@@ -1,0 +1,53 @@
+name: Release package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import pkg from "./package.json" with { type: "json" };
+            import lock from "./package-lock.json" with { type: "json" };
+            assert.equal(process.env.RELEASE_TAG, `v${pkg.version}`, "Release tag must match v<package.json version>");
+            assert.equal(lock.version, pkg.version, "Lockfile version must match package.json");
+            assert.equal(lock.packages[""].version, pkg.version, "Lockfile root version must match package.json");
+          '
+
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run check:package
+
+      - name: Pack verified build
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-package"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release-package"
+
+      - name: Attach package to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/release-package/*.tgz --repo "$GITHUB_REPOSITORY" --clobber

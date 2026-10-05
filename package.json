@@ -1,14 +1,27 @@
 {
   "name": "opencode-command-reviewer",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Advisory command explanations and safety ratings for pending OpenCode shell approvals",
   "type": "module",
-  "private": true,
-  "exports": { "./tui": "./dist/tui.js" },
-  "files": ["dist", "README.md", "THIRD_PARTY_NOTICES.md"],
-  "engines": { "node": ">=22", "opencode": "1.18.34" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mightykatun/opencode-command-reviewer.git"
+  },
+  "exports": {
+    "./tui": "./dist/tui.js"
+  },
+  "files": [
+    "dist/tui.js",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=22",
+    "opencode": "1.18.34"
+  },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
     "test:runtime": "node scripts/smoke.mjs correction && node scripts/smoke.mjs cancel && node scripts/smoke.mjs error && node scripts/smoke.mjs external",
@@ -30,5 +43,7 @@
     "tsx": "4.23.15",
     "typescript": "5.8.2"
   },
-  "overrides": { "@babel/core": "$@babel/core" }
+  "overrides": {
+    "@babel/core": "$@babel/core"
+  }
 }

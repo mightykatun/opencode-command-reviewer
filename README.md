@@ -1,36 +1,21 @@
 # opencode-command-reviewer
 
-Explains a pending OpenCode shell command and displays an advisory **SAFE** or
-**UNSAFE** rating beneath the normal approval UI.
+Explains shell commands awaiting OpenCode approval using a configurable OpenAI-compatible model. Displays a **green ✓** or **orange !** followed by the explanation. Approval remains yours.
 
-```text
-✓ Counts fruit references in the input file and prints the totals.
-```
+Tested with **OpenCode 1.18.34 on Linux, local terminal TUI**.
 
-Results show only a **green ✓** for safe or an **orange !** for unsafe, followed
-by the description. Loading shows `… Analyzing…`; failures show
-`! Analysis unavailable: …`. The native approval UI supplies the command and scope.
+## Install
 
-The normal OpenCode approval controls remain active. The panel disappears when
-you approve or reject; unfinished review requests are cancelled. A rating does
-not approve, block, alter, or execute the command.
-
-## Target and installation
-
-Verified with **OpenCode 1.18.34**, the **local Linux TUI**. Uses the public TUI
-plugin API, permission events/state, session reads and the `app_bottom` slot.
-The native permission dialog itself is not modified.
-
-Build with Node.js 22+ and npm:
+Download `opencode-command-reviewer-VERSION.tgz` from [GitHub Releases](https://github.com/mightykatun/opencode-command-reviewer/releases). Choose the built `.tgz` asset, not GitHub's source archive. Replace `VERSION` below with the release version, then run from the download directory:
 
 ```sh
-npm ci --ignore-scripts
-npm run check
+mkdir -p opencode-command-reviewer
+tar -xzf opencode-command-reviewer-VERSION.tgz -C opencode-command-reviewer --strip-components=1
 ```
 
-Add the following entry to the `plugin` array in
-`~/.config/opencode/tui.json` (or the project's `.opencode/tui.json`). Preserve
-your existing settings and plugin entries. Replace the endpoint and model.
+The archive includes the built plugin; no dependency installation or local build is needed. OpenCode supplies the host libraries. To build from source, see [Development](#development).
+
+Add this plugin entry to `~/.config/opencode/tui.json` or `.opencode/tui.json`, preserving existing entries. Replace the absolute path, endpoint and model:
 
 ```json
 {
@@ -40,216 +25,53 @@ your existing settings and plugin entries. Replace the endpoint and model.
       "/absolute/path/to/opencode-command-reviewer/dist/tui.js",
       {
         "baseURL": "http://127.0.0.1:1234/v1",
-        "model": "your-small-model",
-        "formatRetries": 1,
-        "timeoutMs": 30000,
-        "maxFiles": 4,
-        "maxEvidenceBytes": 65536
+        "model": "your-model"
       }
     ]
   ]
 }
 ```
 
-For an authenticated endpoint, add `"apiKeyEnv": "COMMAND_REVIEWER_API_KEY"` and set
-that environment variable before starting OpenCode. Omit it for an endpoint
-without authentication. A configured but unset key produces Analysis unavailable.
+The endpoint must support Chat Completions; `/chat/completions` is appended to `baseURL`.
 
-**Quit and restart OpenCode after installing or changing plugin configuration.**
-Keep the checkout and built file at the configured path. Rebuild after editing
-the source and restart to load the new bundle.
+**Restart OpenCode after installation or configuration changes.** Keep the built file at the configured path. After updating the source, rebuild and restart.
 
-The plugin assesses pending native `bash` execution requests and
-`external_directory` requests linked to that same native shell tool. Directory
-requests from reads/edits are not shell reviews. The reviewer receives the exact
-permission type; a later execution request receives its own assessment.
-Your existing permission rules determine which commands prompt. If you want every
-native shell command to prompt, configure `"permission": { "bash": "ask" }`
-in your existing `opencode.json`, accounting for any more-specific/agent rules.
-This plugin does not change those rules for you.
+Only pending shell approvals are reviewed, including their `external_directory` checks. To request approval for shell commands, set `"permission": { "bash": "ask" }` in `opencode.json`, accounting for any more-specific or agent rules. The plugin itself belongs in **`tui.json`**.
 
-## Configuration
+## Optional settings
 
-All settings are plugin options in `tui.json`. Unknown keys and invalid types
-produce an explanatory Analysis unavailable result for pending shell requests.
+Add these alongside `baseURL` and `model`:
 
-| Option | Default | Meaning |
+| Option | Default | Purpose |
 | --- | --- | --- |
-| `baseURL` | required | HTTP(S) API base, e.g. `https://example.com/v1`; `/chat/completions` is appended |
-| `model` | required | Reviewer model identifier |
-| `apiKeyEnv` | omitted | Name of environment variable containing the bearer API key |
-| `instructions` | built-in prompt | Replacement assessment instructions; evidence format/output contract remain fixed |
-| `formatRetries` | `1` | Correction requests after invalid assessment JSON; `0` disables corrections |
-| `timeoutMs` | `30000` | One total deadline for context, files, initial request and corrections |
-| `maxFiles` | `4` | Maximum direct source files attempted per assessment |
-| `maxEvidenceBytes` | `65536` | UTF-8 byte budget shared by command text and included file contents |
+| `apiKeyEnv` | omitted | API-key environment-variable name, e.g. `COMMAND_REVIEWER_API_KEY`; set it before starting OpenCode |
+| `instructions` | built-in prompt | Override assessment instructions; JSON response format stays fixed |
+| `formatRetries` | `1` | Correction retries for invalid model response format |
+| `timeoutMs` | `30000` | Total review timeout, including retries |
+| `maxFiles` | `4` | Maximum directly invoked script files to inspect |
+| `maxEvidenceBytes` | `65536` | Combined command/source text budget in bytes |
 
-Numeric settings must be integers. Validation bounds are: retries 0–100, timeout
-1–3,600,000 ms, files 1–1,000, evidence 1–16,777,216 bytes. The latest user prompt
-and factual evidence labels are separate from the command/source budget.
+## Behavior
 
-Example prompt override:
+- Sends the command, execution location, session/repository and permission context, latest user prompt, and directly invoked Python/shell source to your endpoint. Source can include files outside the project.
+- Reports missing or oversized source explicitly. Imports, task runners and complex shell constructs are not fully resolved.
+- Shows `… Analyzing…` while reviewing and `! Analysis unavailable: …` on failure. Resolving the approval removes the panel and cancels unfinished review.
+- Ratings are advisory model judgments, not a safety guarantee. Existing OpenCode permissions stay in control.
 
-```json
-{
-  "instructions": "Explain concrete effects in two concise sentences. Rate routine bounded local work safe. Rate credential exposure, broad deletion, production changes, or material uncertainty unsafe. Consider the user's request, but keep consequential risk visible even when authorized. Do not repeat the rating in the description."
-}
-```
+## Development
 
-The built-in instructions use that same general policy. Contents of commands,
-source files and quoted user prompts are treated as evidence, not reviewer
-instructions. This is a model assessment, not proof of runtime safety.
-
-## Evidence and script discovery
-
-The reviewer receives a JSON-encoded **text message** containing:
-
-- Complete command and resolved working directory, or an explicit unavailable value.
-- `permission`: exact request ID and type (`bash` or `external_directory`), requested
-  `patterns`, proposed `always` patterns, host `metadata` and originating tool IDs.
-- `session`: root and current session IDs, recorded directories, project IDs and
-  workspace IDs, plus their matching OpenCode project name, VCS and worktree metadata.
-- `execution`: invocation instance directory/worktree, original tool `workdir`,
-  how the launch cwd was resolved, and its canonical filesystem path if available.
-- Latest genuine root-conversation user prompt. Synthetic continuations, ignored
-  text and attributed injected text are filtered using OpenCode's public metadata.
-  Subagent delegation messages are not substituted for the user's prompt.
-- Labeled direct Python/shell source files, including files outside the project.
-- Explicit limitations and file-omission notices.
-
-### Session origin, execution location and permission scope
-
-The root session's recorded directory/project describes the conversation's origin;
-the command's invocation directory can differ, including for continued sessions or
-subagents. Relative tool `workdir` is resolved against the assistant invocation's
-public `path.cwd`, matching OpenCode's shell-instance behavior—not against the
-root session's starting directory. `cwd` is the initial shell launch directory,
-before any `cd` statements inside the command. A missing invocation location is
-explicitly unknown rather than replaced with the session's directory.
-
-Project metadata is matched by project ID from OpenCode's registered-project list.
-Only the matching root/current project records are sent. The plugin does not
-initialize another OpenCode instance in the command's target directory to discover
-its project. Linked worktrees can have a different invocation worktree from the
-project's main worktree. A non-repository project's `vcs` is null, even if OpenCode
-reports `/` as its generic worktree. These are the records available at review
-time, not a reconstruction of a session's immutable history after moves/imports.
-
-OpenCode can ask for `external_directory` access before asking for `bash` execution.
-The reviewer receives each exact request separately, including the directory
-patterns/metadata. The prompt explains that `always` lists proposed remembered
-permissions, not permissions already granted. Being outside the starting repo is
-relevant context, not an automatic UNSAFE rating.
-
-Source is read as bounded regular UTF-8 files. Symlinks resolve to their target;
-directories, special files, binary content and invalid UTF-8 are not included.
-Missing or oversized files get notices such as:
-
-```json
-{
-  "filename": "script.py",
-  "status": "file too large for remaining evidence budget; contents not provided; assess risk accordingly"
-}
-```
-
-The model chooses the boolean from the available evidence. The host does not
-automatically force UNSAFE for an omitted file. A command larger than the entire
-evidence budget produces Analysis unavailable rather than sending a partial command.
-
-### Supported literal discovery
-
-- `python`, `python2`, `python3`, versioned Python, including interpreter paths.
-- `sh`, `bash`, `dash`, `ksh`, `zsh` with ordinary supported flags and literal file arguments.
-- Direct paths such as `./script.sh` and extensionless Python/shell shebang scripts.
-- Quoted filenames; absolute/relative paths; tool `workdir`.
-- Common interpreter flags, `--`, basic `env` assignments/`-i`/`-u`, `command`, `exec`.
-- Literal `cd directory && ...`, simple `;`, `&&`, `||` and pipeline tokenization.
-  Ambiguous working directories are explicitly unresolved.
-- Literal shell `-c`/`-lc` strings, with bounded nesting. Python `-c` code is
-  already present in the command and is not recursively analyzed for file references.
-- `source file` and `. file`; later working-directory state is marked uncertain.
-
-### Explicit discovery boundaries
-
-This is bounded tokenization, not a shell interpreter or full static analyzer.
-Multiline commands, heredocs, backticks, substitutions, grouping, redirections,
-background execution, unsupported options, variable-derived/globbed script paths,
-and control flow may leave source discovery incomplete. That limitation is sent
-to the reviewer along with the original command; no proposed command is executed
-to resolve it. `~` and PATH-based script lookup are not expanded.
-
-Imports, nested script calls inside files, `python -m`, task runners such as npm
-and make, other language runtimes and MCP command tools are outside v1 discovery.
-Files reflect the filesystem at review time; commands or other processes may
-change them before execution. The plugin performs no sandboxing or file locking.
-
-Root-prompt lookup follows at most 16 ancestors and 20 pages of 100 messages.
-Unavailable/ambiguous context is labeled, not replaced by an older delegated brief.
-An attachment-only latest user message has no text prompt to send. Compacted or
-imported histories can only be interpreted using the provenance metadata exposed
-by OpenCode.
-
-## Reviewer protocol and failures
-
-The endpoint must support non-streaming Chat Completions with system/user/assistant
-text messages. No tools, Responses API or provider-specific JSON mode are required.
-The model must return exactly:
-
-```json
-{"safe": false, "desc": "Prints .env, which may expose credentials in the output."}
-```
-
-`safe` must be a boolean, `desc` a nonempty string, and extra fields are rejected.
-The description explains effects without repeating the rating. Markdown fences,
-surrounding prose, invalid JSON and schema mismatches trigger a correction request
-with validation feedback, within the configured count and shared deadline.
-
-HTTP/network errors, malformed API envelopes, missing text completions, and an
-HTTP response larger than 64 KiB end the review. Redirects are rejected. The panel
-shows Analysis unavailable and a concise cause; API error bodies are not displayed.
-
-## Lifecycle and scope
-
-- Assessments are keyed to permission request IDs; duplicate events do not re-review.
-- The panel follows the root session's first pending permission, including direct
-  subagents, matching the tested host's approval ordering. An unrelated permission
-  does not show another command's assessment.
-- A read-only pending-permissions refresh every two seconds recovers startup
-  requests and reconciles cancellations that lack a reply event. Stale snapshots
-  cannot resurrect a request resolved while the snapshot was being fetched.
-- Resolution, deletion and plugin disposal abort review work. Late results cannot
-  recreate the panel. No persistent assessment history is stored.
-- The UI uses a bounded scroll area and escapes terminal control/bidi characters.
-
-The current implementation targets local filesystem sessions. Remote OpenCode
-servers/remote workspaces, desktop/web clients and OpenCode 2 are not verified
-targets. Commands, user prompts and captured file contents are sent to your
-configured reviewer endpoint; use one appropriate for that data.
-
-## Development and verification
+Requires Node.js 22+ and npm.
 
 ```sh
-npm run check          # TypeScript, automated tests, compiled ESM bundle
-npm run test:runtime   # installed OpenCode + tmux + local mock HTTP models
-npm run check:package  # reproducible bundle and exact package-content check
+git clone https://github.com/mightykatun/opencode-command-reviewer.git
+cd opencode-command-reviewer
+npm ci --ignore-scripts
+npm run check          # Typecheck, tests and build
+npm run test:runtime   # Real TUI checks; requires tmux, Python 3 and opencode
+npm run check:package  # Reproducible build and package-content check
+npm pack              # Builds and creates opencode-command-reviewer-VERSION.tgz
 ```
 
-Runtime tests require Linux, Python 3, `tmux`, and `opencode` on PATH; set
-`OPENCODE_BIN` for another binary. They create isolated HOME/XDG/project directories
-under the OS temporary directory (`opencode-command-reviewer-*`), use synthetic source and local model fixtures, and leave
-captures under ignored `.runtime/`. They do not use your provider credentials or
-modify your OpenCode configuration. Runtime tests intentionally approve only their
-own harmless temporary Python fixture through a terminal keystroke.
+## Releases
 
-Verified on OpenCode 1.18.34: 42 automated tests and four real-TUI scenarios
-(format correction, cancellation, API failure, and separate directory/execution
-permissions). Checks cover source/context collection, strict JSON validation,
-deadlines, stale-result suppression, advisory-only behavior and compact rendering.
-Packaging checks compare successive build hashes and require exactly the intended
-four package files. The local model fixtures verify mechanics, not the accuracy
-of a live model's safety judgments.
-
-Runtime captures are disposable and can be regenerated with `npm run test:runtime`.
-Source modules separate evidence, context, review transport, lifecycle and TUI
-rendering. The runtime bundle embeds the shell tokenizer; Solid/OpenTUI are supplied
-by the host.
+Update the version with `npm version X.Y.Z --no-git-tag-version`, commit both package manifests and the release workflow, then publish a GitHub release tagged `vX.Y.Z` at that commit. GitHub Actions checks the tag/version match, runs typechecking and tests, verifies the reproducible build and package contents, and attaches `opencode-command-reviewer-X.Y.Z.tgz` to the release. Prereleases use the same workflow. Distribution is through GitHub release assets; no npm registry credentials are required.
