@@ -10,6 +10,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 const root = path.resolve(import.meta.dirname, "..")
 const scenario = process.argv[2] ?? "correction"
 assert.ok(["correction", "cancel", "error", "external"].includes(scenario))
+const initialWidth = scenario === "cancel" ? 80 : 160
 const formattedDescription = "Counts two fruit names.\n\n- **Output:** prints the count.\n- **File:** writes to `executed-marker`.\n- *Literal:* `\x1b[2J\u202e`."
 const temp = await mkdtemp(path.join(tmpdir(), "opencode-command-reviewer-"))
 // Load the built plugin away from the checkout to catch unbundled source assets.
@@ -112,7 +113,8 @@ try {
     OPENCODE_DISABLE_EXTERNAL_SKILLS: "1",
     OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1",
   }
-  tmux("new-session", "-d", "-s", "smoke", "-x", scenario === "cancel" ? "80" : scenario === "correction" ? "160" : "120", "-y", scenario === "cancel" ? "24" : "40", "-c", project,
+  await mkdir(path.join(root, ".runtime"), { recursive: true })
+  tmux("new-session", "-d", "-s", "smoke", "-x", String(initialWidth), "-y", scenario === "cancel" ? "24" : "40", "-c", project,
     "env", ...Object.entries(env).map(([k, v]) => `${k}=${v}`),
     process.env.OPENCODE_BIN ?? "opencode", project,
     "--prompt", "Count the fruit names in fruits.py using python3 fruits.py.")
@@ -126,21 +128,30 @@ try {
     }
     throw new Error("Timed out waiting for expected terminal state")
   }
-  const expected = scenario === "cancel" ? "… Analyzing…" : scenario === "error" ? "! Analysis unavailable" : `${scenario === "external" ? "!" : "✓"} Counts two fruit names`
-  const assertReviewLayout = (screen) => {
+  const expected = scenario === "cancel" ? "… Analyzing…" : scenario === "error" ? "! Analysis unavailable" : scenario === "external" ? "! UNSAFE" : "✓ SAFE"
+  const hasPanel = (s) => /Permission analysis|Counts two fruit names|Analyzing…|Analysis unavailable/.test(s)
+  const toggleSidebar = () => tmux("send-keys", "-t", "smoke", "C-x", "b")
+  const assertReviewLayout = (screen, width) => {
     const lines = screen.split("\n")
+    const headingLine = lines.findIndex((line) => line.includes("Permission analysis"))
+    assert.ok(headingLine >= 0, "permission analysis heading should be visible")
+    const column = lines[headingLine].indexOf("Permission analysis")
+    assert.equal(column, width - 40, "overlay heading should align with the native sidebar padding")
     const reviewLine = lines.findIndex((line) => line.includes(expected))
-    assert.ok(reviewLine >= 0, "review should be visible")
-    const permissionLine = lines.find((line) => line.includes("Permission required"))
-    assert.ok(permissionLine, "native permission should remain visible")
-    assert.equal(lines[reviewLine].indexOf(expected), permissionLine.indexOf("△"), "review icon should align with the permission content")
+    assert.equal(reviewLine, headingLine + 2, "status should have its own line beneath the heading")
+    assert.ok(screen.includes("Permission required"), "native permission should remain visible")
+    assert.equal(lines[reviewLine].indexOf(expected), column, "status should align with the heading")
     const controlsLine = lines.findIndex((line) => line.includes("Allow once"))
-    assert.ok(controlsLine >= 0 && reviewLine > controlsLine && reviewLine - controlsLine <= 5, "review should sit directly beneath the native controls")
-    const rows = lines.slice(reviewLine)
-    while (rows.length && !rows.at(-1).trim()) rows.pop()
-    assert.ok(rows.length <= 6, "long reviews must keep a bounded height")
-    for (const row of rows) assert.ok(row.trimEnd().length <= 77, "review should wrap within its compact column")
-    if (scenario === "correction" || scenario === "external") assert.ok(rows.length > 1, "description should wrap instead of spanning the terminal")
+    assert.ok(controlsLine > headingLine, "native approval controls should remain visible beside the overlay")
+    assert.equal(lines.filter((line) => line.includes(expected)).length, 1, "review must not be duplicated in a bottom bar")
+    const sidebarText = lines.map((line) => line.slice(width - 42)).join("\n")
+    assert.doesNotMatch(sidebarText, /Context|LSP|OpenCode|project:main|Fixture complete\./, "overlay must cover the native sidebar title, sections, and footer")
+    if (scenario === "correction" || scenario === "external") {
+      assert.equal(lines.findIndex((line) => line.includes("Counts two fruit names")), reviewLine + 2, "analysis should follow the status on a separate line")
+    } else {
+      assert.doesNotMatch(sidebarText, /✓ SAFE|! UNSAFE/, "pending or failed reviews must not fabricate a rating")
+    }
+    if (scenario === "error") assert.match(sidebarText, /Reviewer HTTP 503/)
     if (scenario === "correction") {
       assert.ok(screen.includes("Output: prints the count."), "formatted list should be visible")
       assert.ok(screen.includes("File: writes to executed-marker."), "inline code should render without backticks")
@@ -148,9 +159,17 @@ try {
       assert.ok(screen.includes("\\u001b[2J\\u202e"), "controls and bidi must stay escaped inside Markdown")
     }
   }
-  const formattingReady = (s) => scenario !== "correction" || (s.includes("File: writes to executed-marker.") && s.includes("\\u001b[2J\\u202e"))
+  const formattingReady = (s) => scenario === "correction"
+    ? s.includes("File: writes to executed-marker.") && s.includes("\\u001b[2J\\u202e")
+    : scenario !== "external" || s.includes("Counts two fruit names")
+  if (scenario === "cancel") {
+    await until((s) => s.includes("Permission required") && reviewerCalls > 0)
+    assert.ok(!hasPanel(screen) && !screen.includes("Context"), "a narrow terminal must not open the sidebar or show a bottom-bar fallback")
+    await writeFile(path.join(root, ".runtime/cancel-sidebar-hidden.txt"), screen)
+    toggleSidebar()
+  }
   await until((screen) => screen.includes("Permission required") && screen.includes(expected) && formattingReady(screen) && reviewerCalls > 0)
-  assertReviewLayout(screen)
+  assertReviewLayout(screen, initialWidth)
   assert.match(screen, /Permission required/, "real native approval should be visible")
   assert.match(screen, /python3 fruits\.py/)
   assert.ok(screen.includes(expected), "compact icon and description should render alongside approval")
@@ -179,27 +198,48 @@ try {
     await sleep(400)
     assert.match(capture(), /Permission required/, "SAFE must remain advisory")
   } else assert.equal(reviewerCalls, 1)
-  await mkdir(path.join(root, ".runtime"), { recursive: true })
   await writeFile(path.join(root, `.runtime/${scenario}-pending.txt`), screen)
   const styledScreen = tmux("capture-pane", "-p", "-e", "-t", "smoke")
   await writeFile(path.join(root, `.runtime/${scenario}-pending.ansi`), styledScreen)
+  assert.match(styledScreen.split("\n").find((line) => line.includes("Permission analysis")) ?? "", /\x1b\[1m/, "overlay heading should be bold")
+  if (scenario === "correction" || scenario === "external") {
+    const ratingLine = styledScreen.split("\n").find((line) => line.includes(expected)) ?? ""
+    assert.ok(ratingLine.includes(scenario === "correction" ? "\x1b[38;2;34;197;94m" : "\x1b[38;2;249;115;22m"), "rating text and icon must use the assessment color")
+  }
   if (scenario === "correction") {
     assert.match(styledScreen.split("\n").find((line) => line.includes("Output:")) ?? "", /\x1b\[1m/, "important effects should be bold")
     assert.match(styledScreen.split("\n").find((line) => line.includes("Literal:")) ?? "", /\x1b\[3m/, "italic emphasis should render")
     tmux("resize-window", "-t", "smoke", "-x", "80", "-y", "24")
-    await until((s) => s.includes("Permission required") && s.includes(expected) && formattingReady(s) && s.includes("⇆ select") && s.split("\n").length === 25)
-    assertReviewLayout(screen)
-    assert.equal(reviewerCalls, 2, "resizing must not restart the review")
+    await until((s) => s.includes("Permission required") && !hasPanel(s) && !s.includes("Context") && s.split("\n").length === 25)
+    await writeFile(path.join(root, ".runtime/correction-sidebar-hidden.txt"), screen)
+    toggleSidebar()
+    await until((s) => s.includes(expected) && formattingReady(s) && s.includes("Permission analysis"), 10000)
+    assertReviewLayout(screen, 80)
     await writeFile(path.join(root, ".runtime/correction-narrow-pending.txt"), screen)
+    toggleSidebar()
+    await until((s) => s.includes("Permission required") && !hasPanel(s) && !s.includes("Context"), 10000)
+    tmux("resize-window", "-t", "smoke", "-x", "160", "-y", "40")
+    await until((s) => s.includes("Permission required") && s.includes("enter confirm") && !hasPanel(s) && !s.includes("Context") && s.split("\n").length === 41)
+    await writeFile(path.join(root, ".runtime/correction-wide-hidden.txt"), screen)
+    toggleSidebar()
+    await until((s) => s.includes(expected) && formattingReady(s) && s.includes("Permission analysis"), 10000)
+    assertReviewLayout(screen, 160)
+    tmux("send-keys", "-t", "smoke", "C-p")
+    await until((s) => s.includes("Commands") && !hasPanel(s), 10000)
+    await writeFile(path.join(root, ".runtime/correction-dialog.txt"), screen)
+    tmux("send-keys", "-t", "smoke", "Escape")
+    await until((s) => s.includes("Permission required") && s.includes(expected) && formattingReady(s), 10000)
+    assertReviewLayout(screen, 160)
+    assert.equal(reviewerCalls, 2, "resizing or toggling the sidebar must not restart the review")
   }
   if (scenario === "external") {
-    assert.match(screen, /! Counts two fruit names/)
+    assert.match(screen, /! UNSAFE/)
     assert.deepEqual(sent.permission.metadata.directories, [commandDirectory])
     assert.deepEqual(sent.permission.patterns, [`${commandDirectory}/*`])
     assert.deepEqual(sent.permission.always, [`${commandDirectory}/*`])
     // Authorize only the directory boundary. OpenCode must still ask for bash.
     tmux("send-keys", "-t", "smoke", "Enter")
-    await until((s) => s.includes("Permission required") && s.includes("Shell command") && s.includes("! Counts two fruit names") && reviewerCalls === 2, 10000)
+    await until((s) => s.includes("Permission required") && s.includes("Shell command") && s.includes("! UNSAFE") && formattingReady(s) && reviewerCalls === 2, 10000)
     const next = JSON.parse(calls.filter((call) => call.url === "/review/chat/completions")[1].body.messages[1].content)
     assert.equal(next.permission.type, "bash")
     assert.notEqual(next.permission.id, sent.permission.id)
@@ -208,12 +248,17 @@ try {
     assert.equal(next.cwd, commandDirectory)
     assert.equal(next.session.root.directory, project)
     assert.equal(next.files[0].contents, source)
+    assertReviewLayout(screen, initialWidth)
     await assert.rejects(access(path.join(commandDirectory, "executed-marker")))
     await writeFile(path.join(root, ".runtime/external-bash-pending.txt"), screen)
   }
+  if (scenario === "cancel") {
+    toggleSidebar()
+    await until((s) => s.includes("Permission required") && !hasPanel(s) && !s.includes("Context"), 10000)
+    assert.equal(reviewerCalls, 1, "hiding the sidebar must not restart the pending review")
+  }
   // A real human-style keystroke, not a plugin/API permission write.
   tmux("send-keys", "-t", "smoke", scenario === "correction" ? "Enter" : "Escape")
-  const hasPanel = (s) => /Counts two fruit names|Analyzing…|Analysis unavailable/.test(s)
   await until((s) => !s.includes("Permission required") && !hasPanel(s), 10000)
   if (scenario === "correction") {
     await until((s) => s.includes("Fixture complete."), 10000)
@@ -224,6 +269,12 @@ try {
     await assert.rejects(access(path.join(commandDirectory, "executed-marker")))
     assert.ok(!hasPanel(capture()), "late response must not resurrect panel")
   }
+  if (scenario === "cancel") {
+    toggleSidebar()
+    await until((s) => s.includes("Context"), 10000)
+    assert.ok(!hasPanel(screen), "reopening the sidebar after cancellation must not restore the review")
+  }
+  assert.match(capture(), /Context/, "native sidebar sections should remain after the temporary review is removed")
   await writeFile(path.join(root, `.runtime/${scenario}-resolved.txt`), capture())
   await writeFile(path.join(root, `.runtime/${scenario}-requests.json`), JSON.stringify(calls, null, 2))
   console.log(`PASS ${scenario}: native approval, exact evidence, advisory behavior, panel cleanup${scenario === "cancel" ? ", HTTP cancellation and late-result suppression at 80x24" : ""}. Isolated files: ${temp}`)

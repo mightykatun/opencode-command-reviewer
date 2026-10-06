@@ -6,7 +6,7 @@
   workspaces and OpenCode 2 are unverified.
 - The plugin is advisory: never execute, modify, approve or reject reviewed
   commands, or change permission rules. Use public `@opencode-ai/plugin/tui` APIs
-  and the `app_bottom` slot; do not patch the native approval dialog.
+  and public TUI slots; do not patch the native approval dialog.
 - Register the plugin and options in `tui.json`; permissions belong in
   `opencode.json`. Source changes require rebuilding; plugin/config changes require
   restarting OpenCode. Keep `README.md` focused on installation and user behavior.
@@ -70,13 +70,16 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - Preserve two-second read-only reconciliation for startup/missing reply events and
   its revision guard against stale snapshots. Resolution, deletion and disposal
   abort work; late results must not resurrect panels.
-- Completed UI is only green `✓` (`#22c55e`) or orange `!` (`#f97316`) plus description
-  in theme text color. Render Markdown inside `desc`, escaping terminal-control/bidi
-  characters via `displayText` before rendering. Keep the outer response strict JSON,
-  native controls active, and scrolling bounded; no added header, repeated command or IDs.
-- OpenCode 1.18.34 hides `session_prompt` during approvals and exposes no permission
-  slot. Keep the `app_bottom` note transparent, indented and width-capped so it sits
-  beneath the permission content without painting across the terminal/sidebar.
+- The pending overlay shows a **Permission analysis** heading, green `✓ SAFE`
+  (`#22c55e`) or orange `! UNSAFE` (`#f97316`), then the description in theme text
+  color. Render Markdown inside `desc`, escaping terminal-control/bidi characters
+  via `displayText` first. Keep strict outer JSON and native approval controls active.
+- Observe sidebar mounts through `sidebar_content`, using the slot's `session_id`
+  and a mount token. Render the temporary full-height, 42-column overlay via `app`,
+  covering the sidebar title, sections and footer without changing them. Hide it
+  while native dialogs are open, and remove it on resolution/disposal. Keep its
+  analysis scrollable. Respect hidden/narrow sidebar state; do not force it open,
+  persist layout changes, or restore a bottom-bar fallback.
 - Invalid configuration or review failure shows `Analysis unavailable`, never a
   fabricated rating or permission decision.
 

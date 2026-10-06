@@ -1,4 +1,4 @@
-import { createMemo, createSignal, onCleanup, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js"
 import { SyntaxStyle } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { Message, Part } from "@opencode-ai/sdk/v2"
@@ -72,6 +72,7 @@ const tui: TuiPlugin = async (api, options) => {
   let configError = ""
   try { config = parseConfig(options) } catch (error) { configError = error instanceof Error ? error.message : "Invalid configuration" }
   const [views, setViews] = createSignal<View[]>([])
+  const [sidebar, setSidebar] = createSignal<{ sessionID: string; token: symbol }>()
   const reader = contextReader(api)
   const controller = new Controller(async (request, parent, setCommand) => {
     return withDeadline(parent, config?.timeoutMs ?? 30000, async (signal) => {
@@ -111,37 +112,53 @@ const tui: TuiPlugin = async (api, options) => {
   api.lifecycle.onDispose(() => {
     stopped = true
     clearInterval(interval)
+    setSidebar(undefined)
     controller.dispose()
   })
 
   api.slots.register({
     slots: {
-      app_bottom: () => {
+      sidebar_content: (_ctx, props) => {
+        // Observe the native sidebar's lifetime without changing its contents or
+        // visibility settings. A token protects a new mount from stale cleanup.
+        const token = Symbol()
+        createEffect(() => {
+          setSidebar({ sessionID: props.session_id, token })
+          onCleanup(() => setSidebar((current) => current?.token === token ? undefined : current))
+        })
+        return null
+      },
+      app: () => {
         const current = createMemo(() => {
+          const mounted = sidebar()
           const route = api.route.current
-          const id = route.name === "session" && typeof route.params?.sessionID === "string" ? route.params.sessionID : undefined
-          return visibleReview(views(), id, (id) => api.state.session.get(id))
+          if (!mounted || api.ui.dialog.open || route.name !== "session" || route.params?.sessionID !== mounted.sessionID) return
+          return visibleReview(views(), mounted.sessionID, (id) => api.state.session.get(id))
         })
         return (
           <Show when={current()} keyed>
             {(view) => (
-              <box paddingLeft={5} paddingRight={2} flexShrink={0}>
-                {/* The public bottom slot sits outside the session column. Keep the
-                    note transparent and compact so it stays beneath the approval. */}
-                <box width="100%" maxWidth={72} flexDirection="row" gap={1} flexShrink={0}>
-                  <text flexShrink={0} fg={view.status === "analyzing" ? api.theme.current.textMuted : view.assessment?.safe ? "#22c55e" : "#f97316"}>
-                    {view.status === "analyzing" ? "…" : view.assessment?.safe ? "✓" : "!"}
-                  </text>
-                  <scrollbox maxHeight={6} flexGrow={1} flexShrink={1}>
-                    <Show when={view.assessment} fallback={
-                      <text fg={api.theme.current.text}>
-                        {displayText(view.status === "analyzing" ? "Analyzing…" : `Analysis unavailable: ${view.error ?? "Review failed"}`)}
+              // OpenCode 1.18.34's sidebar is 42 columns, including its padding.
+              // The app slot lets this cover its title, sections, and footer while
+              // the original sidebar remains mounted beneath it.
+              <box position="absolute" top={0} right={0} bottom={0} width={42} zIndex={1}
+                paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2}
+                backgroundColor={api.theme.current.backgroundPanel}>
+                <text fg={api.theme.current.text} flexShrink={0}><b>Permission analysis</b></text>
+                <text marginTop={1} flexShrink={0} fg={view.status === "analyzing" ? api.theme.current.textMuted : view.assessment?.safe ? "#22c55e" : "#f97316"}>
+                  <b>{view.assessment ? view.assessment.safe ? "✓ SAFE" : "! UNSAFE" : view.status === "analyzing" ? "… Analyzing…" : "! Analysis unavailable"}</b>
+                </text>
+                <scrollbox marginTop={1} flexGrow={1} minHeight={0} contentOptions={{ minHeight: 0 }}>
+                  <Show when={view.assessment} fallback={
+                    <Show when={view.status === "unavailable"}>
+                      <text fg={api.theme.current.text} width="100%" flexShrink={0}>
+                        {displayText(view.error ?? "Review failed")}
                       </text>
-                    }>
-                      {(assessment) => <ReviewDescription api={api} text={assessment().desc} />}
                     </Show>
-                  </scrollbox>
-                </box>
+                  }>
+                    {(assessment) => <ReviewDescription api={api} text={assessment().desc} />}
+                  </Show>
+                </scrollbox>
               </box>
             )}
           </Show>
