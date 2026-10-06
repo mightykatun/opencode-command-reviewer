@@ -1,5 +1,6 @@
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
 import type { Assessment } from "./types.js"
+import type { Config } from "./config.js"
 
 export interface View {
   request: PermissionRequest
@@ -16,7 +17,8 @@ export class Controller {
   private entries = new Map<string, Entry>()
   private stopped = false
   private version = 0
-  constructor(private evaluate: Evaluate, private changed: (views: View[]) => void) {}
+  constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
+    private options: Pick<Config, "reviewBash" | "reviewEdits"> = { reviewBash: true, reviewEdits: true }) {}
   get revision() { return this.version }
   get views() { return [...this.entries.values()].map((entry) => entry.view) }
   private publish() { if (!this.stopped) this.changed(this.views) }
@@ -24,11 +26,13 @@ export class Controller {
   asked(request: PermissionRequest) {
     if (this.stopped || this.entries.has(request.id)) return
     this.version++
+    const enabled = request.permission === "edit" ? this.options.reviewEdits
+      : (request.permission === "bash" || request.permission === "external_directory") && this.options.reviewBash
     const entry: Entry = {
       abort: new AbortController(),
       view: {
         request,
-        status: request.permission === "bash" ? "analyzing" : request.permission === "external_directory" ? "identifying" : "unrelated",
+        status: !enabled ? "unrelated" : request.permission === "external_directory" ? "identifying" : "analyzing",
       },
     }
     this.entries.set(request.id, entry)

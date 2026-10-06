@@ -1,4 +1,5 @@
 import type { Limits } from "./types.js"
+import path from "node:path"
 
 export interface Config extends Limits {
   baseURL: string
@@ -6,12 +7,14 @@ export interface Config extends Limits {
   apiKey?: string
   apiKeyEnv?: string
   instructions?: string
+  reviewBash: boolean
+  reviewEdits: boolean
   formatRetries: number
   timeoutMs: number
 }
 
 export function parseConfig(options: Record<string, unknown> = {}): Config {
-  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
+  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "reviewBash", "reviewEdits", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
   for (const key of Object.keys(options)) if (!keys.has(key)) throw new Error(`Unknown command-reviewer setting: ${key}`)
   const text = (name: string, optional = false): string | undefined => {
     const value = options[name]
@@ -26,6 +29,11 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     }
     return value
   }
+  const boolean = (name: string) => {
+    const value = options[name] === undefined ? true : options[name]
+    if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`)
+    return value
+  }
   let url: URL
   try { url = new URL(text("baseURL")!) } catch { throw new Error("baseURL must be an HTTP(S) API base URL") }
   // search/hash are empty for bare delimiters, but href retains them.
@@ -34,11 +42,16 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
   }
   const apiKeyEnv = text("apiKeyEnv", true)
   if (apiKeyEnv && !/^[A-Za-z_][A-Za-z_0-9]*$/.test(apiKeyEnv)) throw new Error("apiKeyEnv must be an environment-variable name")
+  const instructions = text("instructions", true)
+  if (instructions && (!path.isAbsolute(instructions) || instructions.includes("\u0000"))) {
+    throw new Error("instructions must be an absolute prompt-directory path; inline instructions are no longer supported")
+  }
   return {
     baseURL: url.href.replace(/\/+$/, ""),
     model: text("model")!, apiKeyEnv,
     apiKey: text("apiKey", true),
-    instructions: text("instructions", true),
+    instructions,
+    reviewBash: boolean("reviewBash"), reviewEdits: boolean("reviewEdits"),
     formatRetries: number("formatRetries", 1, 0, 100),
     timeoutMs: number("timeoutMs", 30000, 1, 3600000),
     maxFiles: number("maxFiles", 4, 1, 1000),

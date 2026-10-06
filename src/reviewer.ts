@@ -1,6 +1,6 @@
 import type { Config } from "./config.js"
-import type { Assessment, Evidence } from "./types.js"
-import { DEFAULT_INSTRUCTIONS, CONTRACT, correctionPrompt } from "./prompts.js"
+import type { Assessment, ReviewEvidence } from "./types.js"
+import { BUILTIN_PROMPTS, CONTRACT, correctionPrompt, type PromptSet } from "./prompts.js"
 
 class FormatError extends Error {}
 
@@ -60,16 +60,18 @@ async function responseText(response: Response, signal: AbortSignal): Promise<st
 }
 
 export async function review(
-  evidence: Evidence,
+  evidence: ReviewEvidence,
   config: Config,
   signal: AbortSignal,
   fetcher: typeof fetch = fetch,
   environment: NodeJS.ProcessEnv = process.env,
+  prompts: PromptSet = BUILTIN_PROMPTS,
 ): Promise<Assessment> {
   const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)
   if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset or empty`)
+  const prompt = evidence.kind === "edit" ? prompts.edit : prompts.shell
   const messages = [
-    { role: "system", content: `${config.instructions ?? DEFAULT_INSTRUCTIONS}\n\n${CONTRACT}` },
+    { role: "system", content: `${prompt.instructions}\n\n${CONTRACT}` },
     { role: "user", content: JSON.stringify(evidence) },
   ]
   for (let attempt = 0; attempt <= config.formatRetries; attempt++) {
@@ -116,7 +118,7 @@ export async function review(
       if (attempt === config.formatRetries) throw new Error("Reviewer response format invalid after configured attempts")
       messages.push(
         { role: "assistant", content: message.content },
-        { role: "user", content: correctionPrompt(error.message) },
+        { role: "user", content: correctionPrompt(error.message, prompt.correction) },
       )
     }
   }

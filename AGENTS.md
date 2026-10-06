@@ -26,11 +26,14 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   `npx tsx --test --test-name-pattern='missing invocation path' test/context.test.ts`.
 - Runtime/UI or host-integration changes warrant real-TUI fixtures after a build.
   Run one with `node scripts/smoke.mjs external`; other scenarios are `correction`,
-  `cancel`, and `error`. Requires Linux, Git, Python 3, tmux and `opencode` on PATH;
+  `cancel`, `error`, `edit`, `write`, `patch`, `edit-cancel`, and `edit-config-error`.
+  Review-switch scenarios are `edit-disabled`, `bash-disabled`, and `external-disabled`.
+  Requires Linux, Git, Python 3, tmux and `opencode` on PATH;
   `OPENCODE_BIN` selects another binary.
 - Runtime fixtures isolate HOME/XDG/project directories under the OS temp directory,
   use local HTTP model fixtures, and save captures/requests in ignored `.runtime/`.
-  The correction scenario approves and executes its harmless temporary Python script.
+  The correction scenario approves and executes its harmless temporary Python script;
+  the edit scenario approves a harmless temporary text replacement.
   These tests verify integration mechanics, not a live model's judgment accuracy.
 - Documentation-only changes need reference/format review, not runtime/model tests.
 - `npm pack` rebuilds via `prepack`. `.github/workflows/release.yml` runs on published
@@ -52,22 +55,29 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   requires exactly `dist/tui.js`, `package.json`, `README.md`, and
   `THIRD_PARTY_NOTICES.md`. Generated `dist/` and runtime captures are ignored.
 - Defaults/validation live in `src/config.ts`, evidence shapes in `src/types.ts`,
-  prompt text in `prompts/PERMISSION-REVIEW-*.md`, and response validation in
+  overridable prompt text in `prompts/`, fixed contract in `contracts/`, and response validation in
   `src/reviewer.ts`; consult these rather than duplicating contracts in documentation.
-- `src/prompts.ts` reads Markdown in source tests; `scripts/build.mjs` embeds it in
-  the bundle. Prompt edits require rebuilding and restarting. Keep the contract
-  separate from overridable instructions and retain `{{validationError}}` in the
-  correction template. Runtime fixtures load an isolated copy of the bundle.
+- `src/prompts.ts` reads built-in Markdown in source tests; `scripts/build.mjs`
+  embeds it in the bundle. Built-in prompt edits require rebuilding and restarting.
+  `instructions` is an absolute custom prompt-directory path, loaded once at startup
+  with per-file fallback, a 64 KiB/file cap and the configured timeout. Custom files
+  need only a restart. Keep contracts outside overrides; retain `{{validationError}}`
+  in correction templates. Runtime fixtures load an isolated copy of the bundle.
 
 ## Permission lifecycle and display
 
-- Review native `bash` and only shell-associated `external_directory` requests.
+- Review native `bash`, shell-associated `external_directory`, and `edit` requests
+  from native `edit`/`write`/`apply_patch` tools. Edit-associated external-directory
+  checks stay hidden; actual edit permission provides the host-computed diffs.
   Directory access can precede execution approval: preserve each request's ID,
   exact type, scope and metadata, even for the same tool call. `always` contains
   proposed remembered patterns, not existing grants.
 - Deduplicate by permission-request ID. Visibility follows the root session's first
   pending permission, including direct children; an unrelated first request must
   not show a later command's assessment. Identify directory requests before display.
+- `reviewBash` and `reviewEdits` default true. Disabled kinds remain hidden ordering
+  blockers but never start context/evidence/model work. `reviewBash` also gates
+  shell-associated external-directory analysis; these switches do not grant access.
 - Preserve two-second read-only reconciliation for startup/missing reply events and
   its revision guard against stale snapshots. Resolution, deletion and disposal
   abort work; late results must not resurrect panels.
@@ -112,6 +122,12 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Missing/oversized source becomes factual notices; the model decides the rating.
   The byte budget covers command plus source, not prompt/metadata. An over-budget
   command fails rather than being truncated. Files are review-time snapshots.
+- Edit evidence is separate from shell evidence. Use pending host diffs without
+  applying edits or reading full targets. Preserve permission identity/scope, normalize
+  per-file paths/operations/move destinations, and omit raw input/metadata copies.
+  `maxFiles` caps considered change entries; `maxEvidenceBytes` caps included UTF-8
+  diff bytes. Omit whole diffs with reasons, retain scope, and flag partial coverage.
+  Never guess operations/paths from aggregate labels or synthesize a safety rating.
 - Use non-streaming Chat Completions with textual JSON evidence; no tool calling or
   provider-specific JSON mode. Instruction overrides cannot replace the fixed
   evidence/output contract: exactly `{"safe": boolean, "desc": "nonempty text"}`.

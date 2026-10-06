@@ -3,10 +3,14 @@ import type { TestContext } from "node:test"
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
 import type { ServerResponse } from "node:http"
-import { readFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { parseConfig } from "../src/config.js"
 import { parseAssessment, review, withDeadline } from "../src/reviewer.js"
+import { BUILTIN_PROMPTS, CONTRACT, loadPrompts } from "../src/prompts.js"
+import { collectEditEvidence } from "../src/evidence.js"
 import type { Evidence } from "../src/types.js"
 
 const evidence: Evidence = {
@@ -41,8 +45,25 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   assert.equal(cfg.formatRetries, 1)
   assert.equal(cfg.maxFiles, 4)
   assert.equal(cfg.maxEvidenceBytes, 65536)
+  assert.equal(cfg.reviewBash, true)
+  assert.equal(cfg.reviewEdits, true)
   for (const override of [ { baseURL: "file:///tmp" }, { baseURL: "https://secret@example.org" }, { model: "" }, { apiKeyEnv: "bad name" }, { timeoutMs: 0 }, { formatRetries: -1 }, { formatRetries: 1.2 }, { retries: 3 } ]) {
     assert.throws(() => parseConfig({ baseURL: "http://localhost/v1", model: "m", ...override }))
+  }
+})
+
+test("review switches are independent strict booleans with enabled defaults", () => {
+  const options = { baseURL: "http://localhost/v1", model: "m" }
+  for (const reviewBash of [true, false]) for (const reviewEdits of [true, false]) {
+    const config = parseConfig({ ...options, reviewBash, reviewEdits })
+    assert.equal(config.reviewBash, reviewBash)
+    assert.equal(config.reviewEdits, reviewEdits)
+  }
+  for (const name of ["reviewBash", "reviewEdits"] as const) {
+    assert.equal(parseConfig({ ...options, [name]: undefined })[name], true)
+    for (const value of [null, 0, 1, "true", "false", {}, []]) {
+      assert.throws(() => parseConfig({ ...options, [name]: value }), { message: `${name} must be a boolean` })
+    }
   }
 })
 
@@ -193,14 +214,17 @@ test("inline API keys must be nonempty strings and validation does not expose th
 test("sends textual source, genuine user prompt, fixed schema and optional bearer key", async (t) => {
   const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Counts fruits."}')))
   config.apiKeyEnv = "TEST_REVIEW_KEY"
-  config.instructions = "Custom risk guidance"
-  assert.deepEqual(await review(evidence, config, signal(), fetch, { TEST_REVIEW_KEY: "fixture-secret" }), { safe: true, desc: "Counts fruits." })
+  config.instructions = await mkdtemp(path.join(tmpdir(), "review-prompts-"))
+  t.after(() => rm(config.instructions!, { recursive: true, force: true }))
+  await writeFile(path.join(config.instructions, "PERMISSION-REVIEW-PROMPT.md"), "Custom risk guidance")
+  const prompts = await loadPrompts(config.instructions, signal())
+  assert.deepEqual(await review(evidence, config, signal(), fetch, { TEST_REVIEW_KEY: "fixture-secret" }, prompts), { safe: true, desc: "Counts fruits." })
   const body = requests[0]!.body
   assert.equal(requests[0]!.authorization, "Bearer fixture-secret")
   assert.deepEqual(JSON.parse(body.messages[1].content), evidence)
   assert.match(body.messages[0].content, /Custom risk guidance/)
   assert.match(body.messages[0].content, /exactly two fields/)
-  const contract = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim()
+  const contract = (await readFile(new URL("../contracts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim()
   assert.equal(body.messages[0].content, `Custom risk guidance\n\n${contract}`)
   assert.equal(body.stream, false)
   assert.equal(body.tools, undefined)
@@ -258,7 +282,7 @@ test("format correction uses validation feedback and configurable retry count", 
   assert.equal(requests.length, 3)
   assert.deepEqual(requests.map((request) => request.target), Array(3).fill("/v1/chat/completions"))
   const prompt = (await readFile(new URL("../prompts/PERMISSION-REVIEW-PROMPT.md", import.meta.url), "utf8")).trim()
-  const contract = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim()
+  const contract = (await readFile(new URL("../contracts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim()
   const correction = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CORRECTION.md", import.meta.url), "utf8")).trim()
   assert.match(correction, /\{\{validationError\}\}/)
   assert.equal(requests[0]!.body.messages[0].content, `${prompt}\n\n${contract}`)
@@ -362,4 +386,38 @@ test("redirects are not followed and cannot forward review evidence", async (t) 
   await assert.rejects(review(evidence, origin.config, signal()), /network request failed/)
   assert.equal(origin.requests.length, 1)
   assert.equal(destination.requests.length, 0)
+})
+
+test("edit evidence uses its own assessment/correction prompts and preserves partial coverage on the wire", async (t) => {
+  const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index % 2 ? '{"safe":false,"desc":"Partial review: deleted file content omitted."}' : '{"safe":"yes","desc":"bad type"}')))
+  const edit = collectEditEvidence({
+    kind: "edit", tool: "apply_patch", userPrompt: "Update a setting", limitations: [], session: evidence.session,
+    location: { instanceDirectory: "/project", instanceWorktree: "/project" },
+    permission: { id: "edit", type: "edit", patterns: ["config", "data"], always: ["*"], tool: { messageID: "m", callID: "c" }, metadata: {
+      diff: "raw secret aggregate", files: [
+        { filePath: "/project/config", type: "update", patch: "-false\n+true\n" },
+        { filePath: "/project/data", type: "delete", patch: "omitted secret" },
+      ],
+    } },
+  }, { maxFiles: 1, maxEvidenceBytes: 100 }, signal())
+  const customDir = await mkdtemp(path.join(tmpdir(), "review-prompts-"))
+  t.after(() => rm(customDir, { recursive: true, force: true }))
+  await writeFile(path.join(customDir, "EDIT-REVIEW-PROMPT.md"), "Custom edit instructions")
+  await writeFile(path.join(customDir, "EDIT-REVIEW-CORRECTION.md"), "Custom edit correction {{validationError}}")
+  await writeFile(path.join(customDir, "PERMISSION-REVIEW-PROMPT.md"), "Shell-only guidance")
+  const custom = await loadPrompts(customDir, signal())
+  for (const prompts of [BUILTIN_PROMPTS, custom]) {
+    const index = requests.length
+    const result = await review(edit, config, signal(), fetch, {}, prompts)
+    assert.equal(result.safe, false)
+    assert.equal(requests[index]!.body.messages[0].content, `${prompts.edit.instructions}\n\n${CONTRACT}`)
+    assert.deepEqual(JSON.parse(requests[index]!.body.messages[1].content), edit)
+    assert.ok(!JSON.stringify(requests[index]!.body).includes("raw secret aggregate"))
+    assert.ok(!JSON.stringify(requests[index]!.body).includes("omitted secret"))
+    assert.ok(!JSON.stringify(requests[index]!.body).includes("Shell-only guidance"))
+    assert.equal(requests[index + 1]!.body.messages[3].content, prompts.edit.correction.replace("{{validationError}}", 'Response must contain exactly "safe": boolean and "desc": nonempty string'))
+    assert.deepEqual(JSON.parse(requests[index + 1]!.body.messages[1].content), edit)
+    assert.equal(requests[index]!.body.tools, undefined)
+    assert.equal(requests[index]!.body.stream, false)
+  }
 })

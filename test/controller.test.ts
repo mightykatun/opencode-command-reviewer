@@ -215,15 +215,18 @@ test("context-identified directory review failures remain visible without a rati
   assert.equal(visible?.assessment, undefined)
 })
 
-test("errors are visible without a rating; non-shell requests are never evaluated", async () => {
+test("errors are visible without a rating; unrelated requests are never evaluated", async () => {
   let calls = 0
   const controller = new Controller(async () => { calls++; throw new Error("Reviewer HTTP 503") }, () => {})
-  controller.asked(request("a", "root", "edit"))
+  controller.asked(request("a", "root", "read"))
   controller.asked(request("b"))
+  controller.asked(request("c", "root", "edit"))
   await tick()
-  assert.equal(calls, 1)
+  assert.equal(calls, 2)
   assert.equal(controller.views[1]?.status, "unavailable")
   assert.equal(controller.views[1]?.assessment, undefined)
+  assert.equal(controller.views[2]?.status, "unavailable")
+  assert.equal(controller.views[2]?.assessment, undefined)
   controller.dispose()
 })
 
@@ -236,7 +239,7 @@ test("display follows root/direct-child approval order and hides unrelated sessi
   assert.equal(visibleReview(controller.views, "root", get)?.request.id, "sub-request")
   assert.equal(visibleReview(controller.views, "sub", get), undefined)
   assert.equal(visibleReview(controller.views, undefined, get), undefined)
-  controller.asked(request("root-request", "root", "edit"))
+  controller.asked(request("root-request", "root", "read"))
   assert.equal(visibleReview(controller.views, "root", get), undefined)
   controller.dispose()
 })
@@ -270,8 +273,8 @@ test("mixed-case session IDs take precedence over request IDs within root/direct
   const get = (id: string) => sessions.get(id)
   const views: View[] = [
     request("per_A", "ses_a"), request("per_B", "ses_B"), request("per_z", "ses_A"),
-    request("per_0", "ses_0", "edit"), request("per_1", "ses_1", "edit"), request("per_2", "ses_2", "edit"),
-  ].map((req) => ({ request: req, status: req.permission === "edit" ? "unrelated" : "complete", assessment: req.permission === "bash" ? result : undefined }))
+    request("per_0", "ses_0", "read"), request("per_1", "ses_1", "read"), request("per_2", "ses_2", "read"),
+  ].map((req) => ({ request: req, status: req.permission === "read" ? "unrelated" : "complete", assessment: req.permission === "bash" ? result : undefined }))
   for (const order of [views, views.toReversed()]) {
     let pending = [...order]
     for (const expected of ["per_z", "per_B", "per_A"]) {
@@ -298,7 +301,7 @@ for (const scope of ["root request", "child request", "root session", "child ses
     const later: View = { request: request(bySession ? "per_A" : "per_a", laterSession), status: "complete", assessment: result }
     for (const status of ["unrelated", "identifying", "unidentified"] as const) {
       const blocker: View = {
-        request: request(bySession ? "per_z" : "per_A", firstSession, status === "unrelated" ? "edit" : "external_directory"),
+        request: request(bySession ? "per_z" : "per_A", firstSession, status === "unrelated" ? "read" : "external_directory"),
         status,
       }
       for (const order of [[later, blocker], [blocker, later]]) {
@@ -387,4 +390,66 @@ test("unrelated external-directory requests remain hidden and each permission st
   assert.deepEqual(evaluated, ["file-read", "directory", "execute"])
   assert.equal(controller.views[0]?.request.permission, "bash")
   controller.dispose()
+})
+
+test("edit reviews deduplicate and share native ordering with shell and unrelated permissions", async (t) => {
+  const evaluated: string[] = []
+  const controller = new Controller(async (req) => { evaluated.push(req.id); return { safe: true, desc: req.permission } }, () => {})
+  t.after(() => controller.dispose())
+  const edit = request("a-edit", "root", "edit")
+  controller.asked(edit); controller.asked(edit); controller.asked(request("b-shell"))
+  await tick()
+  assert.deepEqual(evaluated, ["a-edit", "b-shell"])
+  assert.equal(visibleReview(controller.views, "root", getSession)?.assessment?.desc, "edit")
+  controller.asked(request("0-read", "root", "read"))
+  assert.equal(visibleReview(controller.views, "root", getSession), undefined)
+  controller.replied("0-read"); controller.replied(edit.id)
+  assert.equal(visibleReview(controller.views, "root", getSession)?.assessment?.desc, "bash")
+})
+
+for (const removal of ["reply", "delete", "dispose"] as const) {
+  test(`edit ${removal} aborts and suppresses late analysis/identification`, async () => {
+    let finish!: (assessment: Assessment) => void
+    let identify!: () => void
+    let signal!: AbortSignal
+    const controller = new Controller((_, s, onIdentified) => {
+      signal = s; identify = onIdentified
+      return new Promise((resolve) => { finish = resolve })
+    }, () => {})
+    controller.asked(request("edit-request", "root", "edit"))
+    await tick()
+    if (removal === "reply") controller.replied("edit-request")
+    else if (removal === "delete") controller.deleted("root")
+    else controller.dispose()
+    assert.ok(signal.aborted)
+    identify(); finish(result)
+    await tick()
+    assert.deepEqual(controller.views, [])
+    controller.dispose()
+  })
+}
+
+test("disabled review types never evaluate but still block later native permissions", async (t) => {
+  for (const reviewBash of [true, false]) for (const reviewEdits of [true, false]) {
+    const evaluated: string[] = []
+    const controller = new Controller(async (req, _, identified) => {
+      evaluated.push(req.id); identified(); return result
+    }, () => {}, { reviewBash, reviewEdits })
+    t.after(() => controller.dispose())
+    const requests = [request("0-read", "root", "read"), request("1-directory", "root", "external_directory"), request("2-edit", "root", "edit"), request("3-bash")]
+    controller.reconcile(requests, controller.revision)
+    await tick()
+    assert.deepEqual(evaluated, [ ...(reviewBash ? ["1-directory"] : []), ...(reviewEdits ? ["2-edit"] : []), ...(reviewBash ? ["3-bash"] : []) ])
+    assert.equal(visibleReview(controller.views, "root", getSession), undefined)
+    controller.replied("0-read")
+    assert.equal(visibleReview(controller.views, "root", getSession)?.request.id, reviewBash ? "1-directory" : undefined)
+    controller.replied("1-directory")
+    assert.equal(visibleReview(controller.views, "root", getSession)?.request.id, reviewEdits ? "2-edit" : undefined)
+    controller.replied("2-edit")
+    assert.equal(visibleReview(controller.views, "root", getSession)?.request.id, reviewBash ? "3-bash" : undefined)
+    const count = evaluated.length
+    controller.reconcile([requests[3]!], controller.revision)
+    await tick()
+    assert.equal(evaluated.length, count)
+  }
 })

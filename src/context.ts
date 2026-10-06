@@ -1,7 +1,7 @@
 import path from "node:path"
 import { realpath } from "node:fs/promises"
 import type { Message, OpencodeClient, Part, PermissionRequest, Project, Session } from "@opencode-ai/sdk/v2"
-import type { Evidence, ProjectLocation, SessionLocation } from "./types.js"
+import type { EditContext, Evidence, ProjectLocation, SessionLocation } from "./types.js"
 
 export interface ContextReader {
   session(id: string, signal: AbortSignal): Promise<Session | undefined>
@@ -89,7 +89,47 @@ export async function loadContext(request: PermissionRequest, reader: ContextRea
     try { execution.canonicalCwd = await realpath(cwd) }
     catch { limitations.push("Execution directory could not be canonicalized; cwd is the declared launch path, not a verified physical path.") }
   }
+  const conversation = await loadConversationContext(request, reader, signal)
+  return {
+    ...conversation, command, cwd, execution,
+    limitations: [...limitations, ...conversation.limitations],
+    permission: permissionContext(request),
+  }
+}
+
+function permissionContext(request: PermissionRequest): NonNullable<Evidence["permission"]> {
+  return {
+    id: request.id, type: request.permission, patterns: [...request.patterns], always: [...request.always],
+    metadata: structuredClone(request.metadata), tool: request.tool ? { ...request.tool } : null,
+  }
+}
+
+export async function loadEditContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal): Promise<EditContext> {
   signal.throwIfAborted()
+  if (request.permission !== "edit" || !request.tool) throw new Error("Native edit tool context unavailable")
+  const message = await reader.message(request.sessionID, request.tool.messageID, signal)
+  if (!message || message.info.sessionID !== request.sessionID || message.info.id !== request.tool.messageID) {
+    throw new Error("Pending native edit message unavailable")
+  }
+  const part = message.parts.find((p) => p.type === "tool" && p.callID === request.tool!.callID)
+  if (!part || part.type !== "tool" || part.sessionID !== request.sessionID || part.messageID !== request.tool.messageID
+    || part.state.status !== "running" || (part.tool !== "edit" && part.tool !== "write" && part.tool !== "apply_patch")) {
+    throw new Error("Pending native edit arguments unavailable or unsupported tool")
+  }
+  const invocation = message.info.role === "assistant" ? message.info.path : undefined
+  const location = {
+    instanceDirectory: typeof invocation?.cwd === "string" && path.isAbsolute(invocation.cwd) ? invocation.cwd : null,
+    instanceWorktree: typeof invocation?.root === "string" && path.isAbsolute(invocation.root) ? invocation.root : null,
+  }
+  const conversation = await loadConversationContext(request, reader, signal)
+  if (!location.instanceDirectory) conversation.limitations.push("Edit invocation directory unavailable; session origin is not substituted.")
+  if (!location.instanceWorktree) conversation.limitations.push("Edit invocation worktree unavailable.")
+  return { ...conversation, kind: "edit", tool: part.tool, location, permission: permissionContext(request) }
+}
+
+async function loadConversationContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal) {
+  signal.throwIfAborted()
+  const limitations: string[] = []
   let current: Session | undefined
   let root: Session | undefined
   let prompt: string | null = null
@@ -130,11 +170,7 @@ export async function loadContext(request: PermissionRequest, reader: ContextRea
   }
   signal.throwIfAborted()
   return {
-    command, cwd, userPrompt: prompt, execution, limitations,
+    userPrompt: prompt, limitations,
     session: { current: sessionLocation(current), root: sessionLocation(root), currentProject: projectLocation(current), rootProject: projectLocation(root) },
-    permission: {
-      id: request.id, type: request.permission, patterns: [...request.patterns], always: [...request.always],
-      metadata: structuredClone(request.metadata), tool: { ...request.tool },
-    },
   }
 }

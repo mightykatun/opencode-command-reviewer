@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import type { AssistantMessage, Message, Part, PermissionRequest, Session } from "@opencode-ai/sdk/v2"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { latestUserPrompt, loadContext, loadRootMessages, type ContextReader } from "../src/context.js"
+import { latestUserPrompt, loadContext, loadEditContext, loadRootMessages, type ContextReader } from "../src/context.js"
 import { collectEvidence } from "../src/evidence.js"
 
 function user(id: string, text: string, created: number, flags = {}): { info: Message; parts: Part[] } {
@@ -242,4 +242,50 @@ test("root and child project records are independently associated with their pro
   }), new AbortController().signal)
   assert.equal(result?.session?.rootProject?.worktree, "/origin")
   assert.equal(result?.session?.currentProject?.worktree, "/execution")
+})
+
+test("native edit, write and patch contexts retain exact request identity and root intent without shell input", async () => {
+  for (const name of ["edit", "write", "apply_patch"]) {
+    const metadata = { filepath: "/execution/example.txt", diff: "-old\n+new\n", files: [{ type: "move", filePath: "/execution/old.txt", movePath: "/execution/new.txt", patch: "diff" }] }
+    const editRequest = { ...request, permission: "edit", patterns: ["example.txt"], always: ["*"], metadata }
+    const editTool = { ...tool, tool: name, state: { status: "running" as const, input: { filePath: "/execution/example.txt", newString: "new", workdir: "/not-an-edit-workdir" }, time: { start: 1 } } }
+    const result = await loadEditContext(editRequest, reader({ message: async () => ({ info: assistant, parts: [editTool] }) }), new AbortController().signal)
+    assert.equal(result.kind, "edit")
+    assert.equal(result.tool, name)
+    assert.equal(result.userPrompt, "Actual user intent")
+    assert.equal(result.session?.root?.id, "root")
+    assert.deepEqual(result.location, { instanceDirectory: "/execution", instanceWorktree: "/execution" })
+    assert.deepEqual(result.permission, { id: request.id, type: "edit", patterns: ["example.txt"], always: ["*"], metadata, tool: request.tool })
+    assert.notEqual(result.permission.metadata, metadata)
+    assert.ok(!("command" in result) && !("execution" in result) && !("input" in result))
+  }
+})
+
+test("edit contexts reject mismatched, missing, completed or unsupported tool calls", async () => {
+  const editRequest = { ...request, permission: "edit" }
+  for (const r of [
+    reader(),
+    reader({ message: async () => undefined }),
+    reader({ message: async () => ({ info: { ...assistant, sessionID: "foreign" }, parts: [{ ...tool, tool: "edit" }] }) }),
+    reader({ message: async () => ({ info: assistant, parts: [{ ...tool, tool: "edit", messageID: "foreign" }] }) }),
+    reader({ message: async () => ({ info: assistant, parts: [{ ...tool, tool: "edit", callID: "foreign" }] }) }),
+    reader({ message: async () => ({ info: assistant, parts: [{ ...tool, tool: "edit", state: { status: "pending", input: {}, raw: "" } }] }) }),
+  ]) await assert.rejects(loadEditContext(editRequest, r, new AbortController().signal), /native edit/)
+  await assert.rejects(loadEditContext({ ...editRequest, tool: undefined }, reader(), new AbortController().signal), /context unavailable/)
+  await assert.rejects(loadEditContext(request, reader(), new AbortController().signal), /context unavailable/)
+  const abort = new AbortController()
+  abort.abort()
+  await assert.rejects(loadEditContext(editRequest, reader(), abort.signal), { name: "AbortError" })
+})
+
+test("edit context with missing invocation keeps origin separate and ancestry failures explicit", async () => {
+  const result = await loadEditContext({ ...request, permission: "edit" }, reader({
+    message: async () => ({ info: { ...assistant, path: undefined } as unknown as AssistantMessage, parts: [{ ...tool, tool: "write" }] }),
+    messages: async () => { throw new Error("offline") },
+  }), new AbortController().signal)
+  assert.deepEqual(result.location, { instanceDirectory: null, instanceWorktree: null })
+  assert.equal(result.session?.current?.directory, "/project")
+  assert.equal(result.userPrompt, null)
+  assert.match(result.limitations.join(" "), /not substituted/)
+  assert.match(result.limitations.join(" "), /root-user-prompt context is unavailable/)
 })

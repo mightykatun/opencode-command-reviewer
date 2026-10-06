@@ -2,10 +2,11 @@ import { createEffect, createMemo, createSignal, Index, onCleanup, Show } from "
 import { RGBA, SyntaxStyle } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { parseConfig, type Config } from "./config.js"
-import { loadContext, loadRootMessages, type ContextReader } from "./context.js"
+import { loadContext, loadEditContext, loadRootMessages, type ContextReader } from "./context.js"
 import { Controller, displayText, visibleReview, type View } from "./controller.js"
-import { collectEvidence } from "./evidence.js"
+import { collectEditEvidence, collectEvidence } from "./evidence.js"
 import { review, withDeadline } from "./reviewer.js"
+import { BUILTIN_PROMPTS, loadPrompts } from "./prompts.js"
 import { reviewSyntaxStyles, scannerFrame, SCANNER_FRAME_COUNT, SCANNER_INTERVAL_MS } from "./appearance.js"
 
 function ReviewLoading(props: { api: TuiPluginApi }) {
@@ -67,21 +68,31 @@ function contextReader(api: TuiPluginApi): ContextReader {
 
 const tui: TuiPlugin = async (api, options) => {
   let config: Config | undefined
+  let reviewOptions: Pick<Config, "reviewBash" | "reviewEdits"> | undefined
+  let prompts = BUILTIN_PROMPTS
   let configError = ""
-  try { config = parseConfig(options) } catch (error) { configError = error instanceof Error ? error.message : "Invalid configuration" }
+  try {
+    const parsed = parseConfig(options)
+    reviewOptions = parsed
+    prompts = await withDeadline(api.lifecycle.signal, parsed.timeoutMs, (signal) => loadPrompts(parsed.instructions, signal))
+    config = parsed
+  } catch (error) { configError = error instanceof Error ? error.message : "Invalid configuration" }
+  api.lifecycle.signal.throwIfAborted()
   const [views, setViews] = createSignal<View[]>([])
   const [sidebar, setSidebar] = createSignal<{ sessionID: string; token: symbol }>()
   const reader = contextReader(api)
   const controller = new Controller(async (request, parent, onIdentified) => {
     return withDeadline(parent, config?.timeoutMs ?? 30000, async (signal) => {
-      const context = await loadContext(request, reader, signal)
+      const context = request.permission === "edit"
+        ? await loadEditContext(request, reader, signal)
+        : await loadContext(request, reader, signal)
       if (!context) return null
       onIdentified()
       if (!config) throw new Error(configError)
-      const evidence = await collectEvidence(context, config, signal)
-      return review(evidence, config, signal)
+      const evidence = context.kind === "edit" ? collectEditEvidence(context, config, signal) : await collectEvidence(context, config, signal)
+      return review(evidence, config, signal, undefined, undefined, prompts)
     })
-  }, setViews)
+  }, setViews, reviewOptions)
 
   api.event.on("permission.asked", (event) => controller.asked(event.properties))
   api.event.on("permission.replied", (event) => controller.replied(event.properties.requestID))

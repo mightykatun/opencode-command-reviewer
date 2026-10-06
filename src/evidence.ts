@@ -2,7 +2,7 @@ import path from "node:path"
 import { constants } from "node:fs"
 import { open, realpath } from "node:fs/promises"
 import { parse } from "shell-quote"
-import type { Evidence, FileEvidence, Limits } from "./types.js"
+import type { EditChange, EditContext, EditEvidence, Evidence, FileEvidence, Limits } from "./types.js"
 
 const VARIABLE = "\u0000UNRESOLVED_VARIABLE\u0000"
 const python = /^python(?:[23](?:\.\d+)*)?$/
@@ -345,4 +345,51 @@ export async function collectEvidence(
   }
   signal.throwIfAborted()
   return evidence
+}
+
+/** Use host-computed diffs, never apply edits or duplicate unbounded tool input. */
+export function collectEditEvidence(input: EditContext, limits: Limits, signal: AbortSignal): EditEvidence {
+  signal.throwIfAborted()
+  const { metadata, ...scope } = input.permission
+  const limitations = [...input.limitations,
+    "Proposed diffs come from the pending host permission, not from applying edits. Full files, dependencies and post-approval formatter changes are not inspected; host diffs may normalize whitespace or omit BOMs.",
+  ]
+  const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  const patch = input.tool === "apply_patch"
+  const files = patch ? Array.isArray(metadata.files) ? metadata.files : []
+    : [{ filePath: metadata.filepath, patch: metadata.diff, type: input.tool }]
+  if (!files.length) limitations.push("Per-file patch metadata unavailable; affected changes could not be enumerated.")
+  let remaining = limits.maxEvidenceBytes
+  const changes: EditChange[] = []
+  for (let index = 0; index < files.length; index++) {
+    signal.throwIfAborted()
+    const file = record(files[index])
+    const operation = typeof file.type === "string" && ["add", "update", "delete", "move", "edit", "write"].includes(file.type) ? file.type as EditChange["operation"] : "unknown"
+    const change: EditChange = {
+      path: typeof file.filePath === "string" && file.filePath.trim() ? file.filePath : null,
+      operation, status: "omitted",
+      ...(typeof file.movePath === "string" ? { movePath: file.movePath } : {}),
+    }
+    if (index >= limits.maxFiles) change.reason = "file-count limit reached"
+    else if (!change.path || !path.isAbsolute(change.path)) change.reason = "absolute target path unavailable"
+    else if (operation === "unknown" || (patch && (operation === "edit" || operation === "write"))) change.reason = "file operation unavailable or unsupported"
+    else if (operation === "move" && (!change.movePath || !path.isAbsolute(change.movePath))) change.reason = "absolute move destination unavailable"
+    else if (typeof file.patch !== "string" || !file.patch.trim()) change.reason = "proposed diff unavailable"
+    else if (Buffer.byteLength(file.patch) > remaining) change.reason = "complete diff exceeds remaining evidence byte budget"
+    else {
+      change.status = "included"
+      change.diff = file.patch
+      remaining -= Buffer.byteLength(file.patch)
+    }
+    changes.push(change)
+  }
+  const partial = !changes.length || changes.some((change) => change.status === "omitted")
+  if (partial) limitations.push("Edit evidence is incomplete. Omitted changes are not assessed by the supplied diffs; do not assume the whole proposal is safe.")
+  if (!input.userPrompt) limitations.push("User prompt unavailable.")
+  signal.throwIfAborted()
+  return {
+    kind: "edit", tool: input.tool, userPrompt: input.userPrompt, session: input.session,
+    location: input.location, changes, partial, limitations,
+    permission: { ...scope, metadataStatus: "Host change metadata normalized into changes; raw metadata and tool input are omitted to avoid duplicate or unbounded change text." },
+  }
 }
