@@ -12,6 +12,8 @@ const scenario = process.argv[2] ?? "correction"
 assert.ok(["correction", "cancel", "error", "external"].includes(scenario))
 const initialWidth = scenario === "cancel" ? 80 : 160
 const formattedDescription = "Counts two fruit names.\n\n- **Output:** prints the count.\n- **File:** writes to `executed-marker`.\n- *Literal:* `\x1b[2J\u202e`.\n\n### Details\n\n[Documentation](https://example.com/review)"
+const finalLine = "FINAL ANALYSIS LINE"
+const longDescription = [formattedDescription, ...Array.from({ length: 60 }, (_, i) => `Analysis detail ${String(i + 1).padStart(2, "0")}.`), finalLine].join("\n\n")
 const conversationDescription = "### Conversation heading\n\n**conversation_bold** *conversation_emphasis* `conversation_code`\n\n[conversation_link](https://example.com/conversation)"
 
 function styleAt(ansi, text, index = ansi.indexOf(text)) {
@@ -53,6 +55,35 @@ function assertConversationStyles(ansi) {
     }
   }
 }
+
+// Fixture text before the scrollbar uses single-cell characters. Keep ANSI
+// offsets so assertions inspect the rendered terminal colors, not plugin state.
+function cellAt(ansi, row, column) {
+  const lines = ansi.split("\n")
+  const line = lines[row] ?? ""
+  const start = lines.slice(0, row).reduce((sum, text) => sum + text.length + 1, 0)
+  let x = 0
+  for (const match of line.matchAll(/\x1b\][^\x1b\x07]*(?:\x1b\\|\x07)|\x1b\[[\d;]*m|./gu)) {
+    if (match[0].startsWith("\x1b")) continue
+    if (x++ === column) return { character: match[0], ...styleAt(ansi, match[0], start + match.index) }
+  }
+  // tmux trims trailing blanks but retains their final rendition/background.
+  return { character: " ", ...styleAt(ansi, "", start + line.length) }
+}
+
+function assertScrollbarTheme(ansi) {
+  const panel = styleAt(ansi, "Permission analysis").bg
+  const muted = styleAt(ansi, "#").fg
+  assert.ok(panel && muted && panel !== muted, "fixture needs distinct track and thumb colors")
+  const cells = Array.from({ length: 34 }, (_, i) => cellAt(ansi, i + 5, 157))
+  assert.ok(cells.some((cell) => /[█▀▄]/u.test(cell.character)), "overflow must render a scrollbar thumb")
+  assert.ok(cells.some((cell) => cell.bg === panel && cell.character === " "), "scrollbar track should use the panel background")
+  for (const cell of cells.filter((cell) => /[█▀▄]/u.test(cell.character))) {
+    assert.equal(cell.fg, muted, "scrollbar thumb should use the active theme's muted text color")
+    assert.equal(cell.bg, panel, "scrollbar thumb background should use the active panel color")
+  }
+  return { panel, muted }
+}
 const temp = await mkdtemp(path.join(tmpdir(), "opencode-command-reviewer-"))
 // Load the built plugin away from the checkout to catch unbundled source assets.
 const pluginFile = path.join(temp, "reviewer.mjs")
@@ -69,7 +100,9 @@ const calls = []
 let toolSent = false
 let reviewerCalls = 0
 let reviewerAborted = false
-const delayed = new Set()
+let releaseReview
+let reviewHeldAt
+let releasedReviews = 0
 const server = createServer(async (req, res) => {
   try {
     let text = ""
@@ -84,13 +117,18 @@ const server = createServer(async (req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" })
         const content = scenario === "correction" && reviewerCalls === 1
           ? '{"safe":"yes","desc":"Incorrect boolean type."}'
-          : JSON.stringify({ safe: scenario !== "external", desc: scenario === "correction" ? formattedDescription : "Counts two fruit names, prints the count, and writes it to executed-marker." })
+          : JSON.stringify({ safe: scenario !== "external", desc: scenario === "correction" ? longDescription : "Counts two fruit names, prints the count, and writes it to executed-marker." })
         res.end(JSON.stringify({ choices: [{ message: { content } }] }))
       }
       if (scenario === "cancel") {
         res.on("close", () => { if (!res.writableEnded) reviewerAborted = true })
-        const timer = setTimeout(() => { delayed.delete(timer); reply() }, 6000)
-        delayed.add(timer)
+        reviewHeldAt = Date.now()
+        releaseReview = () => {
+          assert.ok(reviewerAborted && res.destroyed, "release must follow observed client cancellation")
+          releasedReviews++
+          reply()
+          releaseReview = undefined
+        }
       } else reply()
       return
     }
@@ -119,26 +157,32 @@ const server = createServer(async (req, res) => {
     res.end(String(error))
   }
 })
-await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
-const port = server.address().port
-const config = {
-  $schema: "https://opencode.ai/config.json",
-  model: "fixture/fixture",
-  small_model: "fixture/fixture",
-  autoupdate: false,
-  permission: { bash: "ask", external_directory: "ask" },
-  provider: { fixture: { npm: "@ai-sdk/openai-compatible", name: "Fixture", options: { baseURL: `http://127.0.0.1:${port}/main`, apiKey: "fixture-only" }, models: { fixture: { name: "Fixture", limit: { context: 32000, output: 1000 } } } } },
-}
-const tuiFile = path.join(temp, "tui.json")
-await writeFile(tuiFile, JSON.stringify({
-  $schema: "https://opencode.ai/tui.json",
-  theme: scenario === "correction" ? "tokyonight" : "opencode",
-  plugin: [[pluginFile, { baseURL: `http://127.0.0.1:${port}/review`, model: "review-fixture", apiKey: "fixture-review-key" }]],
-}))
 const socket = `command-reviewer-${process.pid}`
 const tmux = (...args) => execFileSync("tmux", ["-L", socket, ...args], { encoding: "utf8" })
 let screen = ""
+let tmuxStarted = false
+const failAfterListen = process.argv.includes("--fail-after-listen")
 try {
+  await new Promise((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  if (failAfterListen) throw new Error("Injected post-listen startup failure")
+  const port = server.address().port
+  const config = {
+    $schema: "https://opencode.ai/config.json",
+    model: "fixture/fixture",
+    small_model: "fixture/fixture",
+    autoupdate: false,
+    permission: { bash: "ask", external_directory: "ask" },
+    provider: { fixture: { npm: "@ai-sdk/openai-compatible", name: "Fixture", options: { baseURL: `http://127.0.0.1:${port}/main`, apiKey: "fixture-only" }, models: { fixture: { name: "Fixture", limit: { context: 32000, output: 1000 } } } } },
+  }
+  const tuiFile = path.join(temp, "tui.json")
+  await writeFile(tuiFile, JSON.stringify({
+    $schema: "https://opencode.ai/tui.json",
+    theme: scenario === "correction" ? "tokyonight" : "opencode",
+    plugin: [[pluginFile, { baseURL: `http://127.0.0.1:${port}/review`, model: "review-fixture", apiKey: "fixture-review-key" }]],
+  }))
   const env = {
     HOME: temp,
     XDG_CONFIG_HOME: path.join(temp, "config"),
@@ -156,6 +200,7 @@ try {
     OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1",
   }
   await mkdir(path.join(root, ".runtime"), { recursive: true })
+  tmuxStarted = true
   tmux("new-session", "-d", "-s", "smoke", "-x", String(initialWidth), "-y", scenario === "cancel" ? "24" : "40", "-c", project,
     "env", ...Object.entries(env).map(([k, v]) => `${k}=${v}`),
     process.env.OPENCODE_BIN ?? "opencode", project,
@@ -166,7 +211,7 @@ try {
     while (Date.now() < deadline) {
       await sleep(100)
       screen = capture()
-      if (condition(screen)) return
+      if (await condition(screen)) return
     }
     throw new Error("Timed out waiting for expected terminal state")
   }
@@ -175,6 +220,28 @@ try {
   const hasExpected = (s) => scenario === "cancel" ? !!spinnerFrame(s) : s.includes(expected)
   const hasPanel = (s) => /Permission analysis|Counts two fruit names|Analysis unavailable/.test(s)
   const toggleSidebar = () => tmux("send-keys", "-t", "smoke", "C-x", "b")
+  // SGR terminal mouse events enter the real host input path. Coordinates are
+  // one-based; wheel = 64/65, left drag = press 0 / motion 32 / release 0.
+  const mouse = (button, x, y, release = false) => tmux("send-keys", "-t", "smoke", "-l", `\x1b[<${button};${x};${y}${release ? "m" : "M"}`)
+  const drag = async (from, to) => {
+    mouse(0, 158, from)
+    await sleep(100)
+    const step = Math.sign(to - from)
+    for (let y = from + step; step > 0 ? y <= to : y >= to; y += step) {
+      mouse(32, 158, y)
+      await sleep(20)
+    }
+    mouse(0, 158, to, true)
+  }
+  const wheelToEnd = async () => {
+    for (let i = 0; i < 100 && !capture().includes(finalLine); i++) {
+      mouse(65, 140, 20)
+      await sleep(40)
+    }
+    await until((s) => s.includes(finalLine), 10000)
+    assert.ok(!screen.includes("Counts two fruit names"), "wheel should move the analysis viewport")
+    assert.match(screen, /Allow once.*Allow always.*Reject/, "native approval controls must survive scrolling")
+  }
   const assertReviewLayout = (screen, width) => {
     const lines = screen.split("\n")
     const headingLine = lines.findIndex((line) => line.includes("Permission analysis"))
@@ -212,6 +279,13 @@ try {
     : scenario !== "external" || s.includes("Counts two fruit names")
   if (scenario === "cancel") {
     await until((s) => s.includes("Permission required") && reviewerCalls > 0)
+    // Deliberately exceed the old six-second response race while the HTTP reply
+    // remains held. This is a slow-UI regression, not a response synchronization.
+    await sleep(6500)
+    screen = capture()
+    assert.ok(Date.now() - reviewHeldAt > 6000)
+    assert.equal(releasedReviews, 0)
+    assert.ok(releaseReview && !reviewerAborted, "review must remain pending throughout slow UI interaction")
     assert.ok(!hasPanel(screen) && !screen.includes("Context"), "a narrow terminal must not open the sidebar or show a bottom-bar fallback")
     await writeFile(path.join(root, ".runtime/cancel-sidebar-hidden.txt"), screen)
     toggleSidebar()
@@ -255,6 +329,17 @@ try {
   }
   if (scenario === "correction") {
     assertConversationStyles(styledScreen)
+    const initialScrollbar = assertScrollbarTheme(styledScreen)
+    assert.ok(!screen.includes(finalLine), "long analysis must initially overflow")
+    await wheelToEnd()
+    await writeFile(path.join(root, ".runtime/correction-wheel-final.txt"), screen)
+    await drag(38, 6)
+    await until((s) => formattingReady(s) && !s.includes(finalLine), 10000)
+    await drag(6, 40)
+    await until((s) => s.includes(finalLine), 10000)
+    await writeFile(path.join(root, ".runtime/correction-drag-final.txt"), screen)
+    await drag(38, 6)
+    await until(formattingReady, 10000)
     tmux("resize-window", "-t", "smoke", "-x", "80", "-y", "24")
     await until((s) => s.includes("Permission required") && !hasPanel(s) && !s.includes("Context") && s.split("\n").length === 25)
     await writeFile(path.join(root, ".runtime/correction-sidebar-hidden.txt"), screen)
@@ -284,9 +369,24 @@ try {
     await until((s) => s.includes("Permission analysis") && s.includes(expected) && formattingReady(s), 10000)
     const changedTheme = tmux("capture-pane", "-p", "-e", "-t", "smoke")
     assertConversationStyles(changedTheme)
+    const changedScrollbar = assertScrollbarTheme(changedTheme)
+    assert.notEqual(changedScrollbar.panel, initialScrollbar.panel, "live theme change must update the track")
+    assert.notEqual(changedScrollbar.muted, initialScrollbar.muted, "live theme change must update the thumb")
     assert.equal(styleAt(changedTheme, expected).fg, "127,216,143", "rating should follow a live theme change")
     assert.notEqual(styleAt(changedTheme, "executed-marker").fg, styleAt(styledScreen, "executed-marker").fg, "analysis code colors should update with the theme")
     await writeFile(path.join(root, ".runtime/correction-theme-changed.ansi"), changedTheme)
+    await wheelToEnd()
+    await writeFile(path.join(root, ".runtime/correction-theme-wheel-final.txt"), screen)
+    tmux("send-keys", "-t", "smoke", "C-f")
+    await until((s) => s.includes("Permission required") && s.includes("minimize"), 10000)
+    await writeFile(path.join(root, ".runtime/correction-permission-fullscreen.txt"), screen)
+    await writeFile(path.join(root, ".runtime/correction-permission-fullscreen.ansi"), tmux("capture-pane", "-p", "-e", "-t", "smoke"))
+    assert.match(screen, /Allow once.*Allow always.*Reject/, "fullscreen native approval controls must remain visible")
+    assert.match(screen, /python3 fruits\.py/, "fullscreen must retain the exact native command")
+    assert.ok(!hasPanel(screen) && !screen.includes(finalLine), "native fullscreen portal should cover the analysis overlay")
+    console.log("Native permission fullscreen layering: analysis covered; native command and all approval controls visible")
+    tmux("send-keys", "-t", "smoke", "C-f")
+    await until((s) => s.includes("Permission analysis") && s.includes("fullscreen") && !s.includes("minimize"), 10000)
     assert.equal(reviewerCalls, 2, "resizing or toggling the sidebar must not restart the review")
   }
   if (scenario === "external") {
@@ -334,11 +434,18 @@ try {
   tmux("send-keys", "-t", "smoke", scenario === "correction" ? "Enter" : "Escape")
   await until((s) => !s.includes("Permission required") && !hasPanel(s), 10000)
   if (scenario === "correction") {
-    await until((s) => s.includes("Fixture complete."), 10000)
+    // The generated sidebar title can also be "Fixture complete." before bash
+    // finishes. Observe execution, rather than mistaking that title for a reply.
+    await until(async (s) => s.includes("Fixture complete.") && await access(path.join(commandDirectory, "executed-marker")).then(() => true, () => false), 10000)
     await access(path.join(commandDirectory, "executed-marker"))
   } else {
-    await sleep(scenario === "cancel" ? 6300 : 300)
-    if (scenario === "cancel") assert.ok(reviewerAborted, "pending HTTP review should be aborted on user rejection")
+    if (scenario === "cancel") {
+      await until(() => reviewerAborted, 10000)
+      assert.equal(releasedReviews, 0, "HTTP abort must precede the held response release")
+      releaseReview()
+      assert.equal(releasedReviews, 1)
+      await until((s) => s.includes("tab agents") && !s.includes("Permission required") && !hasPanel(s), 10000)
+    } else await sleep(300)
     await assert.rejects(access(path.join(commandDirectory, "executed-marker")))
     assert.ok(!hasPanel(capture()), "late response must not resurrect panel")
   }
@@ -350,15 +457,17 @@ try {
   assert.match(capture(), /Context/, "native sidebar sections should remain after the temporary review is removed")
   await writeFile(path.join(root, `.runtime/${scenario}-resolved.txt`), capture())
   await writeFile(path.join(root, `.runtime/${scenario}-requests.json`), JSON.stringify(calls, null, 2))
-  console.log(`PASS ${scenario}: native approval, exact evidence, advisory behavior, panel cleanup${scenario === "cancel" ? ", HTTP cancellation and late-result suppression at 80x24" : ""}. Isolated files: ${temp}`)
+  console.log(`PASS ${scenario}: native approval, exact evidence, advisory behavior, panel cleanup${scenario === "cancel" ? ", >6s held response, observed HTTP cancellation, released late response and clean sidebar remount at 80x24" : scenario === "correction" ? ", long-analysis wheel/drag, live scrollbar theme and native fullscreen layering" : ""}. Isolated files: ${temp}`)
 } catch (error) {
   console.error(screen)
   console.error(`Isolated diagnostic files: ${temp}`)
   console.error(`Requests received: ${calls.length}`)
   throw error
 } finally {
-  try { tmux("kill-server") } catch {}
-  for (const timer of delayed) clearTimeout(timer)
+  if (tmuxStarted) { try { tmux("kill-server") } catch {} }
+  releaseReview = undefined
   server.closeAllConnections()
   await new Promise((resolve) => server.close(resolve))
+  assert.equal(server.listening, false, "fixture HTTP server must close even after startup failure")
+  if (failAfterListen) console.log("PASS post-listen cleanup: fixture HTTP server closed")
 }

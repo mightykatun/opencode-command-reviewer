@@ -1,7 +1,8 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import type { AssistantMessage, Message, Part, PermissionRequest, Session } from "@opencode-ai/sdk/v2"
-import { latestUserPrompt, loadContext, type ContextReader } from "../src/context.js"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { latestUserPrompt, loadContext, loadRootMessages, type ContextReader } from "../src/context.js"
 import { collectEvidence } from "../src/evidence.js"
 
 function user(id: string, text: string, created: number, flags = {}): { info: Message; parts: Part[] } {
@@ -24,6 +25,111 @@ const reader = (overrides: Partial<ContextReader> = {}): ContextReader => ({
   message: async () => ({ info: assistant, parts: [tool] }),
   projects: async () => [{ id: "project", worktree: "/project", name: "Initial repository", vcs: "git", sandboxes: [], time: { created: 1, updated: 1 } }],
   ...overrides,
+})
+
+test("SDK history adapter forwards opaque response cursors and preserves prompt barriers", async () => {
+  const cursor = Buffer.from(JSON.stringify({ id: "opaque-message", time: 123 })).toString("base64url")
+  for (const barrier of [false, true]) {
+    const requests: URL[] = []
+    const client = createOpencodeClient({ baseUrl: "http://fixture.invalid", fetch: async (request) => {
+      const url = new URL(request instanceof Request ? request.url : request)
+      requests.push(url)
+      assert.equal(url.pathname, "/session/root/message")
+      assert.equal(url.searchParams.get("directory"), "/project")
+      assert.equal(url.searchParams.get("limit"), "100")
+      if (requests.length === 1) {
+        assert.equal(url.searchParams.get("before"), null)
+        return Response.json(Array.from({ length: 100 }, (_, i) => user(`synthetic-${i}`, "skip", 100 + i, { synthetic: true })), { headers: { "X-Next-Cursor": cursor } })
+      }
+      assert.equal(url.searchParams.get("before"), cursor)
+      const messages = [user("real", "older genuine ask", 1)]
+      if (barrier) {
+        const attachment = user("attachment", "", 2)
+        attachment.parts = [{ id: "file", messageID: "attachment", sessionID: "root", type: "file", mime: "text/plain", url: "file:///fixture" }]
+        messages.push(attachment)
+      }
+      return Response.json(messages, { headers: { "X-Next-Cursor": "must-not-follow" } })
+    } })
+    assert.equal(latestUserPrompt(await loadRootMessages(client, "root", "/project", new AbortController().signal)), barrier ? null : "older genuine ask")
+    assert.equal(requests.length, 2)
+  }
+})
+
+test("SDK history exhaustion, repeated cursors and page cap are bounded and distinguishable", async () => {
+  for (const mode of ["exhausted", "repeated", "capped"] as const) {
+    let calls = 0
+    const client = createOpencodeClient({ baseUrl: "http://fixture.invalid", fetch: async () => {
+      calls++
+      return Response.json([user(`synthetic-${calls}`, "skip", calls, { synthetic: true })], {
+        headers: mode === "exhausted" ? {} : { "X-Next-Cursor": mode === "repeated" ? "same" : `opaque-${calls}` },
+      })
+    } })
+    const context = await loadContext(request, reader({ messages: (id, signal) => loadRootMessages(client, id, "/project", signal) }), new AbortController().signal)
+    assert.equal(context?.userPrompt, null)
+    assert.equal(calls, mode === "exhausted" ? 1 : mode === "repeated" ? 2 : 20)
+    const diagnostic = context?.limitations.join(" ") ?? ""
+    if (mode === "exhausted") assert.doesNotMatch(diagnostic, /history traversal incomplete/)
+    else assert.match(diagnostic, mode === "repeated" ? /repeated pagination cursor/ : /20-page limit/)
+  }
+})
+
+test("SDK history pagination stops on cancellation", async () => {
+  const abort = new AbortController()
+  let calls = 0
+  const client = createOpencodeClient({ baseUrl: "http://fixture.invalid", fetch: async () => {
+    calls++
+    abort.abort(new Error("history cancelled"))
+    return Response.json([], { headers: { "X-Next-Cursor": "never-follow" } })
+  } })
+  await assert.rejects(loadRootMessages(client, "root", "/project", abort.signal), /history cancelled/)
+  assert.equal(calls, 1)
+})
+
+test("foreign message and part identities neither provide a root prompt nor stop pagination", async () => {
+  const foreign = user("foreign", "foreign prompt", 3)
+  foreign.info.sessionID = "other"
+  foreign.parts[0]!.sessionID = "other"
+  const wrongSession = user("wrong-session", "foreign part", 2)
+  wrongSession.parts[0]!.sessionID = "other"
+  const wrongMessage = user("wrong-message", "foreign part", 1)
+  wrongMessage.parts[0]!.messageID = "other"
+  const wrongFile = user("wrong-file", "", 4)
+  wrongFile.parts = [{ id: "file", messageID: "other", sessionID: "root", type: "file", mime: "text/plain", url: "file:///fixture" }]
+  const invalid = [foreign, wrongSession, wrongMessage, wrongFile]
+  assert.equal(latestUserPrompt(invalid, "root"), null)
+  const context = await loadContext(request, reader({ messages: async () => invalid }), new AbortController().signal)
+  assert.equal(context?.userPrompt, null)
+  let calls = 0
+  const client = createOpencodeClient({ baseUrl: "http://fixture.invalid", fetch: async () => {
+    calls++
+    return calls === 1 ? Response.json(invalid, { headers: { "X-Next-Cursor": "older" } }) : Response.json([user("valid", "genuine root", 0)])
+  } })
+  assert.equal(latestUserPrompt(await loadRootMessages(client, "root", "/project", new AbortController().signal), "root"), "genuine root")
+  assert.equal(calls, 2)
+})
+
+test("absent and malformed invocation paths remain partial context without session substitution", async () => {
+  for (const invocation of [undefined, null, {}, { cwd: 123, root: false }, { cwd: "/execution", root: 123 }, { cwd: null, root: "/tree" }]) {
+    const info = { ...assistant, path: invocation } as unknown as AssistantMessage
+    const result = await loadContext(request, reader({ message: async () => ({ info, parts: [tool] }) }), new AbortController().signal)
+    assert.ok(result)
+    assert.equal(result.cwd, invocation?.cwd === "/execution" ? "/execution/scripts" : null)
+    assert.equal(result.execution?.instanceWorktree, invocation?.root === "/tree" ? "/tree" : null)
+    assert.equal(result.userPrompt, "Actual user intent")
+    assert.notEqual(result.cwd, "/project")
+  }
+})
+
+test("supplied non-string workdir stays unknown despite a valid invocation directory", async () => {
+  for (const workdir of [null, false, 1, {}, []]) {
+    const running: Part = { ...tool, state: { status: "running", input: { command: "pwd", workdir }, time: { start: 1 } } }
+    const result = await loadContext(request, reader({ message: async () => ({ info: assistant, parts: [running] }) }), new AbortController().signal)
+    assert.equal(result?.cwd, null)
+    assert.equal(result?.execution?.canonicalCwd, null)
+    assert.equal(result?.execution?.cwdSource, "unavailable")
+    assert.equal(result?.execution?.instanceDirectory, "/execution")
+    assert.ok(result?.limitations.some((text) => text.includes("tool.workdir is not a string")))
+  }
 })
 
 test("latest genuine prompt excludes synthetic, ignored and attributed text", () => {

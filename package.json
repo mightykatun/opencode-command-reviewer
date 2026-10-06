@@ -44,6 +44,9 @@
     "typescript": "5.8.2"
   },
   "overrides": {
-    "@babel/core": "$@babel/core"
+    "@babel/core": "$@babel/core",
+    "solid-js": {
+      "seroval": "1.6.3"
+    }
   }
 }

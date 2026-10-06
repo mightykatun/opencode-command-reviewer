@@ -2,7 +2,7 @@ import type { Config } from "./config.js"
 import type { Assessment, Evidence } from "./types.js"
 import { DEFAULT_INSTRUCTIONS, CONTRACT, correctionPrompt } from "./prompts.js"
 
-export class FormatError extends Error {}
+class FormatError extends Error {}
 
 export function parseAssessment(content: string): Assessment {
   let value: unknown
@@ -66,8 +66,8 @@ export async function review(
   fetcher: typeof fetch = fetch,
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<Assessment> {
-  const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv] : undefined)
-  if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset`)
+  const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)
+  if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset or empty`)
   const messages = [
     { role: "system", content: `${config.instructions ?? DEFAULT_INSTRUCTIONS}\n\n${CONTRACT}` },
     { role: "user", content: JSON.stringify(evidence) },
@@ -98,8 +98,15 @@ export async function review(
     }
     const choices = (envelope as { choices?: unknown })?.choices
     if (!Array.isArray(choices) || choices.length !== 1) throw new Error("Reviewer API must return one completion")
-    const message = choices[0]?.message
-    if (!message || typeof message.content !== "string" || message.tool_calls?.length || message.refusal) {
+    const choice = choices[0]
+    const message = choice?.message
+    // Minimal providers may omit metadata; explicit metadata must describe a completed text response.
+    if (!message || typeof message.content !== "string"
+      || (message.role !== undefined && message.role !== "assistant")
+      || (choice.finish_reason !== undefined && choice.finish_reason !== "stop")
+      || message.function_call != null
+      || (message.tool_calls != null && (!Array.isArray(message.tool_calls) || message.tool_calls.length !== 0))
+      || message.refusal) {
       throw new Error("Reviewer API did not return a text assessment")
     }
     signal.throwIfAborted()

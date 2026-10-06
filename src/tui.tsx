@@ -1,9 +1,8 @@
 import { createEffect, createMemo, createSignal, Index, onCleanup, Show } from "solid-js"
 import { RGBA, SyntaxStyle } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule, TuiPluginApi } from "@opencode-ai/plugin/tui"
-import type { Message, Part } from "@opencode-ai/sdk/v2"
 import { parseConfig, type Config } from "./config.js"
-import { loadContext, findUserPrompt, type ContextReader } from "./context.js"
+import { loadContext, loadRootMessages, type ContextReader } from "./context.js"
 import { Controller, displayText, visibleReview, type View } from "./controller.js"
 import { collectEvidence } from "./evidence.js"
 import { review, withDeadline } from "./reviewer.js"
@@ -62,24 +61,7 @@ function contextReader(api: TuiPluginApi): ContextReader {
       const result = await api.client.session.message({ sessionID, messageID, ...location() }, { signal })
       return result.data
     },
-    messages: async (sessionID, signal) => {
-      // Pages are newest-first at the API boundary; search by timestamp in each
-      // page and continue if a page only contains synthetic/assistant messages.
-      let before: string | undefined
-      const seen = new Set<string>()
-      for (let page = 0; page < 20; page++) {
-        signal.throwIfAborted()
-        const result = await api.client.session.messages({ sessionID, limit: 100, before, ...location() }, { signal })
-        if (!result.data) throw new Error("Root messages unavailable")
-        const messages: { info: Message; parts: Part[] }[] = result.data
-        if (findUserPrompt(messages) || messages.length < 100) return messages
-        const oldest = messages.toSorted((a, b) => a.info.id.localeCompare(b.info.id))[0]?.info.id
-        if (!oldest || seen.has(oldest)) break
-        seen.add(oldest)
-        before = oldest
-      }
-      return []
-    },
+    messages: (sessionID, signal) => loadRootMessages(api.client, sessionID, location().directory, signal),
   }
 }
 
@@ -90,11 +72,11 @@ const tui: TuiPlugin = async (api, options) => {
   const [views, setViews] = createSignal<View[]>([])
   const [sidebar, setSidebar] = createSignal<{ sessionID: string; token: symbol }>()
   const reader = contextReader(api)
-  const controller = new Controller(async (request, parent, setCommand) => {
+  const controller = new Controller(async (request, parent, onIdentified) => {
     return withDeadline(parent, config?.timeoutMs ?? 30000, async (signal) => {
       const context = await loadContext(request, reader, signal)
       if (!context) return null
-      setCommand(context.command)
+      onIdentified()
       if (!config) throw new Error(configError)
       const evidence = await collectEvidence(context, config, signal)
       return review(evidence, config, signal)
@@ -170,7 +152,11 @@ const tui: TuiPlugin = async (api, options) => {
                     <ReviewLoading api={api} />
                   </Show>
                 </box>
-                <scrollbox marginTop={1} flexGrow={1} minHeight={0} contentOptions={{ minHeight: 0 }}>
+                <scrollbox marginTop={1} flexGrow={1} minHeight={0} contentOptions={{ minHeight: 0 }}
+                  scrollbarOptions={{ trackOptions: {
+                    backgroundColor: api.theme.current.backgroundPanel,
+                    foregroundColor: api.theme.current.textMuted,
+                  } }}>
                   <Show when={view.assessment} fallback={
                     <Show when={view.status === "unavailable"}>
                       <text fg={api.theme.current.text} width="100%" flexShrink={0}>

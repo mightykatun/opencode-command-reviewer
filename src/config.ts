@@ -20,7 +20,7 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     return value.trim()
   }
   const number = (name: string, fallback: number, min: number, max: number) => {
-    const value = options[name] ?? fallback
+    const value = options[name] === undefined ? fallback : options[name]
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
       throw new Error(`${name} must be an integer between ${min} and ${max}`)
     }
@@ -28,7 +28,8 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
   }
   let url: URL
   try { url = new URL(text("baseURL")!) } catch { throw new Error("baseURL must be an HTTP(S) API base URL") }
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+  // search/hash are empty for bare delimiters, but href retains them.
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || /[?#]/.test(url.href)) {
     throw new Error("baseURL must use HTTP(S) without embedded credentials, query, or fragment")
   }
   const apiKeyEnv = text("apiKeyEnv", true)

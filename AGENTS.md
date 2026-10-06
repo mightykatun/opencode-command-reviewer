@@ -35,7 +35,8 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - Documentation-only changes need reference/format review, not runtime/model tests.
 - `npm pack` rebuilds via `prepack`. `.github/workflows/release.yml` runs on published
   GitHub releases (including prereleases), validates `v<package.json version>` and
-  lockfile versions, runs `check`/`check:package`, then uploads the `.tgz` asset.
+  lockfile versions, runs typecheck/tests and `check:package` (two builds), then
+  uploads the `.tgz` asset.
   Use `npm version X.Y.Z --no-git-tag-version` to update both manifests; release tags
   must include the workflow. CI packs with `--ignore-scripts` after verification.
 

@@ -3,13 +3,12 @@ import type { Assessment } from "./types.js"
 
 export interface View {
   request: PermissionRequest
-  command: string
-  status: "identifying" | "analyzing" | "complete" | "unavailable" | "unrelated"
+  status: "identifying" | "unidentified" | "analyzing" | "complete" | "unavailable" | "unrelated"
   assessment?: Assessment
   error?: string
 }
 
-type Evaluate = (request: PermissionRequest, signal: AbortSignal, command: (value: string) => void) => Promise<Assessment | null>
+type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void) => Promise<Assessment | null>
 interface Entry { view: View; abort: AbortController }
 
 /** This component has no host permission-writing or shell-execution capability. */
@@ -29,7 +28,6 @@ export class Controller {
       abort: new AbortController(),
       view: {
         request,
-        command: typeof request.metadata.command === "string" ? request.metadata.command : request.patterns.join(" ; "),
         status: request.permission === "bash" ? "analyzing" : request.permission === "external_directory" ? "identifying" : "unrelated",
       },
     }
@@ -39,14 +37,17 @@ export class Controller {
     const active = () => !this.stopped && !entry.abort.signal.aborted && this.entries.get(request.id) === entry
     void Promise.resolve().then(() => {
       entry.abort.signal.throwIfAborted()
-      return this.evaluate(request, entry.abort.signal, (command) => {
-        if (active()) { entry.view = { ...entry.view, command, status: "analyzing" }; this.publish() }
+      return this.evaluate(request, entry.abort.signal, () => {
+        // A timed-out evaluator may still call back after its review has settled.
+        if (active() && (entry.view.status === "identifying" || entry.view.status === "analyzing")) {
+          entry.view = { ...entry.view, status: "analyzing" }; this.publish()
+        }
       })
     }).then((assessment) => {
       if (active()) { entry.view = assessment ? { ...entry.view, status: "complete", assessment } : { ...entry.view, status: "unrelated" }; this.publish() }
     }, (error: unknown) => {
       if (active()) {
-        entry.view = { ...entry.view, status: "unavailable", error: error instanceof Error ? error.message : "Review failed" }
+        entry.view = { ...entry.view, status: entry.view.status === "identifying" ? "unidentified" : "unavailable", error: error instanceof Error ? error.message : "Review failed" }
         this.publish()
       }
     })
@@ -61,6 +62,9 @@ export class Controller {
   }
 
   deleted(sessionID: string) {
+    if (this.stopped) return
+    // A startup snapshot may contain requests for a session not yet tracked here.
+    this.version++
     for (const entry of this.entries.values()) if (entry.view.request.sessionID === sessionID) this.replied(entry.view.request.id)
   }
 
@@ -88,9 +92,15 @@ export function visibleReview(
   if (!sessionID) return
   const session = getSession(sessionID)
   if (!session || session.parentID) return
-  const first = views.filter((v) => v.request.sessionID === sessionID || getSession(v.request.sessionID)?.parentID === sessionID)
-    .toSorted((a, b) => a.request.sessionID.localeCompare(b.request.sessionID) || a.request.id.localeCompare(b.request.id))[0]
-  return first && first.status !== "unrelated" && first.status !== "identifying" ? first : undefined
+  let first: View | undefined
+  for (const view of views) {
+    const request = view.request
+    if (request.sessionID !== sessionID && getSession(request.sessionID)?.parentID !== sessionID) continue
+    // Match native code-unit ordering; hidden requests still participate in selection.
+    if (!first || request.sessionID < first.request.sessionID ||
+      (request.sessionID === first.request.sessionID && request.id < first.request.id)) first = view
+  }
+  return first && first.status !== "unrelated" && first.status !== "identifying" && first.status !== "unidentified" ? first : undefined
 }
 
 export function displayText(text: string): string {

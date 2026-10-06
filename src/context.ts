@@ -1,6 +1,6 @@
 import path from "node:path"
 import { realpath } from "node:fs/promises"
-import type { Message, Part, PermissionRequest, Project, Session } from "@opencode-ai/sdk/v2"
+import type { Message, OpencodeClient, Part, PermissionRequest, Project, Session } from "@opencode-ai/sdk/v2"
 import type { Evidence, ProjectLocation, SessionLocation } from "./types.js"
 
 export interface ContextReader {
@@ -10,21 +10,43 @@ export interface ContextReader {
   projects(signal: AbortSignal): Promise<readonly Project[]>
 }
 
-export type CommandContext = Omit<Evidence, "files">
+type CommandContext = Omit<Evidence, "files">
+
+class HistoryIncompleteError extends Error {}
+
+export async function loadRootMessages(client: OpencodeClient, sessionID: string, directory: string, signal: AbortSignal) {
+  // Each page is chronological; the opaque response cursor traverses older pages.
+  let before: string | undefined
+  const seen = new Set<string>()
+  for (let page = 0; page < 20; page++) {
+    signal.throwIfAborted()
+    const result = await client.session.messages({ sessionID, directory, limit: 100, before }, { signal })
+    signal.throwIfAborted()
+    if (!result.data) throw new Error("Root messages unavailable")
+    if (findUserPrompt(result.data, sessionID)) return result.data
+    const next = result.response.headers.get("x-next-cursor")
+    if (!next) return result.data
+    if (seen.has(next)) throw new HistoryIncompleteError("Root-user history traversal incomplete: repeated pagination cursor.")
+    seen.add(next)
+    before = next
+  }
+  throw new HistoryIncompleteError("Root-user history traversal incomplete: 20-page limit reached.")
+}
 
 /** Filter synthetic and attributed text using the public part metadata. */
-export function findUserPrompt(messages: readonly { info: Message; parts: Part[] }[]): { text: string | null } | undefined {
-  const ordered = messages.filter((m) => m.info.role === "user").toSorted((a, b) => b.info.time.created - a.info.time.created || b.info.id.localeCompare(a.info.id))
+export function findUserPrompt(messages: readonly { info: Message; parts: Part[] }[], sessionID?: string): { text: string | null } | undefined {
+  const ordered = messages.filter((m) => m.info.role === "user" && (sessionID === undefined || m.info.sessionID === sessionID)).toSorted((a, b) => b.info.time.created - a.info.time.created || (a.info.id < b.info.id ? 1 : a.info.id > b.info.id ? -1 : 0))
   for (const message of ordered) {
-    const parts = message.parts.filter((p) => p.type === "text" && !p.synthetic && !p.ignored && !p.metadata?.source)
+    const owned = message.parts.filter((p) => p.sessionID === message.info.sessionID && p.messageID === message.info.id)
+    const parts = owned.filter((p) => p.type === "text" && !p.synthetic && !p.ignored && !p.metadata?.source)
     if (parts.length) return { text: parts.map((p) => p.type === "text" ? p.text : "").join("\n").trim() || null }
     // A newer attachment-only user message must not be replaced by an older ask.
-    if (message.parts.some((p) => p.type === "file")) return { text: null }
+    if (owned.some((p) => p.type === "file")) return { text: null }
   }
 }
 
-export function latestUserPrompt(messages: readonly { info: Message; parts: Part[] }[]): string | null {
-  return findUserPrompt(messages)?.text ?? null
+export function latestUserPrompt(messages: readonly { info: Message; parts: Part[] }[], sessionID?: string): string | null {
+  return findUserPrompt(messages, sessionID)?.text ?? null
 }
 
 export async function loadContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal): Promise<CommandContext | null> {
@@ -45,17 +67,21 @@ export async function loadContext(request: PermissionRequest, reader: ContextRea
   const { command, workdir } = part.state.input
   if (typeof command !== "string" || !command.trim()) throw new Error("Shell command unavailable")
   const limitations: string[] = []
-  const instanceDirectory = message.info.role === "assistant" && path.isAbsolute(message.info.path.cwd) ? message.info.path.cwd : null
-  const instanceWorktree = message.info.role === "assistant" && path.isAbsolute(message.info.path.root) ? message.info.path.root : null
+  const invocation = message.info.role === "assistant" ? message.info.path : undefined
+  const instanceDirectory = typeof invocation?.cwd === "string" && path.isAbsolute(invocation.cwd) ? invocation.cwd : null
+  const instanceWorktree = typeof invocation?.root === "string" && path.isAbsolute(invocation.root) ? invocation.root : null
+  const invalidWorkdir = workdir !== undefined && typeof workdir !== "string"
   const requestedWorkdir = typeof workdir === "string" && workdir ? workdir : null
   // ShellTool resolves relative workdir against its execution instance, not the
   // stored session directory (which can differ when continuing a session).
-  const cwd = requestedWorkdir && path.isAbsolute(requestedWorkdir) ? requestedWorkdir
+  const cwd = invalidWorkdir ? null : requestedWorkdir && path.isAbsolute(requestedWorkdir) ? requestedWorkdir
     : instanceDirectory ? path.resolve(instanceDirectory, requestedWorkdir ?? ".") : null
   if (!instanceDirectory) limitations.push("Execution instance directory unavailable; the session's starting directory is not substituted for it.")
+  if (!instanceWorktree) limitations.push("Execution instance worktree unavailable.")
+  if (invalidWorkdir) limitations.push("Supplied tool.workdir is not a string; execution directory is unknown.")
   const execution: NonNullable<Evidence["execution"]> = {
     tool: "bash", requestedWorkdir, instanceDirectory, instanceWorktree,
-    cwdSource: requestedWorkdir && path.isAbsolute(requestedWorkdir) ? "absolute tool.workdir"
+    cwdSource: invalidWorkdir ? "unavailable" : requestedWorkdir && path.isAbsolute(requestedWorkdir) ? "absolute tool.workdir"
       : instanceDirectory ? requestedWorkdir ? "tool.workdir relative to assistant.path.cwd" : "assistant.path.cwd" : "unavailable",
     canonicalCwd: null,
   }
@@ -83,10 +109,10 @@ export async function loadContext(request: PermissionRequest, reader: ContextRea
       ancestor = parent
     }
     root = ancestor
-    prompt = latestUserPrompt(await reader.messages(root.id, signal))
-  } catch {
+    prompt = latestUserPrompt(await reader.messages(root.id, signal), root.id)
+  } catch (error) {
     signal.throwIfAborted()
-    limitations.push("Some session ancestry or root-user-prompt context is unavailable.")
+    limitations.push(error instanceof HistoryIncompleteError ? error.message : "Some session ancestry or root-user-prompt context is unavailable.")
   }
   let projects: readonly Project[] = []
   if (current || root) {

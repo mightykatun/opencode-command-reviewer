@@ -33,6 +33,7 @@ Add this plugin entry to `~/.config/opencode/tui.json` or `.opencode/tui.json`, 
 ```
 
 The endpoint must support Chat Completions; `/chat/completions` is appended to `baseURL`.
+HTTP and HTTPS are supported; HTTP sends evidence and any API key without transport encryption, including for remote endpoints.
 
 **Restart OpenCode after installation or configuration changes.** Keep the built file at the configured path. After updating the source, rebuild and restart.
 
@@ -68,10 +69,12 @@ For an authenticated endpoint, the plugin options can include the key directly:
 
 - While a shell permission is pending, a temporary **Permission analysis** panel covers the right sidebar. It shows **✓ Safe** or **! Unsafe** in the active theme's success/warning colors, followed by the agent's Markdown-formatted analysis using the conversation's theme palette. The normal sidebar returns when the permission is resolved.
 - Reviews follow the sidebar's visibility. If it is hidden or the terminal is narrow, use OpenCode's **Show sidebar** command (default: `Ctrl+X`, then `B`).
-- Sends the command, execution location, session/repository and permission context, latest user prompt, and directly invoked Python/shell source to your endpoint. Source can include files outside the project.
+- Sends the command, execution location, session/repository and permission context, latest user prompt, and directly invoked Python/shell source to your endpoint **before approval**. Source can include readable files outside the project and symlink targets; rejecting the command does not retract this transfer. Configure an endpoint you trust with that data.
 - Reports missing or oversized source explicitly. Imports, task runners and complex shell constructs are not fully resolved.
 - While reviewing, a muted gray block-scanner animation matches OpenCode's running indicator. Disabling OpenCode animations shows a static indicator instead. Failures display `! Analysis unavailable` and a reason. Resolving the approval removes the panel and cancels unfinished review.
 - Ratings are advisory model judgments, not a safety guarantee. Existing OpenCode permissions stay in control.
+- Long analysis supports mouse-wheel and scrollbar scrolling. Links are handled by the terminal; the plugin does not fetch them. No analysis-specific keyboard shortcuts are installed.
+- The timeout cancels asynchronous work but cannot interrupt synchronous parsing mid-operation. The evidence budget covers command/source bytes, not the entire HTTP payload; separate pending permissions can be reviewed concurrently without an aggregate cap.
 
 ## Development
 

@@ -20,11 +20,11 @@ const signal = () => new AbortController().signal
 const envelope = (content: string) => JSON.stringify({ choices: [{ message: { content } }] })
 
 async function endpoint(t: TestContext, handler: (index: number, res: ServerResponse) => void) {
-  const requests: { body: Record<string, any>; authorization?: string }[] = []
+  const requests: { body: Record<string, any>; authorization?: string; target?: string }[] = []
   const server = createServer(async (req, res) => {
     let body = ""
     for await (const chunk of req) body += chunk
-    requests.push({ body: JSON.parse(body), authorization: req.headers.authorization })
+    requests.push({ body: JSON.parse(body), authorization: req.headers.authorization, target: req.url })
     handler(requests.length - 1, res)
   })
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
@@ -46,9 +46,135 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   }
 })
 
+test("numeric settings default only on omission and enforce integer boundaries before transport", async (t) => {
+  for (const [name, fallback, min, max] of [
+    ["formatRetries", 1, 0, 100],
+    ["timeoutMs", 30000, 1, 3600000],
+    ["maxFiles", 4, 1, 1000],
+    ["maxEvidenceBytes", 65536, 1, 16 * 1024 * 1024],
+  ] as const) {
+    await t.test(name, async (t) => {
+      const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Unexpected."}')))
+      const options = { baseURL: config.baseURL, model: config.model }
+      assert.equal(parseConfig(options)[name], fallback)
+      assert.equal(parseConfig({ ...options, [name]: undefined })[name], fallback)
+      for (const value of [min, max]) assert.equal(parseConfig({ ...options, [name]: value })[name], value)
+      let fetchCalls = 0
+      const fetcher: typeof fetch = (...args) => { fetchCalls++; return fetch(...args) }
+      for (const value of [null, min - 1, max + 1, min + 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "fixture-secret", false]) {
+        await assert.rejects(async () => {
+          const cfg = parseConfig({ ...options, [name]: value })
+          await review(evidence, cfg, signal(), fetcher)
+        }, { message: `${name} must be an integer between ${min} and ${max}` })
+        assert.equal(fetchCalls, 0)
+        assert.equal(requests.length, 0)
+      }
+    })
+  }
+})
+
 test("strict boolean schema rejects coercion, fences, arrays, blank descriptions and extra keys", () => {
   assert.deepEqual(parseAssessment('{"safe":false,"desc":"  Prints credentials. "}'), { safe: false, desc: "Prints credentials." })
   for (const text of ['{"safe":"false","desc":"x"}', '{"safe":0,"desc":"x"}', '{"safe":true,"desc":" "}', '{"safe":true,"desc":"x","other":1}', '[]', 'null', '```json\n{"safe":true,"desc":"x"}\n```']) assert.throws(() => parseAssessment(text))
+})
+
+test("query and fragment base URLs fail before transport, including bare delimiters", async (t) => {
+  for (const suffix of ["?", "?key=fixture", "#", "#fragment", "?#", "/?", "/#"]) {
+    await t.test(suffix, async (t) => {
+      const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Unexpected."}')))
+      await assert.rejects(async () => {
+        const cfg = parseConfig({ ...config, baseURL: `${config.baseURL}${suffix}` })
+        await review(evidence, cfg, signal())
+      }, { message: "baseURL must use HTTP(S) without embedded credentials, query, or fragment" })
+      assert.deepEqual(requests.map((request) => request.target), [])
+    })
+  }
+})
+
+test("valid base URLs preserve encoded paths and normalize trailing slashes on the wire", async (t) => {
+  const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Counts fruits."}')))
+  const origin = new URL(config.baseURL).origin
+  for (const [path, target] of [
+    ["", "/chat/completions"],
+    ["/", "/chat/completions"],
+    ["/v1", "/v1/chat/completions"],
+    ["/v1/", "/v1/chat/completions"],
+    ["/v1///", "/v1/chat/completions"],
+    ["/v1/%3F%23%2F%20", "/v1/%3F%23%2F%20/chat/completions"],
+    ["/v1/%3f%23%2f%20///", "/v1/%3f%23%2f%20/chat/completions"],
+  ]) {
+    const before = requests.length
+    const cfg = parseConfig({ ...config, baseURL: `${origin}${path}` })
+    assert.deepEqual(await review(evidence, cfg, signal()), { safe: true, desc: "Counts fruits." })
+    assert.deepEqual(requests.slice(before).map((request) => request.target), [target])
+  }
+})
+
+test("minimal and explicit successful assistant envelopes remain compatible", async (t) => {
+  for (const [name, fields, messageFields] of [
+    ["minimal", {}, {}],
+    ["assistant role only", {}, { role: "assistant" }],
+    ["stop reason only", { finish_reason: "stop" }, {}],
+    ["assistant stop", { finish_reason: "stop" }, { role: "assistant" }],
+    ["null optional calls", { finish_reason: "stop" }, { role: "assistant", function_call: null, tool_calls: null, refusal: null }],
+    ["empty tool calls", { finish_reason: "stop" }, { role: "assistant", tool_calls: [] }],
+  ] as const) {
+    await t.test(name, async (t) => {
+      const { config, requests } = await endpoint(t, (_, res) => res.end(JSON.stringify({
+        choices: [{ ...fields, message: { ...messageFields, content: '{"safe":true,"desc":"Counts fruits."}' } }],
+      })))
+      assert.deepEqual(await review(evidence, config, signal()), { safe: true, desc: "Counts fruits." })
+      assert.deepEqual(requests.map((request) => request.target), ["/v1/chat/completions"])
+    })
+  }
+})
+
+test("invalid completion metadata terminates before assessment parsing without retries", async (t) => {
+  for (const [name, fields, messageFields] of [
+    ["legacy function call", {}, { function_call: { name: "fixture", arguments: "{}" } }],
+    ["empty legacy function call", {}, { function_call: {} }],
+    ["false legacy function call", {}, { function_call: false }],
+    ["string legacy function call", {}, { function_call: "" }],
+    ["tool call", {}, { tool_calls: [{ type: "function", function: { name: "fixture", arguments: "{}" } }] }],
+    ["object tool calls", {}, { tool_calls: {} }],
+    ["array-like tool calls", {}, { tool_calls: { length: 0 } }],
+    ["string tool calls", {}, { tool_calls: "" }],
+    ["false tool calls", {}, { tool_calls: false }],
+    ["numeric tool calls", {}, { tool_calls: 0 }],
+    ["user role", {}, { role: "user" }],
+    ["tool role", {}, { role: "tool" }],
+    ["null role", {}, { role: null }],
+    ["empty role", {}, { role: "" }],
+    ["length finish", { finish_reason: "length" }, {}],
+    ["filtered finish", { finish_reason: "content_filter" }, {}],
+    ["tool-call finish", { finish_reason: "tool_calls" }, {}],
+    ["function-call finish", { finish_reason: "function_call" }, {}],
+    ["null finish", { finish_reason: null }, {}],
+    ["empty finish", { finish_reason: "" }, {}],
+    ["unknown finish", { finish_reason: "unknown" }, {}],
+    ["refusal", {}, { refusal: "Cannot assess." }],
+  ] as const) {
+    await t.test(name, async (t) => {
+      for (const content of ['{"safe":true,"desc":"Must not be accepted."}', "bad assessment format"]) {
+        const { config, requests } = await endpoint(t, (_, res) => res.end(JSON.stringify({
+          choices: [{ finish_reason: "stop", ...fields, message: { role: "assistant", content, ...messageFields } }],
+        })))
+        config.formatRetries = 2
+        await assert.rejects(review(evidence, config, signal()), { message: "Reviewer API did not return a text assessment" })
+        assert.deepEqual(requests.map((request) => request.target), ["/v1/chat/completions"])
+      }
+    })
+  }
+})
+
+test("malformed assessment in an assistant stop envelope still gets format correction", async (t) => {
+  const { config, requests } = await endpoint(t, (index, res) => res.end(JSON.stringify({
+    choices: [{ finish_reason: "stop", message: { role: "assistant", content: index ? '{"safe":true,"desc":"Counts fruits."}' : "bad format" } }],
+  })))
+  assert.deepEqual(await review(evidence, config, signal()), { safe: true, desc: "Counts fruits." })
+  assert.deepEqual(requests.map((request) => request.target), ["/v1/chat/completions", "/v1/chat/completions"])
+  assert.deepEqual(requests[1]!.body.messages[2], { role: "assistant", content: "bad format" })
+  assert.match(requests[1]!.body.messages[3].content, /Format validation failed: Response must be valid JSON/)
 })
 
 test("formatted descriptions preserve Markdown and decoded JSON newlines", () => {
@@ -92,13 +218,28 @@ test("inline API key authenticates requests and corrections without entering mod
   }
 })
 
-test("inline API key takes precedence over set or missing environment keys", async (t) => {
+test("environment API keys match inline normalization on requests and corrections", async (t) => {
+  const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index % 2 ? '{"safe":true,"desc":"Counts fruits."}' : "bad format")))
+  const padded = " \t\n fixture-environment-key \r\n\u00a0"
+  for (const options of [{ apiKey: padded }, { apiKeyEnv: "TEST_REVIEW_KEY" }]) {
+    const cfg = parseConfig({ ...config, ...options })
+    assert.deepEqual(await review(evidence, cfg, signal(), fetch, { TEST_REVIEW_KEY: padded }), { safe: true, desc: "Counts fruits." })
+  }
+  assert.deepEqual(requests.map((request) => request.target), Array(4).fill("/v1/chat/completions"))
+  for (const request of requests) {
+    assert.equal(request.authorization, "Bearer fixture-environment-key")
+    assert.deepEqual(JSON.parse(request.body.messages[1].content), evidence)
+    assert.ok(!JSON.stringify(request.body).includes("fixture-environment-key"))
+  }
+})
+
+test("inline API key takes precedence over set, blank or missing environment keys", async (t) => {
   const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Counts fruits."}')))
   const cfg = parseConfig({ ...config, apiKey: "inline-fixture-key", apiKeyEnv: "TEST_REVIEW_KEY" })
-  for (const environment of [{ TEST_REVIEW_KEY: "environment-fixture-key" }, {}]) {
+  for (const environment of [{ TEST_REVIEW_KEY: "environment-fixture-key" }, { TEST_REVIEW_KEY: " \t\r\n" }, {}]) {
     await review(evidence, cfg, signal(), fetch, environment)
   }
-  assert.equal(requests.length, 2)
+  assert.equal(requests.length, 3)
   for (const request of requests) assert.equal(request.authorization, "Bearer inline-fixture-key")
 })
 
@@ -115,6 +256,7 @@ test("format correction uses validation feedback and configurable retry count", 
   const result = await review(evidence, config, signal())
   assert.equal(result.safe, false)
   assert.equal(requests.length, 3)
+  assert.deepEqual(requests.map((request) => request.target), Array(3).fill("/v1/chat/completions"))
   const prompt = (await readFile(new URL("../prompts/PERMISSION-REVIEW-PROMPT.md", import.meta.url), "utf8")).trim()
   const contract = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim()
   const correction = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CORRECTION.md", import.meta.url), "utf8")).trim()
@@ -129,6 +271,9 @@ test("zero retries and exhausted retries end with unavailable, not a fabricated 
   config.formatRetries = 0
   await assert.rejects(review(evidence, config, signal()), /format invalid/)
   assert.equal(requests.length, 1)
+  config.formatRetries = 2
+  await assert.rejects(review(evidence, config, signal()), /format invalid/)
+  assert.deepEqual(requests.map((request) => request.target), Array(4).fill("/v1/chat/completions"))
 })
 
 test("HTTP errors, malformed API envelopes and oversized bodies do not trigger correction", async (t) => {
@@ -171,9 +316,32 @@ test("cancelled and pre-cancelled reviews never return or retry a late response"
   assert.equal(requests.length, 1)
 })
 
-test("missing configured API key stops before a network request", async () => {
-  const cfg = parseConfig({ baseURL: "http://localhost:1", model: "m", apiKeyEnv: "MISSING" })
-  await assert.rejects(review(evidence, cfg, signal(), fetch, {}), /is unset/)
+test("missing and blank environment API keys fail before transport with value-free errors", async (t) => {
+  const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Unexpected."}')))
+  const cfg = parseConfig({ ...config, apiKeyEnv: "TEST_REVIEW_KEY" })
+  let fetchCalls = 0
+  const fetcher: typeof fetch = (...args) => { fetchCalls++; return fetch(...args) }
+  for (const value of [undefined, "", " ", " \t\r\n", "\u00a0\uFEFF"]) {
+    await assert.rejects(review(evidence, cfg, signal(), fetcher, { TEST_REVIEW_KEY: value }), {
+      message: "API key environment variable TEST_REVIEW_KEY is unset or empty",
+    })
+    assert.equal(fetchCalls, 0)
+    assert.equal(requests.length, 0)
+  }
+})
+
+test("environment API keys are excluded from HTTP and network error messages", async (t) => {
+  const secret = "fixture-sensitive-key"
+  const environment = { TEST_REVIEW_KEY: `  ${secret}  ` }
+  const { config, requests } = await endpoint(t, (_, res) => { res.statusCode = 401; res.end(`Rejected ${secret}`) })
+  const cfg = parseConfig({ ...config, apiKeyEnv: "TEST_REVIEW_KEY" })
+  await assert.rejects(review(evidence, cfg, signal(), fetch, environment), { message: "Reviewer HTTP 401" })
+  assert.deepEqual(requests.map((request) => request.target), ["/v1/chat/completions"])
+  assert.equal(requests[0]!.authorization, `Bearer ${secret}`)
+  let fetchCalls = 0
+  const fetcher: typeof fetch = async () => { fetchCalls++; throw new Error(`Transport rejected ${secret}`) }
+  await assert.rejects(review(evidence, cfg, signal(), fetcher, environment), { message: "Reviewer network request failed" })
+  assert.equal(fetchCalls, 1)
 })
 
 test("deadline also aborts a response that stalls after HTTP headers", async (t) => {

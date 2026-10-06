@@ -38,7 +38,7 @@ jobs:
           '
 
       - run: npm ci --ignore-scripts
-      - run: npm run check
+      - run: npm run typecheck && npm test
       - run: npm run check:package
 
       - name: Pack verified build
