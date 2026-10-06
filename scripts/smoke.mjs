@@ -11,7 +11,48 @@ const root = path.resolve(import.meta.dirname, "..")
 const scenario = process.argv[2] ?? "correction"
 assert.ok(["correction", "cancel", "error", "external"].includes(scenario))
 const initialWidth = scenario === "cancel" ? 80 : 160
-const formattedDescription = "Counts two fruit names.\n\n- **Output:** prints the count.\n- **File:** writes to `executed-marker`.\n- *Literal:* `\x1b[2J\u202e`."
+const formattedDescription = "Counts two fruit names.\n\n- **Output:** prints the count.\n- **File:** writes to `executed-marker`.\n- *Literal:* `\x1b[2J\u202e`.\n\n### Details\n\n[Documentation](https://example.com/review)"
+const conversationDescription = "### Conversation heading\n\n**conversation_bold** *conversation_emphasis* `conversation_code`\n\n[conversation_link](https://example.com/conversation)"
+
+function styleAt(ansi, text, index = ansi.indexOf(text)) {
+  assert.ok(index >= 0, `styled text should contain ${text}`)
+  const style = { fg: undefined, bg: undefined, bold: false, italic: false, underline: false }
+  for (const match of ansi.slice(0, index).matchAll(/\x1b\[([\d;]*)m/g)) {
+    const codes = match[1].split(";").map(Number)
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i]
+      if ((code === 38 || code === 48) && codes[i + 1] === 2) {
+        style[code === 38 ? "fg" : "bg"] = codes.slice(i + 2, i + 5).join(",")
+        i += 4
+      } else if (code === 0) Object.assign(style, { fg: undefined, bg: undefined, bold: false, italic: false, underline: false })
+      else if (code === 1 || code === 22) style.bold = code === 1
+      else if (code === 3 || code === 23) style.italic = code === 3
+      else if (code === 4 || code === 24) style.underline = code === 4
+      else if (code === 39) style.fg = undefined
+      else if (code === 49) style.bg = undefined
+    }
+  }
+  return style
+}
+
+function assertConversationStyles(ansi) {
+  for (const [review, conversation, emphasis] of [
+    ["Output:", "conversation_bold", "bold"],
+    ["Literal:", "conversation_emphasis", "italic"],
+    ["Details", "Conversation heading", "bold"],
+    ["Documentation", "conversation_link", "underline"],
+    ["executed-marker", "conversation_code"],
+  ]) {
+    const actual = styleAt(ansi, review)
+    const native = styleAt(ansi, conversation)
+    assert.equal(actual.fg, native.fg, `${review} should use the conversation's theme color`)
+    if (emphasis) assert.ok(actual[emphasis] && native[emphasis], `${review} should retain ${emphasis} formatting`)
+    else {
+      assert.equal(actual.bold, native.bold, "inline code should use the conversation's text weight")
+      assert.equal(actual.italic, native.italic, "inline code should use the conversation's text emphasis")
+    }
+  }
+}
 const temp = await mkdtemp(path.join(tmpdir(), "opencode-command-reviewer-"))
 // Load the built plugin away from the checkout to catch unbundled source assets.
 const pluginFile = path.join(temp, "reviewer.mjs")
@@ -48,7 +89,7 @@ const server = createServer(async (req, res) => {
       }
       if (scenario === "cancel") {
         res.on("close", () => { if (!res.writableEnded) reviewerAborted = true })
-        const timer = setTimeout(() => { delayed.delete(timer); reply() }, 3000)
+        const timer = setTimeout(() => { delayed.delete(timer); reply() }, 6000)
         delayed.add(timer)
       } else reply()
       return
@@ -58,13 +99,13 @@ const server = createServer(async (req, res) => {
     const doTool = !!tool && !toolSent
     if (doTool) toolSent = true
     const message = doTool
-      ? { role: "assistant", content: null, tool_calls: [{ id: "call_fruits", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "python3 fruits.py", description: "Count fruit names", ...(scenario === "external" ? { workdir: "../outside" } : {}) }) } }] }
+      ? { role: "assistant", content: scenario === "correction" ? conversationDescription : null, tool_calls: [{ id: "call_fruits", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "python3 fruits.py", description: "Count fruit names", ...(scenario === "external" ? { workdir: "../outside" } : {}) }) } }] }
       : { role: "assistant", content: "Fixture complete." }
     if (body.stream) {
       res.writeHead(200, { "Content-Type": "text/event-stream" })
       const chunk = (delta, finish_reason) => ({ id: "fixture", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta, finish_reason }] })
       const delta = doTool
-        ? { role: "assistant", tool_calls: message.tool_calls.map((t, index) => ({ index, ...t })) }
+        ? { role: "assistant", content: message.content, tool_calls: message.tool_calls.map((t, index) => ({ index, ...t })) }
         : message
       res.write(`data: ${JSON.stringify(chunk(delta, null))}\n\n`)
       res.write(`data: ${JSON.stringify(chunk({}, doTool ? "tool_calls" : "stop"))}\n\n`)
@@ -91,6 +132,7 @@ const config = {
 const tuiFile = path.join(temp, "tui.json")
 await writeFile(tuiFile, JSON.stringify({
   $schema: "https://opencode.ai/tui.json",
+  theme: scenario === "correction" ? "tokyonight" : "opencode",
   plugin: [[pluginFile, { baseURL: `http://127.0.0.1:${port}/review`, model: "review-fixture", apiKey: "fixture-review-key" }]],
 }))
 const socket = `command-reviewer-${process.pid}`
@@ -128,8 +170,10 @@ try {
     }
     throw new Error("Timed out waiting for expected terminal state")
   }
-  const expected = scenario === "cancel" ? "… Analyzing…" : scenario === "error" ? "! Analysis unavailable" : scenario === "external" ? "! UNSAFE" : "✓ SAFE"
-  const hasPanel = (s) => /Permission analysis|Counts two fruit names|Analyzing…|Analysis unavailable/.test(s)
+  const expected = scenario === "error" ? "! Analysis unavailable" : scenario === "external" ? "! Unsafe" : "✓ Safe"
+  const spinnerFrame = (s) => s.split("\n").find((line) => /[■⬝]{8}/.test(line.slice(initialWidth - 42)))?.match(/[■⬝]{8}/)?.[0]
+  const hasExpected = (s) => scenario === "cancel" ? !!spinnerFrame(s) : s.includes(expected)
+  const hasPanel = (s) => /Permission analysis|Counts two fruit names|Analysis unavailable/.test(s)
   const toggleSidebar = () => tmux("send-keys", "-t", "smoke", "C-x", "b")
   const assertReviewLayout = (screen, width) => {
     const lines = screen.split("\n")
@@ -137,19 +181,23 @@ try {
     assert.ok(headingLine >= 0, "permission analysis heading should be visible")
     const column = lines[headingLine].indexOf("Permission analysis")
     assert.equal(column, width - 40, "overlay heading should align with the native sidebar padding")
-    const reviewLine = lines.findIndex((line) => line.includes(expected))
+    const status = scenario === "cancel" ? spinnerFrame(screen) : expected
+    assert.ok(status, "pending reviews should have an animated scanner")
+    const reviewLine = lines.findIndex((line) => line.includes(status))
     assert.equal(reviewLine, headingLine + 2, "status should have its own line beneath the heading")
     assert.ok(screen.includes("Permission required"), "native permission should remain visible")
-    assert.equal(lines[reviewLine].indexOf(expected), column, "status should align with the heading")
+    assert.equal(lines[reviewLine].indexOf(status), column, "status should align with the heading")
     const controlsLine = lines.findIndex((line) => line.includes("Allow once"))
     assert.ok(controlsLine > headingLine, "native approval controls should remain visible beside the overlay")
-    assert.equal(lines.filter((line) => line.includes(expected)).length, 1, "review must not be duplicated in a bottom bar")
+    assert.equal(lines.filter((line) => line.includes(status)).length, 1, "review must not be duplicated in a bottom bar")
     const sidebarText = lines.map((line) => line.slice(width - 42)).join("\n")
+    assert.doesNotMatch(sidebarText, /\b(?:SAFE|UNSAFE)\b/, "rating labels should use title case")
+    assert.doesNotMatch(sidebarText, /Analyzing|\.\.\./, "the loading indicator should not include redundant text")
     assert.doesNotMatch(sidebarText, /Context|LSP|OpenCode|project:main|Fixture complete\./, "overlay must cover the native sidebar title, sections, and footer")
     if (scenario === "correction" || scenario === "external") {
       assert.equal(lines.findIndex((line) => line.includes("Counts two fruit names")), reviewLine + 2, "analysis should follow the status on a separate line")
     } else {
-      assert.doesNotMatch(sidebarText, /✓ SAFE|! UNSAFE/, "pending or failed reviews must not fabricate a rating")
+      assert.doesNotMatch(sidebarText, /✓ Safe|! Unsafe/, "pending or failed reviews must not fabricate a rating")
     }
     if (scenario === "error") assert.match(sidebarText, /Reviewer HTTP 503/)
     if (scenario === "correction") {
@@ -160,7 +208,7 @@ try {
     }
   }
   const formattingReady = (s) => scenario === "correction"
-    ? s.includes("File: writes to executed-marker.") && s.includes("\\u001b[2J\\u202e")
+    ? s.includes("File: writes to executed-marker.") && s.includes("\\u001b[2J\\u202e") && s.includes("Documentation")
     : scenario !== "external" || s.includes("Counts two fruit names")
   if (scenario === "cancel") {
     await until((s) => s.includes("Permission required") && reviewerCalls > 0)
@@ -168,11 +216,11 @@ try {
     await writeFile(path.join(root, ".runtime/cancel-sidebar-hidden.txt"), screen)
     toggleSidebar()
   }
-  await until((screen) => screen.includes("Permission required") && screen.includes(expected) && formattingReady(screen) && reviewerCalls > 0)
+  await until((screen) => screen.includes("Permission required") && hasExpected(screen) && formattingReady(screen) && reviewerCalls > 0)
   assertReviewLayout(screen, initialWidth)
   assert.match(screen, /Permission required/, "real native approval should be visible")
   assert.match(screen, /python3 fruits\.py/)
-  assert.ok(screen.includes(expected), "compact icon and description should render alongside approval")
+  assert.ok(hasExpected(screen), "review status should render alongside approval")
   assert.ok(!screen.includes("opencode-command-reviewer:"), "the plugin should not display a title header")
   const firstReview = calls.find((call) => call.url === "/review/chat/completions")
   assert.ok(firstReview)
@@ -196,19 +244,17 @@ try {
     assert.match(calls.filter((call) => call.url === "/review/chat/completions")[1].body.messages[3].content, /Format validation failed/)
     assert.match(screen, /Counts two fruit names/)
     await sleep(400)
-    assert.match(capture(), /Permission required/, "SAFE must remain advisory")
+    assert.match(capture(), /Permission required/, "Safe must remain advisory")
   } else assert.equal(reviewerCalls, 1)
   await writeFile(path.join(root, `.runtime/${scenario}-pending.txt`), screen)
   const styledScreen = tmux("capture-pane", "-p", "-e", "-t", "smoke")
   await writeFile(path.join(root, `.runtime/${scenario}-pending.ansi`), styledScreen)
   assert.match(styledScreen.split("\n").find((line) => line.includes("Permission analysis")) ?? "", /\x1b\[1m/, "overlay heading should be bold")
   if (scenario === "correction" || scenario === "external") {
-    const ratingLine = styledScreen.split("\n").find((line) => line.includes(expected)) ?? ""
-    assert.ok(ratingLine.includes(scenario === "correction" ? "\x1b[38;2;34;197;94m" : "\x1b[38;2;249;115;22m"), "rating text and icon must use the assessment color")
+    assert.equal(styleAt(styledScreen, expected).fg, scenario === "correction" ? "195,232,141" : "245,167,66", "rating text and icon must use the selected theme's success/warning color")
   }
   if (scenario === "correction") {
-    assert.match(styledScreen.split("\n").find((line) => line.includes("Output:")) ?? "", /\x1b\[1m/, "important effects should be bold")
-    assert.match(styledScreen.split("\n").find((line) => line.includes("Literal:")) ?? "", /\x1b\[3m/, "italic emphasis should render")
+    assertConversationStyles(styledScreen)
     tmux("resize-window", "-t", "smoke", "-x", "80", "-y", "24")
     await until((s) => s.includes("Permission required") && !hasPanel(s) && !s.includes("Context") && s.split("\n").length === 25)
     await writeFile(path.join(root, ".runtime/correction-sidebar-hidden.txt"), screen)
@@ -230,16 +276,27 @@ try {
     tmux("send-keys", "-t", "smoke", "Escape")
     await until((s) => s.includes("Permission required") && s.includes(expected) && formattingReady(s), 10000)
     assertReviewLayout(screen, 160)
+    tmux("send-keys", "-t", "smoke", "C-x", "t")
+    await until((s) => s.includes("Themes") && !hasPanel(s), 10000)
+    tmux("send-keys", "-t", "smoke", "-l", "opencode")
+    await until((s) => s.includes("Themes") && s.includes("opencode"), 10000)
+    tmux("send-keys", "-t", "smoke", "Enter")
+    await until((s) => s.includes("Permission analysis") && s.includes(expected) && formattingReady(s), 10000)
+    const changedTheme = tmux("capture-pane", "-p", "-e", "-t", "smoke")
+    assertConversationStyles(changedTheme)
+    assert.equal(styleAt(changedTheme, expected).fg, "127,216,143", "rating should follow a live theme change")
+    assert.notEqual(styleAt(changedTheme, "executed-marker").fg, styleAt(styledScreen, "executed-marker").fg, "analysis code colors should update with the theme")
+    await writeFile(path.join(root, ".runtime/correction-theme-changed.ansi"), changedTheme)
     assert.equal(reviewerCalls, 2, "resizing or toggling the sidebar must not restart the review")
   }
   if (scenario === "external") {
-    assert.match(screen, /! UNSAFE/)
+    assert.match(screen, /! Unsafe/)
     assert.deepEqual(sent.permission.metadata.directories, [commandDirectory])
     assert.deepEqual(sent.permission.patterns, [`${commandDirectory}/*`])
     assert.deepEqual(sent.permission.always, [`${commandDirectory}/*`])
     // Authorize only the directory boundary. OpenCode must still ask for bash.
     tmux("send-keys", "-t", "smoke", "Enter")
-    await until((s) => s.includes("Permission required") && s.includes("Shell command") && s.includes("! UNSAFE") && formattingReady(s) && reviewerCalls === 2, 10000)
+    await until((s) => s.includes("Permission required") && s.includes("Shell command") && s.includes("! Unsafe") && formattingReady(s) && reviewerCalls === 2, 10000)
     const next = JSON.parse(calls.filter((call) => call.url === "/review/chat/completions")[1].body.messages[1].content)
     assert.equal(next.permission.type, "bash")
     assert.notEqual(next.permission.id, sent.permission.id)
@@ -253,6 +310,22 @@ try {
     await writeFile(path.join(root, ".runtime/external-bash-pending.txt"), screen)
   }
   if (scenario === "cancel") {
+    const initialFrame = spinnerFrame(screen)
+    await until((s) => !!spinnerFrame(s) && spinnerFrame(s) !== initialFrame, 1500)
+    const loadingLine = styledScreen.split("\n")[3]
+    for (const match of loadingLine.matchAll(/[■⬝]/g)) {
+      const color = styleAt(loadingLine, match[0], match.index).fg?.split(",")
+      assert.ok(color?.length === 3 && color[0] === color[1] && color[1] === color[2], "scanner cells should be gray")
+    }
+    tmux("send-keys", "-t", "smoke", "C-p")
+    await until((s) => s.includes("Commands") && !hasPanel(s), 10000)
+    tmux("send-keys", "-t", "smoke", "-l", "animations")
+    await until((s) => s.includes("Disable animations"), 10000)
+    tmux("send-keys", "-t", "smoke", "Enter")
+    await until((s) => s.includes("Permission analysis") && s.includes("[⋯]"), 10000)
+    assert.ok(!spinnerFrame(screen), "disabled animations should use a static indicator")
+    assert.doesNotMatch(screen, /Analyzing/)
+    await writeFile(path.join(root, ".runtime/cancel-static-indicator.txt"), screen)
     toggleSidebar()
     await until((s) => s.includes("Permission required") && !hasPanel(s) && !s.includes("Context"), 10000)
     assert.equal(reviewerCalls, 1, "hiding the sidebar must not restart the pending review")
@@ -264,7 +337,7 @@ try {
     await until((s) => s.includes("Fixture complete."), 10000)
     await access(path.join(commandDirectory, "executed-marker"))
   } else {
-    await sleep(scenario === "cancel" ? 3300 : 300)
+    await sleep(scenario === "cancel" ? 6300 : 300)
     if (scenario === "cancel") assert.ok(reviewerAborted, "pending HTTP review should be aborted on user rejection")
     await assert.rejects(access(path.join(commandDirectory, "executed-marker")))
     assert.ok(!hasPanel(capture()), "late response must not resurrect panel")

@@ -66,11 +66,11 @@ For an authenticated endpoint, the plugin options can include the key directly:
 
 ## Behavior
 
-- While a shell permission is pending, a temporary **Permission analysis** panel covers the right sidebar. It shows **✓ SAFE** in green or **! UNSAFE** in orange, followed by the agent's Markdown-formatted analysis in a scrollable area. The normal sidebar returns when the permission is resolved.
+- While a shell permission is pending, a temporary **Permission analysis** panel covers the right sidebar. It shows **✓ Safe** or **! Unsafe** in the active theme's success/warning colors, followed by the agent's Markdown-formatted analysis using the conversation's theme palette. The normal sidebar returns when the permission is resolved.
 - Reviews follow the sidebar's visibility. If it is hidden or the terminal is narrow, use OpenCode's **Show sidebar** command (default: `Ctrl+X`, then `B`).
 - Sends the command, execution location, session/repository and permission context, latest user prompt, and directly invoked Python/shell source to your endpoint. Source can include files outside the project.
 - Reports missing or oversized source explicitly. Imports, task runners and complex shell constructs are not fully resolved.
-- Shows `… Analyzing…` while reviewing; failures display `! Analysis unavailable` and a reason. Resolving the approval removes the panel and cancels unfinished review.
+- While reviewing, a muted gray block-scanner animation matches OpenCode's running indicator. Disabling OpenCode animations shows a static indicator instead. Failures display `! Analysis unavailable` and a reason. Resolving the approval removes the panel and cancels unfinished review.
 - Ratings are advisory model judgments, not a safety guarantee. Existing OpenCode permissions stay in control.
 
 ## Development

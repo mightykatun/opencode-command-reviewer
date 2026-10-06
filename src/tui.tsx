@@ -1,5 +1,5 @@
-import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js"
-import { SyntaxStyle } from "@opentui/core"
+import { createEffect, createMemo, createSignal, Index, onCleanup, Show } from "solid-js"
+import { RGBA, SyntaxStyle } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { Message, Part } from "@opencode-ai/sdk/v2"
 import { parseConfig, type Config } from "./config.js"
@@ -7,25 +7,41 @@ import { loadContext, findUserPrompt, type ContextReader } from "./context.js"
 import { Controller, displayText, visibleReview, type View } from "./controller.js"
 import { collectEvidence } from "./evidence.js"
 import { review, withDeadline } from "./reviewer.js"
+import { reviewSyntaxStyles, scannerFrame, SCANNER_FRAME_COUNT, SCANNER_INTERVAL_MS } from "./appearance.js"
+
+function ReviewLoading(props: { api: TuiPluginApi }) {
+  const [frame, setFrame] = createSignal(0)
+  const animated = createMemo(() => props.api.kv.get("animations_enabled", true))
+  const cells = createMemo(() => scannerFrame(frame()))
+  createEffect(() => {
+    if (!animated()) return
+    const timer = setInterval(() => setFrame((value) => (value + 1) % SCANNER_FRAME_COUNT), SCANNER_INTERVAL_MS)
+    onCleanup(() => clearInterval(timer))
+  })
+  return (
+    <text fg={props.api.theme.current.textMuted} height={1}>
+      <Show when={animated()} fallback="[⋯]">
+        <Index each={cells()}>{(cell) => {
+          const color = createMemo(() => {
+            const base = props.api.theme.current.textMuted
+            const { brightness, alpha } = cell()
+            return RGBA.fromValues(Math.min(1, base.r * brightness), Math.min(1, base.g * brightness), Math.min(1, base.b * brightness), alpha)
+          })
+          return <span style={{ fg: color() }}>{cell().character}</span>
+        }}</Index>
+      </Show>
+    </text>
+  )
+}
 
 function ReviewDescription(props: { api: TuiPluginApi; text: string }) {
   const style = createMemo(() => {
-    const theme = props.api.theme.current
-    const syntax = SyntaxStyle.fromStyles({
-      default: { fg: theme.text },
-      markup: { fg: theme.text },
-      "markup.heading": { fg: theme.text, bold: true },
-      "markup.strong": { fg: theme.text, bold: true },
-      "markup.italic": { fg: theme.text, italic: true },
-      "markup.raw": { fg: theme.text, bg: theme.backgroundElement },
-      "markup.list": { fg: theme.text },
-      "markup.link": { fg: theme.text, underline: true },
-    })
+    const syntax = SyntaxStyle.fromStyles(reviewSyntaxStyles(props.api.theme.current))
     // Let existing renderables finish using the native style before releasing it.
     onCleanup(() => { void props.api.renderer.idle().catch(() => {}).finally(() => syntax.destroy()) })
     return syntax
   })
-  return <markdown content={displayText(props.text)} syntaxStyle={style()} fg={props.api.theme.current.text} conceal={true} streaming={false} width="100%" flexShrink={0} />
+  return <markdown content={displayText(props.text)} syntaxStyle={style()} fg={props.api.theme.current.markdownText} conceal={true} streaming={false} tableOptions={{ style: "grid" }} width="100%" flexShrink={0} />
 }
 
 function contextReader(api: TuiPluginApi): ContextReader {
@@ -145,9 +161,15 @@ const tui: TuiPlugin = async (api, options) => {
                 paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2}
                 backgroundColor={api.theme.current.backgroundPanel}>
                 <text fg={api.theme.current.text} flexShrink={0}><b>Permission analysis</b></text>
-                <text marginTop={1} flexShrink={0} fg={view.status === "analyzing" ? api.theme.current.textMuted : view.assessment?.safe ? "#22c55e" : "#f97316"}>
-                  <b>{view.assessment ? view.assessment.safe ? "✓ SAFE" : "! UNSAFE" : view.status === "analyzing" ? "… Analyzing…" : "! Analysis unavailable"}</b>
-                </text>
+                <box marginTop={1} flexShrink={0}>
+                  <Show when={view.status === "analyzing"} fallback={
+                    <text fg={view.assessment?.safe ? api.theme.current.success : api.theme.current.warning}>
+                      <b>{view.assessment ? view.assessment.safe ? "✓ Safe" : "! Unsafe" : "! Analysis unavailable"}</b>
+                    </text>
+                  }>
+                    <ReviewLoading api={api} />
+                  </Show>
+                </box>
                 <scrollbox marginTop={1} flexGrow={1} minHeight={0} contentOptions={{ minHeight: 0 }}>
                   <Show when={view.assessment} fallback={
                     <Show when={view.status === "unavailable"}>
