@@ -1,0 +1,1 @@
+Format validation failed: {{validationError}}. Correct the assessment for the same evidence. Return only {"safe": boolean, "desc": "description of effects"}. Markdown formatting is allowed inside desc; escape newlines and quotes to keep valid JSON. Do not wrap the JSON object in Markdown fences.

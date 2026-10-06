@@ -1,6 +1,6 @@
 {
   "name": "opencode-command-reviewer",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Advisory command explanations and safety ratings for pending OpenCode shell approvals",
   "type": "module",
   "repository": {

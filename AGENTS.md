@@ -51,8 +51,12 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   requires exactly `dist/tui.js`, `package.json`, `README.md`, and
   `THIRD_PARTY_NOTICES.md`. Generated `dist/` and runtime captures are ignored.
 - Defaults/validation live in `src/config.ts`, evidence shapes in `src/types.ts`,
-  and model instructions/output contract in `src/reviewer.ts`; consult these rather
-  than duplicating option ranges or protocol definitions in documentation.
+  prompt text in `prompts/PERMISSION-REVIEW-*.md`, and response validation in
+  `src/reviewer.ts`; consult these rather than duplicating contracts in documentation.
+- `src/prompts.ts` reads Markdown in source tests; `scripts/build.mjs` embeds it in
+  the bundle. Prompt edits require rebuilding and restarting. Keep the contract
+  separate from overridable instructions and retain `{{validationError}}` in the
+  correction template. Runtime fixtures load an isolated copy of the bundle.
 
 ## Permission lifecycle and display
 
@@ -67,8 +71,12 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   its revision guard against stale snapshots. Resolution, deletion and disposal
   abort work; late results must not resurrect panels.
 - Completed UI is only green `✓` (`#22c55e`) or orange `!` (`#f97316`) plus description
-  in theme text color. No header, repeated command or IDs. Keep native controls active,
-  bounded scrolling, and terminal-control/bidi escaping via `displayText`.
+  in theme text color. Render Markdown inside `desc`, escaping terminal-control/bidi
+  characters via `displayText` before rendering. Keep the outer response strict JSON,
+  native controls active, and scrolling bounded; no added header, repeated command or IDs.
+- OpenCode 1.18.34 hides `session_prompt` during approvals and exposes no permission
+  slot. Keep the `app_bottom` note transparent, indented and width-capped so it sits
+  beneath the permission content without painting across the terminal/sidebar.
 - Invalid configuration or review failure shows `Analysis unavailable`, never a
   fabricated rating or permission decision.
 

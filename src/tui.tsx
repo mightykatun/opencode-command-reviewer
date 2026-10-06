@@ -1,4 +1,5 @@
-import { createMemo, createSignal, Show } from "solid-js"
+import { createMemo, createSignal, onCleanup, Show } from "solid-js"
+import { SyntaxStyle } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { Message, Part } from "@opencode-ai/sdk/v2"
 import { parseConfig, type Config } from "./config.js"
@@ -6,6 +7,26 @@ import { loadContext, findUserPrompt, type ContextReader } from "./context.js"
 import { Controller, displayText, visibleReview, type View } from "./controller.js"
 import { collectEvidence } from "./evidence.js"
 import { review, withDeadline } from "./reviewer.js"
+
+function ReviewDescription(props: { api: TuiPluginApi; text: string }) {
+  const style = createMemo(() => {
+    const theme = props.api.theme.current
+    const syntax = SyntaxStyle.fromStyles({
+      default: { fg: theme.text },
+      markup: { fg: theme.text },
+      "markup.heading": { fg: theme.text, bold: true },
+      "markup.strong": { fg: theme.text, bold: true },
+      "markup.italic": { fg: theme.text, italic: true },
+      "markup.raw": { fg: theme.text, bg: theme.backgroundElement },
+      "markup.list": { fg: theme.text },
+      "markup.link": { fg: theme.text, underline: true },
+    })
+    // Let existing renderables finish using the native style before releasing it.
+    onCleanup(() => { void props.api.renderer.idle().catch(() => {}).finally(() => syntax.destroy()) })
+    return syntax
+  })
+  return <markdown content={displayText(props.text)} syntaxStyle={style()} fg={props.api.theme.current.text} conceal={true} streaming={false} width="100%" flexShrink={0} />
+}
 
 function contextReader(api: TuiPluginApi): ContextReader {
   const location = () => ({ directory: api.state.path.directory })
@@ -104,15 +125,23 @@ const tui: TuiPlugin = async (api, options) => {
         return (
           <Show when={current()} keyed>
             {(view) => (
-              <box paddingLeft={1} paddingRight={1} flexDirection="row" gap={1} flexShrink={0} backgroundColor={api.theme.current.backgroundPanel}>
-                <text flexShrink={0} fg={view.status === "analyzing" ? api.theme.current.textMuted : view.assessment?.safe ? "#22c55e" : "#f97316"}>
-                  {view.status === "analyzing" ? "…" : view.assessment?.safe ? "✓" : "!"}
-                </text>
-                <scrollbox maxHeight={6} flexGrow={1} flexShrink={1}>
-                  <text fg={api.theme.current.text}>
-                    {displayText(view.status === "analyzing" ? "Analyzing…" : view.assessment?.desc ?? `Analysis unavailable: ${view.error ?? "Review failed"}`)}
+              <box paddingLeft={5} paddingRight={2} flexShrink={0}>
+                {/* The public bottom slot sits outside the session column. Keep the
+                    note transparent and compact so it stays beneath the approval. */}
+                <box width="100%" maxWidth={72} flexDirection="row" gap={1} flexShrink={0}>
+                  <text flexShrink={0} fg={view.status === "analyzing" ? api.theme.current.textMuted : view.assessment?.safe ? "#22c55e" : "#f97316"}>
+                    {view.status === "analyzing" ? "…" : view.assessment?.safe ? "✓" : "!"}
                   </text>
-                </scrollbox>
+                  <scrollbox maxHeight={6} flexGrow={1} flexShrink={1}>
+                    <Show when={view.assessment} fallback={
+                      <text fg={api.theme.current.text}>
+                        {displayText(view.status === "analyzing" ? "Analyzing…" : `Analysis unavailable: ${view.error ?? "Review failed"}`)}
+                      </text>
+                    }>
+                      {(assessment) => <ReviewDescription api={api} text={assessment().desc} />}
+                    </Show>
+                  </scrollbox>
+                </box>
               </box>
             )}
           </Show>

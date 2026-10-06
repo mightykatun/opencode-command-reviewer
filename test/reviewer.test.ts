@@ -3,6 +3,7 @@ import type { TestContext } from "node:test"
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
 import type { ServerResponse } from "node:http"
+import { readFile } from "node:fs/promises"
 import { setTimeout as sleep } from "node:timers/promises"
 import { parseConfig } from "../src/config.js"
 import { parseAssessment, review, withDeadline } from "../src/reviewer.js"
@@ -50,6 +51,11 @@ test("strict boolean schema rejects coercion, fences, arrays, blank descriptions
   for (const text of ['{"safe":"false","desc":"x"}', '{"safe":0,"desc":"x"}', '{"safe":true,"desc":" "}', '{"safe":true,"desc":"x","other":1}', '[]', 'null', '```json\n{"safe":true,"desc":"x"}\n```']) assert.throws(() => parseAssessment(text))
 })
 
+test("formatted descriptions preserve Markdown and decoded JSON newlines", () => {
+  const desc = "**Effects**\n\n- Writes `result.txt`.\n- *Risk:* replaces its existing contents.\n\n```sh\nprintf hello\n```"
+  assert.deepEqual(parseAssessment(JSON.stringify({ safe: false, desc })), { safe: false, desc })
+})
+
 test("inline API keys must be nonempty strings and validation does not expose their values", () => {
   for (const apiKey of ["", " \t\n", null, 123, false, ["fixture-secret"], { key: "fixture-secret" }]) {
     assert.throws(() => parseConfig({ baseURL: "http://localhost/v1", model: "m", apiKey }), {
@@ -68,6 +74,8 @@ test("sends textual source, genuine user prompt, fixed schema and optional beare
   assert.deepEqual(JSON.parse(body.messages[1].content), evidence)
   assert.match(body.messages[0].content, /Custom risk guidance/)
   assert.match(body.messages[0].content, /exactly two fields/)
+  const contract = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim()
+  assert.equal(body.messages[0].content, `Custom risk guidance\n\n${contract}`)
   assert.equal(body.stream, false)
   assert.equal(body.tools, undefined)
 })
@@ -107,7 +115,12 @@ test("format correction uses validation feedback and configurable retry count", 
   const result = await review(evidence, config, signal())
   assert.equal(result.safe, false)
   assert.equal(requests.length, 3)
-  assert.match(requests[1]!.body.messages[3].content, /Format validation failed/)
+  const prompt = (await readFile(new URL("../prompts/PERMISSION-REVIEW-PROMPT.md", import.meta.url), "utf8")).trim()
+  const contract = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim()
+  const correction = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CORRECTION.md", import.meta.url), "utf8")).trim()
+  assert.match(correction, /\{\{validationError\}\}/)
+  assert.equal(requests[0]!.body.messages[0].content, `${prompt}\n\n${contract}`)
+  assert.equal(requests[1]!.body.messages[3].content, correction.replace("{{validationError}}", 'Response must contain exactly "safe": boolean and "desc": nonempty string'))
   assert.deepEqual(JSON.parse(requests[2]!.body.messages[1].content), evidence)
 })
 

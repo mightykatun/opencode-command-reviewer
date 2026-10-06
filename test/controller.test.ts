@@ -96,6 +96,7 @@ test("session deletion and disposal cancel and release pending reviews", async (
 test("terminal control sequences and bidi text cannot manipulate displayed ratings", () => {
   assert.equal(displayText("x\x1b[2J\r\u202ey"), "x\\u001b[2J\\u000d\\u202ey")
   assert.equal(displayText("first\nsecond\tthird"), "first\nsecond\tthird")
+  assert.equal(displayText("**Effects**\n- `\x1b[2J`\n- *\u202eRisk*"), "**Effects**\n- `\\u001b[2J`\n- *\\u202eRisk*")
 })
 
 test("directory requests stay hidden until their native shell association is verified", async () => {

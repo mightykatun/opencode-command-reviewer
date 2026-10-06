@@ -66,6 +66,7 @@ For an authenticated endpoint, the plugin options can include the key directly:
 
 ## Behavior
 
+- Explanations support Markdown formatting, including paragraphs, lists, emphasis, and inline code, in a compact scrollable panel.
 - Sends the command, execution location, session/repository and permission context, latest user prompt, and directly invoked Python/shell source to your endpoint. Source can include files outside the project.
 - Reports missing or oversized source explicitly. Imports, task runners and complex shell constructs are not fully resolved.
 - Shows `… Analyzing…` while reviewing and `! Analysis unavailable: …` on failure. Resolving the approval removes the panel and cancels unfinished review.

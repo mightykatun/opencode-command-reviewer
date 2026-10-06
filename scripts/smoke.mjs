@@ -1,7 +1,7 @@
 // Real, isolated OpenCode TUI + deterministic local HTTP fixtures. No paid model.
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
-import { mkdtemp, mkdir, writeFile, access } from "node:fs/promises"
+import { mkdtemp, mkdir, writeFile, access, copyFile } from "node:fs/promises"
 import { execFileSync } from "node:child_process"
 import path from "node:path"
 import { tmpdir } from "node:os"
@@ -10,7 +10,11 @@ import { setTimeout as sleep } from "node:timers/promises"
 const root = path.resolve(import.meta.dirname, "..")
 const scenario = process.argv[2] ?? "correction"
 assert.ok(["correction", "cancel", "error", "external"].includes(scenario))
+const formattedDescription = "Counts two fruit names.\n\n- **Output:** prints the count.\n- **File:** writes to `executed-marker`.\n- *Literal:* `\x1b[2J\u202e`."
 const temp = await mkdtemp(path.join(tmpdir(), "opencode-command-reviewer-"))
+// Load the built plugin away from the checkout to catch unbundled source assets.
+const pluginFile = path.join(temp, "reviewer.mjs")
+await copyFile(path.join(root, "dist/tui.js"), pluginFile)
 const project = path.join(temp, "project")
 await mkdir(project)
 execFileSync("git", ["init", "--quiet", project])
@@ -38,7 +42,7 @@ const server = createServer(async (req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" })
         const content = scenario === "correction" && reviewerCalls === 1
           ? '{"safe":"yes","desc":"Incorrect boolean type."}'
-          : JSON.stringify({ safe: scenario !== "external", desc: "Counts two fruit names, prints the count, and writes it to executed-marker." })
+          : JSON.stringify({ safe: scenario !== "external", desc: scenario === "correction" ? formattedDescription : "Counts two fruit names, prints the count, and writes it to executed-marker." })
         res.end(JSON.stringify({ choices: [{ message: { content } }] }))
       }
       if (scenario === "cancel") {
@@ -86,7 +90,7 @@ const config = {
 const tuiFile = path.join(temp, "tui.json")
 await writeFile(tuiFile, JSON.stringify({
   $schema: "https://opencode.ai/tui.json",
-  plugin: [[path.join(root, "dist/tui.js"), { baseURL: `http://127.0.0.1:${port}/review`, model: "review-fixture", apiKey: "fixture-review-key" }]],
+  plugin: [[pluginFile, { baseURL: `http://127.0.0.1:${port}/review`, model: "review-fixture", apiKey: "fixture-review-key" }]],
 }))
 const socket = `command-reviewer-${process.pid}`
 const tmux = (...args) => execFileSync("tmux", ["-L", socket, ...args], { encoding: "utf8" })
@@ -108,7 +112,7 @@ try {
     OPENCODE_DISABLE_EXTERNAL_SKILLS: "1",
     OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1",
   }
-  tmux("new-session", "-d", "-s", "smoke", "-x", scenario === "cancel" ? "80" : "120", "-y", scenario === "cancel" ? "24" : "40", "-c", project,
+  tmux("new-session", "-d", "-s", "smoke", "-x", scenario === "cancel" ? "80" : scenario === "correction" ? "160" : "120", "-y", scenario === "cancel" ? "24" : "40", "-c", project,
     "env", ...Object.entries(env).map(([k, v]) => `${k}=${v}`),
     process.env.OPENCODE_BIN ?? "opencode", project,
     "--prompt", "Count the fruit names in fruits.py using python3 fruits.py.")
@@ -123,7 +127,30 @@ try {
     throw new Error("Timed out waiting for expected terminal state")
   }
   const expected = scenario === "cancel" ? "… Analyzing…" : scenario === "error" ? "! Analysis unavailable" : `${scenario === "external" ? "!" : "✓"} Counts two fruit names`
-  await until((screen) => screen.includes("Permission required") && screen.includes(expected) && reviewerCalls > 0)
+  const assertReviewLayout = (screen) => {
+    const lines = screen.split("\n")
+    const reviewLine = lines.findIndex((line) => line.includes(expected))
+    assert.ok(reviewLine >= 0, "review should be visible")
+    const permissionLine = lines.find((line) => line.includes("Permission required"))
+    assert.ok(permissionLine, "native permission should remain visible")
+    assert.equal(lines[reviewLine].indexOf(expected), permissionLine.indexOf("△"), "review icon should align with the permission content")
+    const controlsLine = lines.findIndex((line) => line.includes("Allow once"))
+    assert.ok(controlsLine >= 0 && reviewLine > controlsLine && reviewLine - controlsLine <= 5, "review should sit directly beneath the native controls")
+    const rows = lines.slice(reviewLine)
+    while (rows.length && !rows.at(-1).trim()) rows.pop()
+    assert.ok(rows.length <= 6, "long reviews must keep a bounded height")
+    for (const row of rows) assert.ok(row.trimEnd().length <= 77, "review should wrap within its compact column")
+    if (scenario === "correction" || scenario === "external") assert.ok(rows.length > 1, "description should wrap instead of spanning the terminal")
+    if (scenario === "correction") {
+      assert.ok(screen.includes("Output: prints the count."), "formatted list should be visible")
+      assert.ok(screen.includes("File: writes to executed-marker."), "inline code should render without backticks")
+      assert.ok(!screen.includes("**Output:**"), "emphasis markers should be concealed")
+      assert.ok(screen.includes("\\u001b[2J\\u202e"), "controls and bidi must stay escaped inside Markdown")
+    }
+  }
+  const formattingReady = (s) => scenario !== "correction" || (s.includes("File: writes to executed-marker.") && s.includes("\\u001b[2J\\u202e"))
+  await until((screen) => screen.includes("Permission required") && screen.includes(expected) && formattingReady(screen) && reviewerCalls > 0)
+  assertReviewLayout(screen)
   assert.match(screen, /Permission required/, "real native approval should be visible")
   assert.match(screen, /python3 fruits\.py/)
   assert.ok(screen.includes(expected), "compact icon and description should render alongside approval")
@@ -154,6 +181,17 @@ try {
   } else assert.equal(reviewerCalls, 1)
   await mkdir(path.join(root, ".runtime"), { recursive: true })
   await writeFile(path.join(root, `.runtime/${scenario}-pending.txt`), screen)
+  const styledScreen = tmux("capture-pane", "-p", "-e", "-t", "smoke")
+  await writeFile(path.join(root, `.runtime/${scenario}-pending.ansi`), styledScreen)
+  if (scenario === "correction") {
+    assert.match(styledScreen.split("\n").find((line) => line.includes("Output:")) ?? "", /\x1b\[1m/, "important effects should be bold")
+    assert.match(styledScreen.split("\n").find((line) => line.includes("Literal:")) ?? "", /\x1b\[3m/, "italic emphasis should render")
+    tmux("resize-window", "-t", "smoke", "-x", "80", "-y", "24")
+    await until((s) => s.includes("Permission required") && s.includes(expected) && formattingReady(s) && s.includes("⇆ select") && s.split("\n").length === 25)
+    assertReviewLayout(screen)
+    assert.equal(reviewerCalls, 2, "resizing must not restart the review")
+    await writeFile(path.join(root, ".runtime/correction-narrow-pending.txt"), screen)
+  }
   if (scenario === "external") {
     assert.match(screen, /! Counts two fruit names/)
     assert.deepEqual(sent.permission.metadata.directories, [commandDirectory])

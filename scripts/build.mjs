@@ -2,6 +2,12 @@ import { build } from "esbuild"
 import { transformAsync } from "@babel/core"
 import { readFile } from "node:fs/promises"
 
+const prompts = Object.fromEntries(await Promise.all(
+  ["PERMISSION-REVIEW-PROMPT", "PERMISSION-REVIEW-CONTRACT", "PERMISSION-REVIEW-CORRECTION"].map(async (name) => [
+    name, (await readFile(new URL(`../prompts/${name}.md`, import.meta.url), "utf8")).trim(),
+  ]),
+))
+
 await build({
   entryPoints: ["src/tui.tsx"],
   outfile: "dist/tui.js",
@@ -9,6 +15,7 @@ await build({
   platform: "node",
   format: "esm",
   target: "es2023",
+  define: { __REVIEW_PROMPTS__: JSON.stringify(prompts) },
   external: ["solid-js", "solid-js/*", "@opentui/*", "@opencode-ai/*"],
   plugins: [{
     name: "opentui-solid",
