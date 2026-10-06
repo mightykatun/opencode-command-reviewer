@@ -81,7 +81,7 @@ export async function review(
   fetcher: typeof fetch = fetch,
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<Assessment> {
-  const key = config.apiKeyEnv ? environment[config.apiKeyEnv] : undefined
+  const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv] : undefined)
   if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset`)
   const messages = [
     { role: "system", content: `${config.instructions ?? DEFAULT_INSTRUCTIONS}\n\n${CONTRACT}` },

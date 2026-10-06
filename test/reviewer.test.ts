@@ -50,6 +50,14 @@ test("strict boolean schema rejects coercion, fences, arrays, blank descriptions
   for (const text of ['{"safe":"false","desc":"x"}', '{"safe":0,"desc":"x"}', '{"safe":true,"desc":" "}', '{"safe":true,"desc":"x","other":1}', '[]', 'null', '```json\n{"safe":true,"desc":"x"}\n```']) assert.throws(() => parseAssessment(text))
 })
 
+test("inline API keys must be nonempty strings and validation does not expose their values", () => {
+  for (const apiKey of ["", " \t\n", null, 123, false, ["fixture-secret"], { key: "fixture-secret" }]) {
+    assert.throws(() => parseConfig({ baseURL: "http://localhost/v1", model: "m", apiKey }), {
+      message: "apiKey must be a nonempty string",
+    })
+  }
+})
+
 test("sends textual source, genuine user prompt, fixed schema and optional bearer key", async (t) => {
   const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Counts fruits."}')))
   config.apiKeyEnv = "TEST_REVIEW_KEY"
@@ -62,6 +70,35 @@ test("sends textual source, genuine user prompt, fixed schema and optional beare
   assert.match(body.messages[0].content, /exactly two fields/)
   assert.equal(body.stream, false)
   assert.equal(body.tools, undefined)
+})
+
+test("inline API key authenticates requests and corrections without entering model evidence", async (t) => {
+  const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index ? '{"safe":true,"desc":"Counts fruits."}' : "bad format")))
+  const cfg = parseConfig({ ...config, apiKey: "  inline-fixture-key  " })
+  assert.deepEqual(await review(evidence, cfg, signal(), fetch, {}), { safe: true, desc: "Counts fruits." })
+  assert.equal(requests.length, 2)
+  for (const request of requests) {
+    assert.equal(request.authorization, "Bearer inline-fixture-key")
+    assert.deepEqual(JSON.parse(request.body.messages[1].content), evidence)
+    assert.ok(!JSON.stringify(request.body).includes("inline-fixture-key"))
+  }
+})
+
+test("inline API key takes precedence over set or missing environment keys", async (t) => {
+  const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Counts fruits."}')))
+  const cfg = parseConfig({ ...config, apiKey: "inline-fixture-key", apiKeyEnv: "TEST_REVIEW_KEY" })
+  for (const environment of [{ TEST_REVIEW_KEY: "environment-fixture-key" }, {}]) {
+    await review(evidence, cfg, signal(), fetch, environment)
+  }
+  assert.equal(requests.length, 2)
+  for (const request of requests) assert.equal(request.authorization, "Bearer inline-fixture-key")
+})
+
+test("omitting both API-key options sends no authorization header", async (t) => {
+  const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Counts fruits."}')))
+  await review(evidence, config, signal(), fetch, { TEST_REVIEW_KEY: "unused-fixture-key" })
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0]!.authorization, undefined)
 })
 
 test("format correction uses validation feedback and configurable retry count", async (t) => {

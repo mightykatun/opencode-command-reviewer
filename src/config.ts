@@ -3,6 +3,7 @@ import type { Limits } from "./types.js"
 export interface Config extends Limits {
   baseURL: string
   model: string
+  apiKey?: string
   apiKeyEnv?: string
   instructions?: string
   formatRetries: number
@@ -10,7 +11,7 @@ export interface Config extends Limits {
 }
 
 export function parseConfig(options: Record<string, unknown> = {}): Config {
-  const keys = new Set(["baseURL", "model", "apiKeyEnv", "instructions", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
+  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
   for (const key of Object.keys(options)) if (!keys.has(key)) throw new Error(`Unknown command-reviewer setting: ${key}`)
   const text = (name: string, optional = false): string | undefined => {
     const value = options[name]
@@ -35,6 +36,7 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
   return {
     baseURL: url.href.replace(/\/+$/, ""),
     model: text("model")!, apiKeyEnv,
+    apiKey: text("apiKey", true),
     instructions: text("instructions", true),
     formatRetries: number("formatRetries", 1, 0, 100),
     timeoutMs: number("timeoutMs", 30000, 1, 3600000),

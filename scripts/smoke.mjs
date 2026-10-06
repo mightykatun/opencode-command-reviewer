@@ -31,6 +31,7 @@ const server = createServer(async (req, res) => {
     const body = JSON.parse(text)
     calls.push({ url: req.url, body })
     if (req.url === "/review/chat/completions") {
+      assert.equal(req.headers.authorization, "Bearer fixture-review-key")
       reviewerCalls++
       if (scenario === "error") { res.writeHead(503); res.end("fixture outage"); return }
       const reply = () => {
@@ -85,7 +86,7 @@ const config = {
 const tuiFile = path.join(temp, "tui.json")
 await writeFile(tuiFile, JSON.stringify({
   $schema: "https://opencode.ai/tui.json",
-  plugin: [[path.join(root, "dist/tui.js"), { baseURL: `http://127.0.0.1:${port}/review`, model: "review-fixture" }]],
+  plugin: [[path.join(root, "dist/tui.js"), { baseURL: `http://127.0.0.1:${port}/review`, model: "review-fixture", apiKey: "fixture-review-key" }]],
 }))
 const socket = `command-reviewer-${process.pid}`
 const tmux = (...args) => execFileSync("tmux", ["-L", socket, ...args], { encoding: "utf8" })

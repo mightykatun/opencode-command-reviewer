@@ -44,12 +44,25 @@ Add these alongside `baseURL` and `model`:
 
 | Option | Default | Purpose |
 | --- | --- | --- |
+| `apiKey` | omitted | API key stored directly in the plugin options; takes precedence over `apiKeyEnv` |
 | `apiKeyEnv` | omitted | API-key environment-variable name, e.g. `COMMAND_REVIEWER_API_KEY`; set it before starting OpenCode |
 | `instructions` | built-in prompt | Override assessment instructions; JSON response format stays fixed |
 | `formatRetries` | `1` | Correction retries for invalid model response format |
 | `timeoutMs` | `30000` | Total review timeout, including retries |
 | `maxFiles` | `4` | Maximum directly invoked script files to inspect |
 | `maxEvidenceBytes` | `65536` | Combined command/source text budget in bytes |
+
+For an authenticated endpoint, the plugin options can include the key directly:
+
+```json
+{
+  "baseURL": "https://api.example.com/v1",
+  "model": "your-model",
+  "apiKey": "your-api-key"
+}
+```
+
+`apiKey` must be a nonempty string and is sent as a Bearer authorization header. If both key options are set, `apiKey` wins even when the named environment variable is unset. Omit both options for an unauthenticated endpoint.
 
 ## Behavior
 
