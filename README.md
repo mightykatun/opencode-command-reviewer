@@ -1,7 +1,5 @@
 # Opencode request reviewer
 
-[![Tested on OpenCode 1.18.34](https://img.shields.io/badge/OpenCode-1.18.34-3178c6?style=flat-square)](https://opencode.ai) ![Linux terminal TUI](https://img.shields.io/badge/Interface-Linux%20TUI-64748b?style=flat-square) [![Auto-approval is opt-in](https://img.shields.io/badge/Auto--approval-opt--in-0f766e?style=flat-square)](#auto-approval)
-
 Review shell commands and file changes in OpenCode's sidebar, with explanations, safety ratings, and optional one-time auto-approval.
 
 Supports pending `bash`, shell-associated `external_directory`, and native `edit`/`write`/`apply_patch` permissions. Tested with **OpenCode 1.18.34, local Linux TUI**; other versions and clients are unverified.
