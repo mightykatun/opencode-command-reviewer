@@ -3,6 +3,7 @@ import { createHash } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import { readFile } from "node:fs/promises"
 import { pathToFileURL } from "node:url"
+import { isPrerelease } from "./release-version.mjs"
 
 // Publish the same verified bytes attached to GitHub. Existing versions are immutable:
 // reruns (or the authenticated first-publication bootstrap) must match exactly.
@@ -19,7 +20,7 @@ export async function publishRelease(tarball, pkg, bytes, {
     return "existing"
   }
   assert.equal(response.status, 404, `Registry lookup failed: HTTP ${response.status}`)
-  const tag = prerelease || pkg.version.includes("-") ? "next" : "latest"
+  const tag = prerelease || isPrerelease(pkg.version) ? "next" : "latest"
   run("npm", ["publish", tarball, "--ignore-scripts", "--access", "public",
     "--provenance", "--tag", tag, "--registry", "https://registry.npmjs.org/"], { stdio: "inherit" })
   return "published"

@@ -1,3 +1,12 @@
+# Unreleased
+
+- Release automation now starts on a pushed `v*` tag, matching Speedometer's flow.
+  It verifies the tagged version, builds the package, creates the GitHub Release
+  automatically and publishes to npm. Manual dispatch supports an existing tag
+  from the default branch. Semantic prereleases use GitHub prerelease and npm `next`.
+- Release reruns reuse existing GitHub releases and retain the npm archive-integrity
+  check. Publishing a GitHub Release manually no longer triggers the workflow.
+
 # v0.4.0: npm distribution, streaming reviews and conversation controls
 
 First npm release: register `opencode-reviewer@0.4.0` with its options in

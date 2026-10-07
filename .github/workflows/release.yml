@@ -1,15 +1,28 @@
 name: Release package
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.release.tag_name }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_REF: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  TRIGGER_REF: ${{ github.ref }}
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
 
 jobs:
   package:
@@ -21,7 +34,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-node@v4
@@ -33,21 +47,20 @@ jobs:
         run: npm install --global npm@12.2.0 --ignore-scripts
 
       - name: Check release version
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        id: version
+        shell: bash
         run: |
-          node --input-type=module -e '
-            import assert from "node:assert/strict";
-            import pkg from "./package.json" with { type: "json" };
-            import lock from "./package-lock.json" with { type: "json" };
-            assert.equal(process.env.RELEASE_TAG, `v${pkg.version}`, "Release tag must match v<package.json version>");
-            assert.equal(lock.version, pkg.version, "Lockfile version must match package.json");
-            assert.equal(lock.packages[""].version, pkg.version, "Lockfile root version must match package.json");
-          '
+          set -euo pipefail
+          if test "$GITHUB_EVENT_NAME" = "workflow_dispatch"; then
+            test "$TRIGGER_REF" = "refs/heads/$DEFAULT_BRANCH"
+          fi
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+          node scripts/release-version.mjs
 
       - run: npm ci --ignore-scripts
       - run: npm run typecheck && npm test
-      - run: node --test test/smoke-measurements.test.mjs test/publish-release.test.mjs
+      - run: node --test test/smoke-measurements.test.mjs test/publish-release.test.mjs test/release-version.test.mjs
       - run: npm run check:package
 
       - name: Pack verified build
@@ -55,14 +68,30 @@ jobs:
           mkdir -p "$RUNNER_TEMP/release-package"
           npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release-package"
 
-      - name: Attach package to release
+      - name: Create GitHub release and attach package
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/release-package/*.tgz --repo "$GITHUB_REPOSITORY" --clobber
+          RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=(--verify-tag --generate-notes --title "opencode-reviewer $RELEASE_TAG")
+          if test "$RELEASE_PRERELEASE" = "true"; then
+            flags+=(--prerelease --latest=false)
+            latest=false
+          else
+            flags+=(--latest)
+            latest=true
+          fi
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/release-package/*.tgz --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease="$RELEASE_PRERELEASE" --latest="$latest" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" "$RUNNER_TEMP"/release-package/*.tgz "${flags[@]}" --repo "$GITHUB_REPOSITORY"
+          fi
 
       - name: Publish verified package to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
         run: node scripts/publish-release.mjs "$RUNNER_TEMP"/release-package/*.tgz

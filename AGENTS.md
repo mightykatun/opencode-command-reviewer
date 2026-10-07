@@ -99,11 +99,15 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   the supervisor so a late startup cannot race cleanup. Never kill shared/default
   tmux servers or discover cleanup targets by broad process-name matching.
 - Documentation-only changes need reference/format review, not runtime/model tests.
-- `npm pack` rebuilds via `prepack`. `.github/workflows/release.yml` runs on published
-  GitHub releases (including prereleases), validates `v<package.json version>` and
-  lockfile versions, runs typecheck/tests and `check:package` (two builds), then
-  uploads and publishes the same `.tgz` to npm. Stable versions use `latest`;
-  prereleases use `next`. Existing npm versions must match archive integrity on rerun.
+- `npm pack` rebuilds via `prepack`. `.github/workflows/release.yml` runs on pushed
+  `v*` tags or manual dispatch with an existing `tag`. Manual dispatch must use the
+  default branch. Checkout and validation verify the exact tag commit, semantic
+  version and matching package/lockfile versions. CI runs typecheck/tests and
+  `check:package` (two builds), automatically creates a GitHub release with generated
+  notes and the archive, then publishes the same `.tgz` to npm. Reruns reuse the
+  release and refresh its asset. Stable versions use GitHub latest and npm `latest`;
+  semantic prerelease versions use GitHub prerelease and npm `next`, without replacing
+  GitHub latest. Existing npm versions must match archive integrity on rerun.
   Publishing uses GitHub OIDC with `id-token: write` and npm 12.2.0, with optional
   `NPM_TOKEN` secret fallback. Configure npm trusted publishing for GitHub owner
   `mightykatun`, repository `opencode-reviewer`, workflow `release.yml`, no environment,
@@ -111,6 +115,8 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   bootstrap before npm permits trust setup; never put credentials in the repository.
   Use `npm version X.Y.Z --no-git-tag-version` to update both manifests; release tags
   must include the workflow. CI packs with `--ignore-scripts` after verification.
+  Manually publishing a GitHub release is no longer a trigger. Run publishing and
+  version validation tests with `node --test test/publish-release.test.mjs test/release-version.test.mjs`.
 - User installation is the npm package specifier in `tui.json` (e.g.
   `opencode-reviewer@0.4.0`), resolved by OpenCode. Document migration by replacing
   an old file-path entry while retaining options; do not prescribe extraction,

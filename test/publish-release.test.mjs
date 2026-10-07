@@ -30,7 +30,7 @@ test("mismatched archives and registry failures never publish", async () => {
 })
 
 test("new releases publish the existing archive, with stable/prerelease tags and provenance", async () => {
-  for (const [version, prerelease, tag] of [["0.4.0", false, "latest"], ["0.5.0-beta.1", false, "next"], ["0.5.0", true, "next"]]) {
+  for (const [version, prerelease, tag] of [["0.4.0", false, "latest"], ["0.5.0-beta.1", false, "next"], ["0.5.0", true, "next"], ["0.5.0+build-hash", false, "latest"]]) {
     let calls = 0
     assert.equal(await publishRelease("/tmp/verified.tgz", { ...pkg, version }, bytes, {
       prerelease, fetcher: async () => new Response(null, { status: 404 }),

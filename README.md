@@ -214,3 +214,11 @@ npm run check:package  # Reproducible build and exact package contents
 ```
 
 Use `OPENCODE_BIN` to select a test binary. Build output is `dist/tui.js`; `npm pack` creates `opencode-reviewer-VERSION.tgz`. See [AGENTS.md](https://github.com/mightykatun/opencode-reviewer/blob/main/AGENTS.md) for maintainer and release details.
+
+### Releasing
+
+Update both manifests with `npm version X.Y.Z --no-git-tag-version`, commit the release changes, then create and push the matching `vX.Y.Z` tag. A `v*` tag push runs verification and packaging, automatically creates a GitHub Release with generated notes and the archive, and publishes that same archive to npm. No separate GitHub Release creation step is required.
+
+Stable versions publish to npm's `latest` tag. Versions such as `X.Y.Z-beta.1` create GitHub prereleases and publish to npm's `next` tag. Package and lockfile versions must match the Git tag; published npm versions are immutable.
+
+For an existing tag containing this workflow, use **Actions → Release package → Run workflow**, select `main`, and supply the tag. Equivalent CLI command: `gh workflow run release.yml --ref main -f tag=vX.Y.Z`. Reruns reuse an existing release, and skip npm publication only when the existing package has identical archive integrity.
