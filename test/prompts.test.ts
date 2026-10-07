@@ -14,6 +14,9 @@ test("shell and edit prompts use their named files and share the separate fixed 
     assert.equal(BUILTIN_PROMPTS[kind].instructions, assessment)
     assert.equal(BUILTIN_PROMPTS[kind].correction, correction)
     assert.match(correction, /\{\{validationError\}\}/)
+    assert.match(assessment, /one-time allowance \(Allow once\)/)
+    assert.match(assessment, /Do not explain, warn about, or rate.*Allow always/)
+    assert.match(correction, /without commentary about Allow always/)
     assert.ok(correctionPrompt("feedback $&", correction).includes("feedback $&"))
   }
   assert.equal(CONTRACT, (await readFile(new URL("../contracts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim())
@@ -21,6 +24,8 @@ test("shell and edit prompts use their named files and share the separate fixed 
   assert.match(CONTRACT, /exactly two fields/)
   assert.match(BUILTIN_PROMPTS.edit.instructions, /partial=true/)
   assert.match(BUILTIN_PROMPTS.edit.instructions, /writing executable code.*running it now/)
+  assert.equal(BUILTIN_PROMPTS.extraCareful, (await readFile(new URL("../prompts/EXTRA-CAREFUL-REVIEW-PROMPT.md", import.meta.url), "utf8")).trim())
+  assert.doesNotMatch(BUILTIN_PROMPTS.extraCareful, /auto|countdown|will (?:run|execute)/i)
 })
 
 test("instructions accepts only absolute directory paths, not former inline guidance", () => {
@@ -45,6 +50,7 @@ test("prompt files override independently with immutable startup snapshots and p
   assert.equal(first.edit.instructions, "custom edit guidance")
   assert.equal(first.edit.correction, BUILTIN_PROMPTS.edit.correction)
   assert.equal(first.shell.instructions, BUILTIN_PROMPTS.shell.instructions)
+  assert.equal(first.extraCareful, BUILTIN_PROMPTS.extraCareful)
   assert.equal(correctionPrompt("feedback $&", first.shell.correction), "shell correction: feedback $&")
   await writeFile(path.join(dir, "EDIT-REVIEW-PROMPT.md"), "changed on disk")
   assert.equal(first.edit.instructions, "custom edit guidance")
@@ -53,30 +59,33 @@ test("prompt files override independently with immutable startup snapshots and p
   assert.notEqual(BUILTIN_PROMPTS.edit.instructions, first.edit.instructions)
 })
 
-test("all four named files load and correction substitutions preserve literal feedback", async (t) => {
+test("all five named files load and correction substitutions preserve literal feedback", async (t) => {
   const dir = await mkdtemp(path.join(tmpdir(), "review-prompts-"))
   t.after(() => rm(dir, { recursive: true, force: true }))
   for (const prefix of ["PERMISSION", "EDIT"]) {
     await writeFile(path.join(dir, `${prefix}-REVIEW-PROMPT.md`), `${prefix} custom guidance`)
     await writeFile(path.join(dir, `${prefix}-REVIEW-CORRECTION.md`), `${prefix} {{validationError}} / {{validationError}}`)
   }
+  await writeFile(path.join(dir, "EXTRA-CAREFUL-REVIEW-PROMPT.md"), "Custom extra-careful guidance")
   const prompts = await loadPrompts(dir, new AbortController().signal)
+  await writeFile(path.join(dir, "EXTRA-CAREFUL-REVIEW-PROMPT.md"), "Changed on disk")
+  assert.equal(prompts.extraCareful, "Custom extra-careful guidance")
   assert.equal(prompts.shell.instructions, "PERMISSION custom guidance")
   assert.equal(prompts.edit.instructions, "EDIT custom guidance")
   assert.equal(correctionPrompt("$&", prompts.edit.correction), "EDIT $& / $&")
 })
 
 test("supplied invalid prompt files fail rather than falling back or leaking file contents", async (t) => {
-  for (const scenario of ["blank", "binary", "utf8", "oversized", "directory", "dangling", "fifo", "placeholder", "contract"]) {
+  for (const scenario of ["blank", "binary", "utf8", "oversized", "directory", "dangling", "fifo", "placeholder", "contract", "extra-careful"]) {
     await t.test(scenario, async (t) => {
       const dir = await mkdtemp(path.join(tmpdir(), "review-prompts-"))
       t.after(() => rm(dir, { recursive: true, force: true }))
-      const name = scenario === "placeholder" ? "EDIT-REVIEW-CORRECTION.md" : scenario === "contract" ? "PERMISSION-REVIEW-CONTRACT.md" : "EDIT-REVIEW-PROMPT.md"
+      const name = scenario === "placeholder" ? "EDIT-REVIEW-CORRECTION.md" : scenario === "contract" ? "PERMISSION-REVIEW-CONTRACT.md" : scenario === "extra-careful" ? "EXTRA-CAREFUL-REVIEW-PROMPT.md" : "EDIT-REVIEW-PROMPT.md"
       const file = path.join(dir, name)
       if (scenario === "directory") await mkdir(file)
       else if (scenario === "dangling") await symlink(path.join(dir, "missing"), file)
       else if (scenario === "fifo") execFileSync("mkfifo", [file])
-      else await writeFile(file, scenario === "blank" ? " \n" : scenario === "binary" ? "\u0000secret" : scenario === "utf8" ? Buffer.from([0xff]) : scenario === "oversized" ? "x".repeat(65537) : "secret-invalid-template")
+      else await writeFile(file, scenario === "blank" || scenario === "extra-careful" ? " \n" : scenario === "binary" ? "\u0000secret" : scenario === "utf8" ? Buffer.from([0xff]) : scenario === "oversized" ? "x".repeat(65537) : "secret-invalid-template")
       await assert.rejects(loadPrompts(dir, new AbortController().signal), (error: unknown) => {
         assert.ok(error instanceof Error)
         assert.match(error.message, scenario === "contract" ? /Contract prompt overrides/ : /Invalid prompt file/)

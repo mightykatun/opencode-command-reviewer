@@ -9,13 +9,15 @@ export interface Config extends Limits {
   instructions?: string
   reviewBash: boolean
   reviewEdits: boolean
+  autoApprove: boolean
+  autoApproveDelaySeconds: number
   formatRetries: number
   timeoutMs: number
 }
 
 export function parseConfig(options: Record<string, unknown> = {}): Config {
-  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "reviewBash", "reviewEdits", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
-  for (const key of Object.keys(options)) if (!keys.has(key)) throw new Error(`Unknown command-reviewer setting: ${key}`)
+  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "reviewBash", "reviewEdits", "autoApprove", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
+  for (const key of Object.keys(options)) if (!keys.has(key)) throw new Error(`Unknown opencode-reviewer setting: ${key}`)
   const text = (name: string, optional = false): string | undefined => {
     const value = options[name]
     if (value === undefined && optional) return undefined
@@ -29,8 +31,8 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     }
     return value
   }
-  const boolean = (name: string) => {
-    const value = options[name] === undefined ? true : options[name]
+  const boolean = (name: string, fallback = true) => {
+    const value = options[name] === undefined ? fallback : options[name]
     if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`)
     return value
   }
@@ -52,6 +54,8 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     apiKey: text("apiKey", true),
     instructions,
     reviewBash: boolean("reviewBash"), reviewEdits: boolean("reviewEdits"),
+    autoApprove: boolean("autoApprove", false),
+    autoApproveDelaySeconds: number("autoApproveDelaySeconds", 15, 0, 3600),
     formatRetries: number("formatRetries", 1, 0, 100),
     timeoutMs: number("timeoutMs", 30000, 1, 3600000),
     maxFiles: number("maxFiles", 4, 1, 1000),

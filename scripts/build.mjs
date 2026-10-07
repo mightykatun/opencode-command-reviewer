@@ -3,7 +3,7 @@ import { transformAsync } from "@babel/core"
 import { readFile } from "node:fs/promises"
 
 const prompts = Object.fromEntries(await Promise.all(
-  ["PERMISSION-REVIEW-PROMPT", "PERMISSION-REVIEW-CONTRACT", "PERMISSION-REVIEW-CORRECTION", "EDIT-REVIEW-PROMPT", "EDIT-REVIEW-CORRECTION"].map(async (name) => [
+  ["PERMISSION-REVIEW-PROMPT", "PERMISSION-REVIEW-CONTRACT", "PERMISSION-REVIEW-CORRECTION", "EDIT-REVIEW-PROMPT", "EDIT-REVIEW-CORRECTION", "EXTRA-CAREFUL-REVIEW-PROMPT"].map(async (name) => [
     name, (await readFile(new URL(`../${name === "PERMISSION-REVIEW-CONTRACT" ? "contracts" : "prompts"}/${name}.md`, import.meta.url), "utf8")).trim(),
   ]),
 ))

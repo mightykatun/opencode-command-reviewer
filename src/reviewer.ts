@@ -6,11 +6,11 @@ class FormatError extends Error {}
 
 export function parseAssessment(content: string): Assessment {
   let value: unknown
-  try { value = JSON.parse(content) } catch { throw new FormatError("Response must be valid JSON without surrounding prose or Markdown fences") }
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new FormatError("Response must be a JSON object")
+  try { value = JSON.parse(content) } catch { throw new FormatError("Invalid JSON") }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new FormatError("Non-object JSON")
   const record = value as Record<string, unknown>
   if (Object.keys(record).length !== 2 || typeof record.safe !== "boolean" || typeof record.desc !== "string" || !record.desc.trim()) {
-    throw new FormatError('Response must contain exactly "safe": boolean and "desc": nonempty string')
+    throw new FormatError("Invalid assessment fields or types")
   }
   return { safe: record.safe, desc: record.desc.trim() }
 }
@@ -71,7 +71,7 @@ export async function review(
   if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset or empty`)
   const prompt = evidence.kind === "edit" ? prompts.edit : prompts.shell
   const messages = [
-    { role: "system", content: `${prompt.instructions}\n\n${CONTRACT}` },
+    { role: "system", content: [prompt.instructions, ...(config.autoApprove ? [prompts.extraCareful] : []), CONTRACT].join("\n\n") },
     { role: "user", content: JSON.stringify(evidence) },
   ]
   for (let attempt = 0; attempt <= config.formatRetries; attempt++) {

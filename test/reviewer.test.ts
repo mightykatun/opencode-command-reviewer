@@ -47,6 +47,8 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   assert.equal(cfg.maxEvidenceBytes, 65536)
   assert.equal(cfg.reviewBash, true)
   assert.equal(cfg.reviewEdits, true)
+  assert.equal(cfg.autoApprove, false)
+  assert.equal(cfg.autoApproveDelaySeconds, 15)
   for (const override of [ { baseURL: "file:///tmp" }, { baseURL: "https://secret@example.org" }, { model: "" }, { apiKeyEnv: "bad name" }, { timeoutMs: 0 }, { formatRetries: -1 }, { formatRetries: 1.2 }, { retries: 3 } ]) {
     assert.throws(() => parseConfig({ baseURL: "http://localhost/v1", model: "m", ...override }))
   }
@@ -59,8 +61,9 @@ test("review switches are independent strict booleans with enabled defaults", ()
     assert.equal(config.reviewBash, reviewBash)
     assert.equal(config.reviewEdits, reviewEdits)
   }
-  for (const name of ["reviewBash", "reviewEdits"] as const) {
-    assert.equal(parseConfig({ ...options, [name]: undefined })[name], true)
+  for (const name of ["reviewBash", "reviewEdits", "autoApprove"] as const) {
+    assert.equal(parseConfig({ ...options, [name]: undefined })[name], name !== "autoApprove")
+    for (const value of [true, false]) assert.equal(parseConfig({ ...options, [name]: value })[name], value)
     for (const value of [null, 0, 1, "true", "false", {}, []]) {
       assert.throws(() => parseConfig({ ...options, [name]: value }), { message: `${name} must be a boolean` })
     }
@@ -73,6 +76,7 @@ test("numeric settings default only on omission and enforce integer boundaries b
     ["timeoutMs", 30000, 1, 3600000],
     ["maxFiles", 4, 1, 1000],
     ["maxEvidenceBytes", 65536, 1, 16 * 1024 * 1024],
+    ["autoApproveDelaySeconds", 15, 0, 3600],
   ] as const) {
     await t.test(name, async (t) => {
       const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Unexpected."}')))
@@ -195,7 +199,7 @@ test("malformed assessment in an assistant stop envelope still gets format corre
   assert.deepEqual(await review(evidence, config, signal()), { safe: true, desc: "Counts fruits." })
   assert.deepEqual(requests.map((request) => request.target), ["/v1/chat/completions", "/v1/chat/completions"])
   assert.deepEqual(requests[1]!.body.messages[2], { role: "assistant", content: "bad format" })
-  assert.match(requests[1]!.body.messages[3].content, /Format validation failed: Response must be valid JSON/)
+  assert.match(requests[1]!.body.messages[3].content, /Format validation failed: Invalid JSON/)
 })
 
 test("formatted descriptions preserve Markdown and decoded JSON newlines", () => {
@@ -286,7 +290,7 @@ test("format correction uses validation feedback and configurable retry count", 
   const correction = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CORRECTION.md", import.meta.url), "utf8")).trim()
   assert.match(correction, /\{\{validationError\}\}/)
   assert.equal(requests[0]!.body.messages[0].content, `${prompt}\n\n${contract}`)
-  assert.equal(requests[1]!.body.messages[3].content, correction.replace("{{validationError}}", 'Response must contain exactly "safe": boolean and "desc": nonempty string'))
+  assert.equal(requests[1]!.body.messages[3].content, correction.replace("{{validationError}}", "Invalid assessment fields or types"))
   assert.deepEqual(JSON.parse(requests[2]!.body.messages[1].content), evidence)
 })
 
@@ -415,9 +419,37 @@ test("edit evidence uses its own assessment/correction prompts and preserves par
     assert.ok(!JSON.stringify(requests[index]!.body).includes("raw secret aggregate"))
     assert.ok(!JSON.stringify(requests[index]!.body).includes("omitted secret"))
     assert.ok(!JSON.stringify(requests[index]!.body).includes("Shell-only guidance"))
-    assert.equal(requests[index + 1]!.body.messages[3].content, prompts.edit.correction.replace("{{validationError}}", 'Response must contain exactly "safe": boolean and "desc": nonempty string'))
+    assert.equal(requests[index + 1]!.body.messages[3].content, prompts.edit.correction.replace("{{validationError}}", "Invalid assessment fields or types"))
     assert.deepEqual(JSON.parse(requests[index + 1]!.body.messages[1].content), edit)
     assert.equal(requests[index]!.body.tools, undefined)
     assert.equal(requests[index]!.body.stream, false)
   }
+})
+
+test("auto mode adds only the extra-careful template to both review kinds, including corrections", async (t) => {
+  const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index % 2 ? '{"safe":true,"desc":"Bounded effects."}' : "invalid JSON")))
+  const edit = collectEditEvidence({
+    kind: "edit", tool: "edit", userPrompt: "Update note", limitations: [], session: evidence.session,
+    location: { instanceDirectory: "/project", instanceWorktree: "/project" },
+    permission: { ...evidence.permission!, type: "edit", metadata: { filepath: "/project/note", diff: "-old\n+new" } },
+  }, config, signal())
+  for (const input of [evidence, edit]) for (const autoApprove of [false, true]) {
+    const prompts = { ...BUILTIN_PROMPTS, extraCareful: "CUSTOM EXTRA CARE: check the supplied evidence carefully." }
+    const start = requests.length
+    await review(input, { ...config, autoApprove, autoApproveDelaySeconds: 17 }, signal(), fetch, {}, prompts)
+    const kind = input.kind === "edit" ? "edit" : "shell"
+    for (const request of requests.slice(start)) {
+      assert.equal(request.body.messages[0].content, [prompts[kind].instructions, ...(autoApprove ? [prompts.extraCareful] : []), CONTRACT].join("\n\n"))
+      assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
+      assert.doesNotMatch(JSON.stringify(request.body), /autoApprove|countdown|automatic approval/)
+    }
+    assert.equal(requests.length - start, 2)
+  }
+})
+
+test("provider reasoning stays outside the displayed assessment", async (t) => {
+  const { config } = await endpoint(t, (_, res) => res.end(JSON.stringify({ choices: [{ message: {
+    content: '{"safe":true,"desc":"Visible effects."}', reasoning: "hidden reasoning", reasoning_content: "hidden thoughts",
+  } }] })))
+  assert.deepEqual(await review(evidence, config, signal()), { safe: true, desc: "Visible effects." })
 })

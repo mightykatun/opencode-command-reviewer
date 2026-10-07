@@ -1,12 +1,23 @@
 {
-  "name": "opencode-command-reviewer",
-  "version": "0.1.0",
-  "description": "Advisory explanations and safety ratings for pending OpenCode shell and edit approvals",
+  "name": "opencode-reviewer",
+  "version": "0.2.0",
+  "description": "Safety reviews and optional one-time auto-approval for OpenCode shell and edit permissions",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mightykatun/opencode-command-reviewer.git"
+    "url": "git+https://github.com/mightykatun/opencode-reviewer.git"
   },
+  "homepage": "https://github.com/mightykatun/opencode-reviewer#readme",
+  "bugs": {
+    "url": "https://github.com/mightykatun/opencode-reviewer/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tui",
+    "permissions",
+    "auto-approval"
+  ],
   "exports": {
     "./tui": "./dist/tui.js"
   },
@@ -24,7 +35,7 @@
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "test:runtime": "node scripts/smoke.mjs correction && node scripts/smoke.mjs cancel && node scripts/smoke.mjs error && node scripts/smoke.mjs external && node scripts/smoke.mjs edit && node scripts/smoke.mjs write && node scripts/smoke.mjs patch && node scripts/smoke.mjs edit-cancel && node scripts/smoke.mjs edit-config-error && node scripts/smoke.mjs edit-disabled && node scripts/smoke.mjs bash-disabled && node scripts/smoke.mjs external-disabled",
+    "test:runtime": "node scripts/smoke.mjs correction && node scripts/smoke.mjs cancel && node scripts/smoke.mjs error && node scripts/smoke.mjs external && node scripts/smoke.mjs edit && node scripts/smoke.mjs write && node scripts/smoke.mjs patch && node scripts/smoke.mjs edit-cancel && node scripts/smoke.mjs edit-config-error && node scripts/smoke.mjs edit-disabled && node scripts/smoke.mjs bash-disabled && node scripts/smoke.mjs external-disabled && node scripts/smoke.mjs auto-shell && node scripts/smoke.mjs auto-cancel && node scripts/smoke.mjs auto-scroll && node scripts/smoke.mjs auto-edit && node scripts/smoke.mjs auto-external && node scripts/smoke.mjs auto-immediate && node scripts/smoke.mjs auto-zero && node scripts/smoke.mjs auto-unsafe && node scripts/smoke.mjs auto-error && node scripts/smoke.mjs auto-hide && node scripts/smoke.mjs auto-dialog && node scripts/smoke.mjs auto-fullscreen && node scripts/smoke.mjs auto-narrow && node scripts/smoke.mjs auto-manual && node scripts/smoke.mjs auto-initially-hidden",
     "check:package": "node scripts/check-package.mjs",
     "check": "npm run typecheck && npm test && npm run build"
   },

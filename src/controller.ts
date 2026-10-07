@@ -1,27 +1,149 @@
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
 import type { Assessment } from "./types.js"
 import type { Config } from "./config.js"
+import type { ApprovalTransport } from "./approval.js"
+import { isDeepStrictEqual } from "node:util"
+import { withDeadline } from "./reviewer.js"
+
+export type AutoApproval = { status: "countdown"; seconds: number } | { status: "checking" | "allowing" | "cancelled" | "failed" }
 
 export interface View {
   request: PermissionRequest
   status: "identifying" | "unidentified" | "analyzing" | "complete" | "unavailable" | "unrelated"
   assessment?: Assessment
   error?: string
+  autoApproval?: AutoApproval
 }
 
 type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void) => Promise<Assessment | null>
-interface Entry { view: View; abort: AbortController }
+interface Entry { view: View; abort: AbortController; cancelTimer?: () => void; deadline?: number; approvalAbort?: AbortController }
 
-/** This component has no host permission-writing or shell-execution capability. */
+export interface ApprovalClock {
+  now(): number
+  after(ms: number, callback: () => void): () => void
+}
+const clock: ApprovalClock = {
+  now: () => performance.now(),
+  after: (ms, callback) => { const timer = setTimeout(callback, ms); return () => clearTimeout(timer) },
+}
+type Options = Pick<Config, "reviewBash" | "reviewEdits"> & Partial<Pick<Config, "autoApprove" | "autoApproveDelaySeconds">>
+export interface Approval extends ApprovalTransport {
+  /** Recompute actual presentation/order, rather than trusting a stale UI effect. */
+  visibleID(): string | undefined
+}
+
+/** Reviews remain advisory unless explicitly configured with a once-only writer. */
 export class Controller {
   private entries = new Map<string, Entry>()
   private stopped = false
   private version = 0
+  private visibleID: string | undefined
   constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
-    private options: Pick<Config, "reviewBash" | "reviewEdits"> = { reviewBash: true, reviewEdits: true }) {}
+    private options: Options = { reviewBash: true, reviewEdits: true },
+    private approval?: Approval, private time: ApprovalClock = clock) {}
   get revision() { return this.version }
   get views() { return [...this.entries.values()].map((entry) => entry.view) }
   private publish() { if (!this.stopped) this.changed(this.views) }
+
+  /** Called only after the assessment has actually been rendered, or to hide it. */
+  presented(id?: string) {
+    if (this.stopped) return
+    if (id !== this.visibleID) {
+      const old = this.visibleID
+      this.visibleID = id
+      if (old) this.cancelAutoApproval(old)
+    }
+    const entry = id ? this.entries.get(id) : undefined
+    if (!entry || entry.view.autoApproval || !this.eligible(entry)) return
+    entry.deadline = this.time.now() + (this.options.autoApproveDelaySeconds ?? 15) * 1000
+    entry.view = { ...entry.view, autoApproval: { status: "countdown", seconds: this.options.autoApproveDelaySeconds ?? 15 } }
+    this.publish()
+    // Even zero delay goes through the same cancellable single-flight path.
+    this.schedule(entry)
+  }
+
+  cancelAutoApproval(id: string) {
+    const entry = this.entries.get(id)
+    if (!entry || !["countdown", "checking"].includes(entry.view.autoApproval?.status ?? "")) return
+    entry.cancelTimer?.()
+    entry.cancelTimer = undefined
+    entry.approvalAbort?.abort()
+    entry.view = { ...entry.view, autoApproval: { status: "cancelled" } }
+    this.publish()
+  }
+
+  private active(entry: Entry) {
+    return !this.stopped && !entry.abort.signal.aborted && this.entries.get(entry.view.request.id) === entry
+  }
+
+  private eligible(entry: Entry) {
+    return this.active(entry) && this.options.autoApprove === true && entry.view.status === "complete"
+      && entry.view.assessment?.safe === true && this.visibleID === entry.view.request.id
+      && this.approval?.visibleID() === entry.view.request.id
+  }
+
+  private schedule(entry: Entry) {
+    if (!this.active(entry) || entry.view.autoApproval?.status !== "countdown") return
+    const remaining = Math.max(0, entry.deadline! - this.time.now())
+    entry.cancelTimer = this.time.after(Math.min(1000, remaining), () => {
+      entry.cancelTimer = undefined
+      if (!this.active(entry) || entry.view.autoApproval?.status !== "countdown") return
+      if (!this.eligible(entry)) { this.cancelAutoApproval(entry.view.request.id); return }
+      const seconds = Math.max(0, Math.ceil((entry.deadline! - this.time.now()) / 1000))
+      if (seconds === 0) { void this.approveNow(entry.view.request.id); return }
+      entry.view = { ...entry.view, autoApproval: { status: "countdown", seconds } }
+      this.publish()
+      this.schedule(entry)
+    })
+  }
+
+  async approveNow(id: string) {
+    const entry = this.entries.get(id)
+    if (!entry || entry.view.autoApproval?.status !== "countdown" || !this.approval) return
+    if (!this.eligible(entry)) { this.cancelAutoApproval(id); return }
+    entry.cancelTimer?.()
+    entry.cancelTimer = undefined
+    entry.approvalAbort = new AbortController()
+    entry.view = { ...entry.view, autoApproval: { status: "checking" } }
+    this.publish()
+    try {
+      await withDeadline(AbortSignal.any([entry.abort.signal, entry.approvalAbort.signal]), 5000, async (signal) => {
+        const revision = this.version
+        const pending = await this.approval!.list(signal)
+        signal.throwIfAborted()
+        if (!this.eligible(entry)) { this.cancelAutoApproval(id); return }
+        if (revision !== this.version) throw new Error("Pending permissions changed during verification")
+        const current = pending.find((request) => request.id === id)
+        if (!current) { this.replied(id); return }
+        if (!isDeepStrictEqual(current, entry.view.request)) throw new Error("Pending request changed")
+        this.reconcile(pending, revision)
+        if (!this.eligible(entry)) { this.cancelAutoApproval(id); return }
+        entry.view = { ...entry.view, autoApproval: { status: "allowing" } }
+        this.publish()
+        // Publishing can synchronously trigger native resolution or visibility loss.
+        signal.throwIfAborted()
+        if (!this.eligible(entry)) {
+          entry.view = { ...entry.view, autoApproval: { status: "cancelled" } }
+          this.publish()
+          return
+        }
+        await this.approval!.once(entry.view.request, signal)
+        signal.throwIfAborted()
+        this.replied(id)
+      })
+    } catch {
+      // A native reply may abort our in-flight HTTP response after accepting it.
+      if (!this.active(entry) || entry.view.autoApproval?.status === "cancelled") return
+      entry.view = { ...entry.view, autoApproval: { status: "failed" } }
+      this.publish()
+      // Reconcile an uncertain outcome, without ever retrying the write.
+      const revision = this.version
+      try {
+        const pending = await withDeadline(entry.abort.signal, 5000, (signal) => this.approval!.list(signal))
+        this.reconcile(pending, revision)
+      } catch { /* Periodic read-only reconciliation remains active. */ }
+    }
+  }
 
   asked(request: PermissionRequest) {
     if (this.stopped || this.entries.has(request.id)) return
@@ -61,6 +183,7 @@ export class Controller {
     if (this.stopped) return
     // Increment even for an unknown ID: an in-flight snapshot may still contain it.
     this.version++
+    this.entries.get(id)?.cancelTimer?.()
     this.entries.get(id)?.abort.abort()
     if (this.entries.delete(id)) this.publish()
   }
@@ -82,7 +205,7 @@ export class Controller {
 
   dispose() {
     this.stopped = true
-    for (const entry of this.entries.values()) entry.abort.abort()
+    for (const entry of this.entries.values()) { entry.cancelTimer?.(); entry.abort.abort() }
     this.entries.clear()
   }
 }
