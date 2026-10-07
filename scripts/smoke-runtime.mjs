@@ -1,6 +1,98 @@
 import { execFileSync, fork } from "node:child_process"
 import path from "node:path"
 
+/** Fixture-server observations only. Never retain URLs, headers, bodies or native IDs. */
+export function smokeMetrics(server, { pollIntervalMs, hostVersion, origin = "shared" } = {}) {
+  const start = performance.now()
+  const now = () => performance.now() - start
+  const sockets = new WeakMap()
+  const attached = new WeakSet()
+  const connections = [], requests = [], milestones = []
+  const role = (url) => url === "/review/chat/completions" ? "reviewer"
+    : url === "/main/chat/completions" ? "main" : url === "/mcp" ? "mcp" : "other"
+  const connection = (socket, origin) => {
+    let record = sockets.get(socket)
+    if (!record) {
+      record = { id: connections.length + 1, origin, connectedAtMs: now(), requests: 0 }
+      connections.push(record)
+      sockets.set(socket, record)
+      socket.once("close", () => { record.closedAtMs = now() })
+    }
+    return record
+  }
+  const attach = (server, origin) => {
+    if (attached.has(server)) throw new Error("Fixture server metrics already attached")
+    if (!["shared", "main", "reviewer"].includes(origin)) throw new Error("Unknown fixture origin label")
+    attached.add(server)
+    server.on("connection", (socket) => connection(socket, origin))
+    // Run before the fixture handler starts reading the body. This observes the
+    // same request, not a second listener that parses or copies its payload.
+    server.prependListener("request", (req, res) => {
+      const socket = connection(req.socket, origin)
+      const kind = role(req.url)
+      const previous = requests.findLast((item) => item.role === kind)
+      const record = { id: requests.length + 1, origin, role: kind, attempt: (previous?.attempt ?? 0) + 1,
+        socket: socket.id, socketRequest: ++socket.requests, receivedAtMs: now(), requestBytes: 0, responseBytes: 0,
+        reusedRoleSocket: requests.some((item) => item.role === kind && item.socket === socket.id) }
+      requests.push(record)
+      if (previous?.finishedAtMs !== undefined) record.previousResponseGapMs = record.receivedAtMs - previous.finishedAtMs
+      req.on("data", (chunk) => { record.requestBytes += chunk.length })
+      req.once("end", () => { record.bodyReadAtMs = now() })
+      req.once("aborted", () => { record.requestAbortedAtMs = now() })
+      const writeHead = res.writeHead
+      res.writeHead = function (...args) {
+        const result = writeHead.apply(this, args)
+        record.headersAtMs ??= now()
+        return result
+      }
+      // Only wrap this fixture response. No host fetch, socket or filesystem globals.
+      for (const method of ["write", "end"]) {
+        const original = res[method]
+        res[method] = function (...args) {
+          const result = original.apply(this, args)
+          const chunk = args[0]
+          const bytes = typeof chunk === "string" ? Buffer.byteLength(chunk, typeof args[1] === "string" ? args[1] : "utf8")
+            : ArrayBuffer.isView(chunk) ? chunk.byteLength : 0
+          if (bytes) {
+            record.firstBodyWriteAtMs ??= now()
+            record.responseBytes += bytes
+          }
+          return result
+        }
+      }
+      res.once("finish", () => { record.finishedAtMs = now(); record.status = res.statusCode })
+      res.once("close", () => { record.closedAtMs = now(); record.responseAborted = !res.writableFinished })
+    })
+  }
+  attach(server, origin)
+  const rounded = (record) => Object.fromEntries(Object.entries(record).map(([key, value]) =>
+    [key, typeof value === "number" ? Math.round(value * 1000) / 1000 : value]))
+  return {
+    attach,
+    // Callers supply fixed fixture milestone names and local attempt ordinals only.
+    mark(event, reviewerAttempt) { milestones.push({ event, atMs: now(), ...(reviewerAttempt === undefined ? {} : { reviewerAttempt }) }) },
+    snapshot(outcome) {
+      const byRole = Object.fromEntries(["main", "reviewer", "mcp", "other"].map((kind) => {
+        const items = requests.filter((item) => item.role === kind)
+        return [kind, { requests: items.length, sockets: new Set(items.map((item) => item.socket)).size,
+          reusedSocketRequests: items.filter((item) => item.reusedRoleSocket).length,
+          completed: items.filter((item) => item.finishedAtMs !== undefined).length,
+          aborted: items.filter((item) => item.responseAborted).length }]
+      }))
+      return { version: 2, outcome, hostVersion, nodeVersion: process.version, pollIntervalMs,
+        clock: "monotonic milliseconds since fixture metrics initialization",
+        timingScope: "server receive/body-read/header-write/body-write/finish; UI milestones are polling observations, not client dispatch or validation",
+        limitations: "Loopback HTTP only; no DNS/TLS/provider generation measurements. Byte counts exclude HTTP framing. SSE body writes include framing, not just assessment text. Socket novelty does not measure client connection setup latency.",
+        elapsedMs: Math.round(now() * 1000) / 1000, counts: { requests: requests.length, sockets: connections.length, byRole },
+        connections: connections.map(rounded), requests: requests.map((record) => rounded({ ...record,
+          ...(record.headersAtMs === undefined ? {} : { receiveToHeadersMs: record.headersAtMs - record.receivedAtMs }),
+          ...(record.firstBodyWriteAtMs === undefined ? {} : { receiveToFirstBodyWriteMs: record.firstBodyWriteAtMs - record.receivedAtMs }),
+          ...(record.finishedAtMs === undefined ? {} : { receiveToFinishMs: record.finishedAtMs - record.receivedAtMs }),
+        })), milestones: milestones.map(rounded) }
+    },
+  }
+}
+
 const tmux = (socket, args) => execFileSync("tmux", ["-S", socket, ...args], {
   encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000, killSignal: "SIGKILL",
 })

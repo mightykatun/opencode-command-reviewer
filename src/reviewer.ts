@@ -1,43 +1,158 @@
 import type { Config } from "./config.js"
-import type { Assessment, ReviewEvidence, ReviewResult } from "./types.js"
+import type { Assessment, ReviewEvidence, ReviewProgress, ReviewResult } from "./types.js"
 import { BUILTIN_PROMPTS, CONTRACT, correctionPrompt, type PromptSet } from "./prompts.js"
-import { responseUsage, sumUsage, type PricingLookup, type Usage } from "./usage.js"
+import { usageAttempt, sumUsage, type PricingLookup, type Usage } from "./usage.js"
 import { reviewStage } from "./deadline.js"
+import { SSEParser } from "./sse.js"
+import { AssessmentFormatError, StreamingAssessment } from "./streaming-assessment.js"
+import { diagnosticAttempt, type DiagnosticObserver } from "./diagnostics.js"
 export { withDeadline } from "./deadline.js"
-
-class FormatError extends Error {}
+export type { ReviewProgress } from "./types.js"
 
 export function parseAssessment(content: string): Assessment {
-  let value: unknown
-  try { value = JSON.parse(content) } catch { throw new FormatError("Invalid JSON") }
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new FormatError("Non-object JSON")
-  const record = value as Record<string, unknown>
-  if (Object.keys(record).length !== 2 || typeof record.safe !== "boolean" || typeof record.desc !== "string" || !record.desc.trim()) {
-    throw new FormatError("Invalid assessment fields or types")
+  const parser = new StreamingAssessment()
+  parser.push(content)
+  return parser.finish()
+}
+
+/** Each wait removes its listener on settlement; no growing Promise.race listener chain.
+ * A fetcher may ignore abort. Own any late response without allowing it back into review.
+ */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal, late?: (value: T) => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const abort = () => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener("abort", abort)
+      reject(signal.reason)
+    }
+    signal.addEventListener("abort", abort, { once: true })
+    promise.then((value) => {
+      if (settled) { late?.(value); return }
+      settled = true
+      signal.removeEventListener("abort", abort)
+      resolve(value)
+    }, (error) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener("abort", abort)
+      reject(error)
+    })
+    if (signal.aborted) abort()
+  })
+}
+
+function cancelBody(response: Response): void {
+  try { void response.body?.cancel().catch(() => {}) } catch { /* Cleanup cannot change the outcome. */ }
+}
+
+async function readBody(response: Response, signal: AbortSignal, consume: (bytes: Uint8Array) => void): Promise<void> {
+  if (!response.body) throw new Error("Reviewer returned an empty HTTP response")
+  const reader = response.body.getReader()
+  try {
+    while (true) {
+      reviewStage(signal, "Reviewer response body")
+      let part: ReadableStreamReadResult<Uint8Array>
+      try { part = await abortable(reader.read(), signal) }
+      catch {
+        signal.throwIfAborted()
+        throw new Error("Reviewer response read failed")
+      }
+      signal.throwIfAborted()
+      if (part.done) break
+      consume(part.value)
+    }
+  } finally {
+    // cancel() synchronously closes pending reads, but its underlying cleanup promise
+    // can hang in injected transports. Do not await it; always release the reader lock.
+    try { void reader.cancel().catch(() => {}) } finally { reader.releaseLock() }
   }
-  return { safe: record.safe, desc: record.desc.trim() }
 }
 
 const MAX_RESPONSE_BYTES = 65536
 async function responseText(response: Response, signal: AbortSignal): Promise<string> {
-  if (!response.body) throw new Error("Reviewer returned an empty HTTP response")
-  const reader = response.body.getReader()
   let bytes = 0
   const chunks: Uint8Array[] = []
-  try {
-    while (true) {
-      signal.throwIfAborted()
-      const { value, done } = await reader.read()
-      if (done) break
-      bytes += value.length
-      if (bytes > MAX_RESPONSE_BYTES) throw new Error("Reviewer HTTP response exceeds 64 KiB")
-      chunks.push(value)
-    }
-    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))
-  } finally {
-    await reader.cancel().catch(() => {})
-    reader.releaseLock()
+  await readBody(response, signal, (value) => {
+    bytes += value.length
+    if (bytes > MAX_RESPONSE_BYTES) throw new Error("Reviewer HTTP response exceeds 64 KiB")
+    chunks.push(value)
+  })
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)) }
+  catch { throw new Error("Reviewer HTTP response contains invalid UTF-8") }
+}
+
+const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value)
+const textMetadata = (message: Record<string, unknown>) => (message.role === undefined || message.role === "assistant")
+  && message.function_call == null
+  && (message.tool_calls == null || (Array.isArray(message.tool_calls) && message.tool_calls.length === 0))
+  && (message.refusal == null || message.refusal === "")
+
+async function streamedAssessment(response: Response, signal: AbortSignal, accounting: ReturnType<typeof usageAttempt>,
+  progress: (preview?: Partial<Assessment>) => void, firstContent?: () => void): Promise<StreamingAssessment> {
+  if (response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "text/event-stream") {
+    cancelBody(response)
+    throw new Error("Reviewer expected an SSE response")
   }
+  const assessment = new StreamingAssessment()
+  let stopped = false, done = false
+  let id: string | undefined, model: string | undefined
+  let last: Partial<Assessment> | undefined
+  function invalid(): never { throw new Error("Reviewer API did not return a text assessment stream") }
+  const sse = new SSEParser(({ data, event }) => {
+    if (data.trim() === "[DONE]") {
+      if (done || !stopped || event !== "message") invalid()
+      done = true
+      return
+    }
+    let body: unknown
+    try { body = JSON.parse(data) } catch { throw new Error("Reviewer returned invalid SSE API JSON") }
+    // Even an invalid/error/late frame can report real usage. Capture it before validation.
+    // Usage-only frames may omit the response model. Keep the established identity
+    // for generic catalog estimates rather than reverting to a requested alias.
+    accounting.observe(object(body) && body.model === undefined && model !== undefined ? { ...body, model } : body)
+    reviewStage(signal, "Reviewer response body")
+    if (done || event !== "message" || !object(body) || body.error != null) invalid()
+    if (body.object !== undefined && body.object !== "chat.completion.chunk") invalid()
+    for (const key of ["id", "model"] as const) {
+      const value = body[key]
+      if (value === undefined) continue
+      if (typeof value !== "string" || !value) invalid()
+      const previous = key === "id" ? id : model
+      if (previous !== undefined && previous !== value) invalid()
+      if (key === "id") id = value
+      else model = value
+    }
+    if (!Array.isArray(body.choices) || body.choices.length > 1) invalid()
+    if (body.choices.length === 0) {
+      if (!object(body.usage)) invalid()
+      return
+    }
+    const choice: unknown = body.choices[0]
+    if (!object(choice) || choice.index !== 0 || choice.message != null || choice.text != null || choice.error != null) invalid()
+    const finish = choice.finish_reason
+    if ((finish != null && finish !== "stop") || (stopped && finish !== "stop")) invalid()
+    const delta = choice.delta === undefined && finish === "stop" ? {} : choice.delta
+    if (!object(delta) || !textMetadata(delta)) invalid()
+    if (delta.content != null && typeof delta.content !== "string") invalid()
+    if (stopped && [delta.content, delta.reasoning, delta.reasoning_content, delta.reasoning_details]
+      .some((value) => value != null && value !== "" && !(Array.isArray(value) && value.length === 0))) invalid()
+    if (typeof delta.content === "string" && delta.content) {
+      firstContent?.()
+      assessment.push(delta.content)
+      const preview = assessment.preview()
+      if (preview?.safe !== last?.safe || preview?.desc !== last?.desc) {
+        last = preview
+        progress(preview)
+      }
+    }
+    if (finish === "stop") stopped = true
+  })
+  await readBody(response, signal, (bytes) => sse.push(bytes))
+  sse.finish()
+  if (!done || !stopped) throw new Error("Reviewer stream ended without stop and DONE")
+  return assessment
 }
 
 export async function review(
@@ -49,6 +164,8 @@ export async function review(
   prompts: PromptSet = BUILTIN_PROMPTS,
   pricing?: PricingLookup,
   onUsage?: (usage: Usage) => void,
+  onProgress?: (progress: ReviewProgress) => void,
+  onDiagnostics?: DiagnosticObserver,
 ): Promise<ReviewResult> {
   const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)
   if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset or empty`)
@@ -60,60 +177,86 @@ export async function review(
   let usage: Usage | undefined
   for (let attempt = 0; attempt <= config.formatRetries; attempt++) {
     signal.throwIfAborted()
-    reviewStage(signal, "Reviewer response")
-    let response: Response
+    const progress = (phase: ReviewProgress["phase"], preview?: Partial<Assessment>) => {
+      if (signal.aborted) return
+      try { onProgress?.({ attempt, phase, ...(preview ? { preview: { ...preview } } : {}) }) }
+      catch { /* Observational callbacks cannot change review outcomes. */ }
+    }
+    progress(attempt ? "retrying" : "evaluating")
+    const accounting = usageAttempt(config.baseURL, config.model, pricing, onUsage)
     try {
-      response = await fetcher(`${config.baseURL}/chat/completions`, {
-        method: "POST", redirect: "error", signal,
-        headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
-        body: JSON.stringify({ model: config.model, messages, stream: false }),
-      })
-    } catch {
-      signal.throwIfAborted()
-      throw new Error("Reviewer network request failed")
-    }
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {})
-      throw new Error(`Reviewer HTTP ${response.status}`)
-    }
-    let envelope: unknown
-    reviewStage(signal, "Reviewer response body")
-    try { envelope = JSON.parse(await responseText(response, signal)) }
-    catch (error) {
-      signal.throwIfAborted()
-      if (error instanceof SyntaxError) throw new Error("Reviewer returned invalid API JSON")
-      throw error
-    }
-    reviewStage(signal, "Assessment validation")
-    let currentUsage: Usage | undefined
-    try { currentUsage = responseUsage(envelope, config.model, pricing) }
-    catch { currentUsage = responseUsage(envelope, config.model) }
-    // A completed HTTP response can be billable even if its assessment is invalid.
-    // Accounting is observational: it must never change review/permission outcomes.
-    if (currentUsage) { try { onUsage?.({ ...currentUsage }) } catch { /* The observer owns persistence diagnostics. */ } }
-    const choices = (envelope as { choices?: unknown })?.choices
-    if (!Array.isArray(choices) || choices.length !== 1) throw new Error("Reviewer API must return one completion")
-    const choice = choices[0]
-    const message = choice?.message
-    // Minimal providers may omit metadata; explicit metadata must describe a completed text response.
-    if (!message || typeof message.content !== "string"
-      || (message.role !== undefined && message.role !== "assistant")
-      || (choice.finish_reason !== undefined && choice.finish_reason !== "stop")
-      || message.function_call != null
-      || (message.tool_calls != null && (!Array.isArray(message.tool_calls) || message.tool_calls.length !== 0))
-      || message.refusal) {
-      throw new Error("Reviewer API did not return a text assessment")
-    }
-    signal.throwIfAborted()
-    usage = attempt === 0 ? currentUsage : sumUsage(usage, currentUsage)
-    try { return { ...parseAssessment(message.content), ...(usage ? { usage } : {}) } }
-    catch (error) {
-      if (!(error instanceof FormatError)) throw error
-      if (attempt === config.formatRetries) throw new Error("Reviewer response format invalid after configured attempts")
-      messages.push(
-        { role: "assistant", content: message.content },
-        { role: "user", content: correctionPrompt(error.message) },
-      )
+      reviewStage(signal, "Reviewer response")
+      let response: Response
+      let diagnose: ReturnType<typeof diagnosticAttempt> | undefined
+      try {
+        const body = JSON.stringify({ model: config.model, messages, stream: config.stream,
+          ...(config.stream ? { stream_options: { include_usage: true } } : {}) })
+        diagnose = onDiagnostics ? diagnosticAttempt(onDiagnostics, attempt) : undefined
+        response = await abortable(fetcher(`${config.baseURL}/chat/completions`, {
+          method: "POST", redirect: "error", signal,
+          headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+          body,
+        }), signal, cancelBody)
+        diagnose?.("headers")
+      } catch {
+        signal.throwIfAborted()
+        throw new Error("Reviewer network request failed")
+      }
+      if (!response.ok) {
+        cancelBody(response)
+        throw new Error(`Reviewer HTTP ${response.status}`)
+      }
+      let assessment: StreamingAssessment
+      if (config.stream) assessment = await streamedAssessment(response, signal, accounting, (preview) => {
+        if (typeof preview?.safe === "boolean") diagnose?.("first-rating")
+        progress("streaming", preview)
+      }, diagnose ? () => diagnose("first-content") : undefined)
+      else {
+        let envelope: unknown
+        try { envelope = JSON.parse(await responseText(response, signal)) }
+        catch (error) {
+          signal.throwIfAborted()
+          if (error instanceof SyntaxError) throw new Error("Reviewer returned invalid API JSON")
+          throw error
+        }
+        accounting.observe(envelope)
+        reviewStage(signal, "Assessment validation")
+        const choices = object(envelope) ? envelope.choices : undefined
+        if (!Array.isArray(choices) || choices.length !== 1) throw new Error("Reviewer API must return one completion")
+        const choice = choices[0], message = choice?.message
+        // Minimal non-stream providers may omit metadata; explicit values must describe text completion.
+        if (!object(message) || typeof message.content !== "string" || !textMetadata(message)
+          || (object(envelope) && envelope.error != null)
+          || (choice.index !== undefined && choice.index !== 0)
+          || (choice.finish_reason !== undefined && choice.finish_reason !== "stop")) {
+          throw new Error("Reviewer API did not return a text assessment")
+        }
+        if (message.content) diagnose?.("first-content")
+        assessment = new StreamingAssessment()
+        assessment.push(message.content)
+        if (diagnose && typeof assessment.preview()?.safe === "boolean") diagnose("first-rating")
+      }
+      reviewStage(signal, "Assessment validation")
+      const currentUsage = accounting.current()
+      usage = attempt === 0 ? currentUsage : sumUsage(usage, currentUsage)
+      try {
+        let result: Assessment
+        try { result = assessment.finish() } finally { diagnose?.("final-validation") }
+        if (config.stream) progress("streaming", result)
+        signal.throwIfAborted()
+        return { ...result, ...(usage ? { usage } : {}) }
+      }
+      catch (error) {
+        if (!(error instanceof AssessmentFormatError)) throw error
+        if (attempt === config.formatRetries) throw new Error("Reviewer response format invalid after configured attempts")
+        messages.push(
+          { role: "assistant", content: assessment.content },
+          { role: "user", content: correctionPrompt(error.message) },
+        )
+      }
+    } finally {
+      // Disposal must await aborted review workers before flushing their queued accounting writes.
+      accounting.finalize()
     }
   }
   throw new Error("Reviewer exhausted attempts")

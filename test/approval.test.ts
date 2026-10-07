@@ -67,9 +67,9 @@ function fixture(t: TestContext, settings: {
     list: async () => structuredClone(host.pending),
     once: async (req) => { host.pending = host.pending.filter((item) => item.id !== req.id) },
   }
-  const controller: Controller = new Controller((req, signal, identified) => {
+  const controller: Controller = new Controller((req, signal, identified, progress) => {
     evaluated.push(req.id)
-    if (settings.evaluate) return settings.evaluate(req, signal, identified)
+    if (settings.evaluate) return settings.evaluate(req, signal, identified, progress)
     identified()
     return Promise.resolve(safe)
   }, (views) => {
@@ -264,6 +264,7 @@ for (const blocker of ["unrelated", "disabled", "identifying"] as const) test(`$
   assert.equal(f.reads.length, 0)
   assert.equal(f.writes.length, 0)
   f.controller.replied(first.id)
+  pending.resolve(safe) // Disposal now drains even removed review workers.
   f.host.pending = [request()]
   f.present()
   assert.deepEqual(f.view()?.autoApproval, { status: "countdown", seconds: 15 })

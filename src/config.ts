@@ -7,6 +7,7 @@ export interface Config extends Limits {
   apiKey?: string
   apiKeyEnv?: string
   instructions?: string
+  stream: boolean
   reviewBash: boolean
   reviewEdits: boolean
   reviewMcp: boolean
@@ -19,7 +20,7 @@ export interface Config extends Limits {
 }
 
 export function parseConfig(options: Record<string, unknown> = {}): Config {
-  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
+  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "stream", "reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
   for (const key of Object.keys(options)) if (!keys.has(key)) throw new Error(`Unknown opencode-reviewer setting: ${key}`)
   const text = (name: string, optional = false): string | undefined => {
     const value = options[name]
@@ -56,6 +57,7 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     model: text("model")!, apiKeyEnv,
     apiKey: text("apiKey", true),
     instructions,
+    stream: boolean("stream", false),
     reviewBash: boolean("reviewBash"), reviewEdits: boolean("reviewEdits"),
     reviewMcp: boolean("reviewMcp", false), reviewCustomTools: boolean("reviewCustomTools", false),
     reviewExternalDirectories: boolean("reviewExternalDirectories", false),

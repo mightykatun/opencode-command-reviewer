@@ -11,8 +11,9 @@ import { parseConfig } from "../src/config.js"
 import { parseAssessment, review, withDeadline } from "../src/reviewer.js"
 import { BUILTIN_PROMPTS, CONTRACT, CORRECTION, loadPrompts } from "../src/prompts.js"
 import { collectEditEvidence } from "../src/evidence.js"
-import type { Evidence, ReviewEvidence } from "../src/types.js"
-import type { Usage } from "../src/usage.js"
+import type { Evidence, ReviewEvidence, ReviewProgress } from "../src/types.js"
+import { usageText, type Usage } from "../src/usage.js"
+import { LifetimeUsage, lifetimeCost } from "../src/lifetime.js"
 
 const evidence: Evidence = {
   kind: "shell",
@@ -53,6 +54,7 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   assert.equal(cfg.reviewCustomTools, false)
   assert.equal(cfg.reviewExternalDirectories, false)
   assert.equal(cfg.autoApprove, false)
+  assert.equal(cfg.stream, false)
   assert.equal(cfg.autoApproveDelaySeconds, 15)
   for (const override of [ { baseURL: "file:///tmp" }, { baseURL: "https://secret@example.org" }, { model: "" }, { apiKeyEnv: "bad name" }, { timeoutMs: 0 }, { formatRetries: -1 }, { formatRetries: 1.2 }, { retries: 3 } ]) {
     assert.throws(() => parseConfig({ baseURL: "http://localhost/v1", model: "m", ...override }))
@@ -66,7 +68,7 @@ test("review switches are independent strict booleans with enabled defaults", ()
     assert.equal(config.reviewBash, reviewBash)
     assert.equal(config.reviewEdits, reviewEdits)
   }
-  for (const name of ["reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove"] as const) {
+  for (const name of ["reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "stream"] as const) {
     assert.equal(parseConfig({ ...options, [name]: undefined })[name], name === "reviewBash" || name === "reviewEdits")
     for (const value of [true, false]) assert.equal(parseConfig({ ...options, [name]: value })[name], value)
     for (const value of [null, 0, 1, "true", "false", {}, []]) {
@@ -236,6 +238,8 @@ test("sends textual source, genuine user prompt, fixed schema and optional beare
   const contract = (await readFile(new URL("../contracts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim()
   assert.equal(body.messages[0].content, `Custom risk guidance\n\n${contract}`)
   assert.equal(body.stream, false)
+  assert.equal(body.stream_options, undefined)
+  assert.match(body.messages[0].content, /Emit "safe" first/)
   assert.equal(body.tools, undefined)
 })
 
@@ -530,7 +534,7 @@ test("completed invalid envelopes retain reported usage; accounting failures can
   assert.deepEqual(observed.at(-1), { input: 100, output: 10 })
 })
 
-test("missing usage, HTTP errors, and cancellation produce no lifetime usage records", async (t) => {
+test("missing usage, HTTP errors, and cancellation before usage produce no lifetime usage records", async (t) => {
   let observations = 0
   const observe = () => { observations++ }
   const missing = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Bounded effects."}')))
@@ -540,4 +544,469 @@ test("missing usage, HTTP errors, and cancellation produce no lifetime usage rec
   const held = await endpoint(t, () => {})
   await assert.rejects(withDeadline(signal(), 100, (s) => review(evidence, held.config, s, fetch, {}, BUILTIN_PROMPTS, undefined, observe)), /timed out/)
   assert.equal(observations, 0)
+})
+
+test("OpenRouter cost-only corrections accumulate report cost and finalize each attempt once", async () => {
+  const config = parseConfig({ baseURL: "https://openrouter.ai/api/v1/", model: "fixture" })
+  const observed: Usage[] = []
+  let calls = 0
+  const fetcher: typeof fetch = async (url, init) => {
+    assert.equal(url, "https://openrouter.ai/api/v1/chat/completions")
+    assert.equal(observed.length, calls, "the previous attempt must finalize before correction dispatch")
+    const index = calls++
+    assert.equal(JSON.parse(init!.body as string).stream, false)
+    return new Response(JSON.stringify({
+      usage: { cost: index ? 0.02 : 0.01, ...(index ? { prompt_tokens: 10, completion_tokens: 2 } : {}), cost_details: { upstream_inference_cost: 99 } },
+      choices: [{ message: { content: index ? '{"safe":true,"desc":"Bounded effects."}' : "bad format" } }],
+    }))
+  }
+  const result = await review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS,
+    () => { assert.fail("reported cost must bypass catalog pricing") }, (usage) => observed.push(usage))
+  assert.deepEqual(result, { safe: true, desc: "Bounded effects.", usage: { cost: 0.03 } })
+  assert.deepEqual(observed, [{ cost: 0.01 }, { input: 10, output: 2, cost: 0.02 }])
+  assert.equal(calls, 2)
+})
+
+test("OpenRouter incomplete report components do not suppress known lifetime contributions", async () => {
+  for (const missing of [0, 1]) for (const tokens of [false, true]) {
+    const config = parseConfig({ baseURL: "https://openrouter.ai/api/v1", model: "fixture" })
+    const observed: Usage[] = []
+    let calls = 0
+    const fetcher: typeof fetch = async () => {
+      const index = calls++
+      return new Response(JSON.stringify({
+        usage: { ...(tokens ? { prompt_tokens: 10, completion_tokens: 2 } : {}), ...(index === missing ? {} : { cost: 0 }) },
+        choices: [{ message: { content: index ? '{"safe":true,"desc":"Bounded effects."}' : "bad format" } }],
+      }))
+    }
+    const result = await review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS,
+      () => { assert.fail("missing reported cost must not trigger estimation") }, (usage) => observed.push(usage))
+    assert.deepEqual(result, { safe: true, desc: "Bounded effects.", ...(tokens ? { usage: { input: 20, output: 4 } } : {}) })
+    assert.equal(calls, 2)
+    assert.equal(observed.length, tokens ? 2 : 1)
+    assert.deepEqual(observed.filter((usage) => usage.cost !== undefined), [{ ...(tokens ? { input: 10, output: 2 } : {}), cost: 0 }])
+  }
+})
+
+test("decoded cost-only usage survives invalid envelopes, refusals and exhausted assessment corrections", async () => {
+  for (const [choices, message, attempts] of [
+    [undefined, /one completion/, 1],
+    [[{ message: { content: "ignored", refusal: "refused" } }], /text assessment/, 1],
+    [[{ message: { content: "bad format" } }], /format invalid/, 2],
+  ] as const) {
+    const config = parseConfig({ baseURL: "https://openrouter.ai/api/v1", model: "fixture" })
+    const observed: Usage[] = []
+    let calls = 0
+    const fetcher: typeof fetch = async () => {
+      calls++
+      return new Response(JSON.stringify({ usage: { cost: 0.01, prompt_tokens: "bad", completion_tokens: 3 }, choices }))
+    }
+    await assert.rejects(review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined, (usage) => observed.push(usage)), message)
+    assert.equal(calls, attempts)
+    assert.deepEqual(observed, Array.from({ length: attempts }, () => ({ cost: 0.01 })))
+  }
+})
+
+test("cancellation after decoded usage finalizes accounting but cannot return or retry an assessment", async () => {
+  const config = parseConfig({ baseURL: "https://generic.test/v1", model: "fixture" })
+  const controller = new AbortController()
+  const observed: Usage[] = []
+  let calls = 0
+  const fetcher: typeof fetch = async () => {
+    calls++
+    return new Response(JSON.stringify({ usage: { prompt_tokens: 10, completion_tokens: 2 },
+      choices: [{ message: { content: '{"safe":true,"desc":"Bounded effects."}' } }] }))
+  }
+  await assert.rejects(review(evidence, config, controller.signal, fetcher, {}, BUILTIN_PROMPTS,
+    () => { controller.abort(); return { input: 1, output: 2, cache: { read: 0, write: 0 } } },
+    (usage) => observed.push(usage)), { name: "AbortError" })
+  assert.equal(calls, 1)
+  assert.deepEqual(observed, [{ input: 10, output: 2, cost: 0.000014 }])
+})
+
+test("correction transport failure retains prior reported cost without an extra POST or record", async () => {
+  const config = parseConfig({ baseURL: "https://openrouter.ai/api/v1", model: "fixture", formatRetries: 5 })
+  const observed: Usage[] = []
+  let calls = 0
+  const fetcher: typeof fetch = async () => {
+    if (calls++) throw new Error("disconnected")
+    return new Response(JSON.stringify({ usage: { cost: 0.01 }, choices: [{ message: { content: "bad format" } }] }))
+  }
+  await assert.rejects(review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined, (usage) => observed.push(usage)), /network request failed/)
+  assert.equal(calls, 2)
+  assert.deepEqual(observed, [{ cost: 0.01 }])
+})
+
+const streamConfig = () => parseConfig({ baseURL: "https://openrouter.ai/api/v1", model: "fixture", stream: true })
+const event = (body: unknown) => `data: ${typeof body === "string" ? body : JSON.stringify(body)}\n\n`
+const chunk = (content: string | null = "", finish_reason: string | null = null) => ({
+  id: "fixture-id", model: "fixture", object: "chat.completion.chunk",
+  choices: [{ index: 0, delta: { content }, finish_reason }],
+})
+const done = event("[DONE]")
+function streamingResponse(parts: readonly Uint8Array[]): Response {
+  let index = 0
+  return new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index === parts.length) controller.close()
+      else controller.enqueue(parts[index++]!)
+    },
+  }), { headers: { "Content-Type": "text/event-stream; charset=utf-8" } })
+}
+const streamText = (text: string) => streamingResponse([Buffer.from(text)])
+
+test("SSE review survives every byte split, including UTF-8 and escaped assessment Unicode", async () => {
+  const desc = 'Café 🍐 **effects**\n"quoted"'
+  const text = JSON.stringify({ safe: false, desc }).replace("🍐", "\\uD83C\\uDF50")
+  const wire = Buffer.from(": café 🍐\r\n\r\n" + event(chunk(text.slice(0, 25)))
+    + event(chunk(text.slice(25), "stop")) + event({ choices: [], usage: { cost: 0 } }) + done)
+  for (let split = 0; split <= wire.length; split++) {
+    let calls = 0
+    const observed: Usage[] = []
+    const fetcher: typeof fetch = async (_, init) => {
+      calls++
+      const request = JSON.parse(init!.body as string)
+      assert.equal(request.stream, true)
+      assert.deepEqual(request.stream_options, { include_usage: true })
+      assert.equal(request.tools, undefined)
+      assert.equal(request.response_format, undefined)
+      return streamingResponse([wire.subarray(0, split), wire.subarray(split)])
+    }
+    assert.deepEqual(await review(evidence, streamConfig(), signal(), fetcher, {}, BUILTIN_PROMPTS, undefined,
+      (usage) => observed.push(usage)), { safe: false, desc, usage: { cost: 0 } })
+    assert.equal(calls, 1)
+    assert.deepEqual(observed, [{ cost: 0 }])
+  }
+  const fetcher: typeof fetch = async () => streamingResponse(Array.from(wire, (byte) => Uint8Array.of(byte)))
+  assert.equal((await review(evidence, streamConfig(), signal(), fetcher)).desc, desc)
+})
+
+test("previews precede completion while stop, final cumulative usage, DONE and EOF are all consumed", async () => {
+  let writer!: ReadableStreamDefaultController<Uint8Array>
+  const body = new ReadableStream<Uint8Array>({ start(controller) { writer = controller } })
+  const response = new Response(body, { headers: { "Content-Type": "text/event-stream" } })
+  const previews: ReviewProgress[] = [], observed: Usage[] = []
+  let completed = false
+  const promise = review(evidence, streamConfig(), signal(), async () => response, {}, BUILTIN_PROMPTS, undefined,
+    (usage) => observed.push(usage), (progress) => previews.push(progress)).then((result) => { completed = true; return result })
+  writer.enqueue(Buffer.from(event({ ...chunk(), choices: [{ index: 0, delta: { role: "assistant", reasoning: "PRIVATE REASONING", reasoning_content: "PRIVATE" }, finish_reason: null }] })
+    + event(chunk('{"safe":true'))))
+  await sleep(0)
+  assert.equal(previews.some((progress) => progress.preview?.safe !== undefined), false)
+  writer.enqueue(Buffer.from(event(chunk(',"desc":"Visible'))))
+  await sleep(0)
+  assert.deepEqual(previews.at(-1), { attempt: 0, phase: "streaming", preview: { safe: true, desc: "Visible" } })
+  assert.equal(completed, false)
+  writer.enqueue(Buffer.from(event(chunk(' effects."}', "stop"))))
+  await sleep(0)
+  assert.equal(completed, false, "a brace and stop are not transport completion")
+  writer.enqueue(Buffer.from(event({ ...chunk("", "stop"), usage: { prompt_tokens: 10, completion_tokens: 2, cost: 0.02 } })
+    + event({ ...chunk("", "stop"), usage: { cost: 0.01 } })
+    + event({ choices: [], usage: { cost: 0.01 } }) + done))
+  await sleep(0)
+  assert.equal(completed, false, "consume through EOF to reject trailing data")
+  writer.close()
+  assert.deepEqual(await promise, { safe: true, desc: "Visible effects.", usage: { input: 10, output: 2, cost: 0.01 } })
+  assert.deepEqual(observed, [{ input: 10, output: 2, cost: 0.01 }])
+  assert.equal(body.locked, false)
+  assert.deepEqual(previews[0], { attempt: 0, phase: "evaluating" })
+  assert.doesNotMatch(JSON.stringify(previews), /PRIVATE/)
+})
+
+test("only final assessment-format errors correct, with reset progress and fresh per-attempt accounting", async () => {
+  for (const stream of [false, true]) {
+    const bad = '{"safe":true,"desc":"provisional","s\\u0061fe":false}'
+    const progress: ReviewProgress[] = [], observed: Usage[] = []
+    let calls = 0
+    const fetcher: typeof fetch = async (_, init) => {
+      const index = calls++
+      if (index) {
+        assert.deepEqual(progress.at(-1), { attempt: 1, phase: "retrying" })
+        assert.equal(observed.length, 1)
+        const request = JSON.parse(init!.body as string)
+        assert.equal(request.messages[2].content, bad)
+        assert.match(request.messages[3].content, /Duplicate assessment field/)
+      }
+      const content = index ? '{"desc":"Corrected.","safe":false}' : bad
+      return stream ? streamText(event(chunk(content.slice(0, 25))) + event(chunk(content.slice(25), "stop")) + event({ choices: [], usage: { cost: 0.01 } }) + done)
+        : new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { cost: 0.01 } }))
+    }
+    const result = await review(evidence, { ...streamConfig(), stream }, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined,
+      (usage) => observed.push(usage), (value) => progress.push(value))
+    assert.deepEqual(result, { safe: false, desc: "Corrected.", usage: { cost: 0.02 } })
+    assert.equal(calls, 2)
+    assert.deepEqual(observed, [{ cost: 0.01 }, { cost: 0.01 }])
+    assert.ok(progress.some((value) => value.attempt === 1 && value.phase === "retrying" && value.preview === undefined))
+    if (stream) assert.ok(progress.some((value) => value.attempt === 0 && value.preview?.safe === true))
+  }
+})
+
+test("malformed/error SSE events and contradictory completion metadata terminate without correction", async (t) => {
+  const valid = chunk('{"safe":true,"desc":"x"}')
+  const withChoice = (fields: Record<string, unknown>) => event({ ...valid, choices: [{ ...valid.choices[0], ...fields }] })
+  const withDelta = (fields: Record<string, unknown>) => withChoice({ delta: { ...valid.choices[0]!.delta, ...fields } })
+  const cases: [string, string][] = [
+    ["invalid JSON", event("not JSON")], ["null", event("null")], ["array", event("[]")],
+    ["error", event({ error: { message: "PRIVATE ERROR" }, usage: { cost: 0.02 } })],
+    ["error event", "event: error\n" + event({ error: "PRIVATE ERROR", usage: { cost: 0.02 } })],
+    ["named event", "event: unsupported\n" + event(valid)],
+    ["missing choices", event({})], ["multiple choices", event({ choices: [valid.choices[0], valid.choices[0]] })],
+    ["non-accounting empty choices", event({ choices: [] })],
+    ["missing index", withChoice({ index: undefined })], ["wrong index", withChoice({ index: 1 })],
+    ["string index", withChoice({ index: "0" })], ["null choice", event({ choices: [null] })],
+    ["message instead of delta", withChoice({ message: { content: "PRIVATE" } })],
+    ["null delta", withChoice({ delta: null })], ["missing delta", withChoice({ delta: undefined })],
+    ["wrong role", withDelta({ role: "user" })], ["null role", withDelta({ role: null })],
+    ["object content", withDelta({ content: {} })], ["array content", withDelta({ content: [] })],
+    ["legacy call", withDelta({ function_call: {} })], ["tool calls", withDelta({ tool_calls: [{ id: "call" }] })],
+    ["bad calls", withDelta({ tool_calls: "" })], ["refusal", withDelta({ refusal: "PRIVATE" })],
+    ["bad refusal", withDelta({ refusal: false })], ["length", withChoice({ finish_reason: "length" })],
+    ["filter", withChoice({ finish_reason: "content_filter" })], ["tool finish", withChoice({ finish_reason: "tool_calls" })],
+    ["empty finish", withChoice({ finish_reason: "" })], ["wrong object", event({ ...valid, object: "chat.completion" })],
+    ["changed ID", event(valid) + event({ ...valid, id: "different" })],
+    ["changed model", event(valid) + event({ ...valid, model: "different" })],
+    ["invalid ID", event({ ...valid, id: 1 })],
+    ["content after stop", event(chunk("", "stop")) + event(chunk("late", "stop"))],
+    ["reasoning after stop", event(chunk("", "stop")) + withDelta({ content: "", reasoning_content: "late" })],
+    ["contradictory stop", event(chunk("", "stop")) + event(chunk("", "length"))],
+    ["continuation after stop", event(chunk("", "stop")) + event(chunk("", null))],
+    ["DONE before stop", done],
+    ["data after DONE", event(chunk("", "stop")) + done + event(valid)],
+    ["duplicate DONE", event(chunk("", "stop")) + done + done],
+  ]
+  for (const [name, text] of cases) await t.test(name, async () => {
+    const observed: Usage[] = []
+    let calls = 0
+    const response = streamText(event({ choices: [], usage: { cost: 0.01 } }) + text + done)
+    await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return response }, {}, BUILTIN_PROMPTS,
+      undefined, (usage) => observed.push(usage)), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.doesNotMatch(error.message, /PRIVATE|format invalid/)
+      return true
+    })
+    assert.equal(calls, 1)
+    assert.equal(response.body!.locked, false)
+    assert.deepEqual(observed, [{ cost: name.startsWith("error") ? 0.02 : 0.01 }])
+  })
+})
+
+test("missing terminal protocol and unfinished events fail even after a valid assessment and stop", async () => {
+  for (const text of [
+    event(chunk('{"safe":true,"desc":"x"}')),
+    event(chunk('{"safe":true,"desc":"x"}', "stop")),
+    event(chunk('{"safe":true,"desc":"x"}', "stop")) + "data: [DONE]\n",
+    event(chunk('{"safe":true,"desc":"x"}', "stop")) + done + "data: trailing",
+    event(chunk("invalid JSON", "stop")),
+  ]) {
+    let calls = 0
+    await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return streamText(text) }), /ended/)
+    assert.equal(calls, 1, "format errors cannot retry an incomplete transport")
+  }
+})
+
+test("decoded usage survives later UTF-8, API JSON, assessment-limit and framing-limit failures", async () => {
+  const usage = Buffer.from(event({ choices: [], usage: { cost: 0.01 } }))
+  const assessmentLimit = Array.from({ length: 3 }, () => event(chunk("x".repeat(30000)))).join("")
+  const failures = [Buffer.from([0xff]), Buffer.from([0xe2]), Buffer.from(event("{")),
+    Buffer.from(assessmentLimit), Buffer.from(":" + "x".repeat(65536)),
+    Buffer.from(event({ ...chunk(), choices: [{ index: 0, delta: { reasoning: "x".repeat(65536) } }] })),
+    Buffer.from("\n".repeat(65536)),
+    Buffer.from((":" + "x".repeat(1021) + "\n\n").repeat(4096)),
+  ]
+  for (const bytes of failures) {
+    const observed: Usage[] = []
+    let calls = 0
+    const response = streamingResponse([Buffer.concat([usage, bytes])])
+    await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return response }, {}, BUILTIN_PROMPTS,
+      undefined, (value) => observed.push(value)))
+    assert.equal(calls, 1)
+    assert.deepEqual(observed, [{ cost: 0.01 }])
+    assert.equal(response.body!.locked, false)
+  }
+})
+
+test("stream progress observer mutations and exceptions cannot change assessment or accounting", async () => {
+  const text = event(chunk('{"safe":false,"desc":"Visible."}', "stop")) + event({ choices: [], usage: { cost: 0.01 } }) + done
+  let progressCalls = 0
+  const result = await review(evidence, streamConfig(), signal(), async () => streamText(text), {}, BUILTIN_PROMPTS, undefined,
+    () => { throw new Error("accounting observer") }, (value) => {
+      progressCalls++
+      if (value.preview) { value.preview.safe = true; value.preview.desc = "mutated" }
+      throw new Error("progress observer")
+    })
+  assert.deepEqual(result, { safe: false, desc: "Visible.", usage: { cost: 0.01 } })
+  assert.ok(progressCalls >= 2)
+})
+
+test("aborting pending reads ignores fetcher signal cooperation and hanging cancel promises", { timeout: 3000 }, async () => {
+  for (const stream of [false, true]) for (const atEOF of [false, true]) {
+    const controller = new AbortController()
+    const observed: Usage[] = []
+    let cancelCalls = 0, calls = 0
+    let started!: () => void
+    const reading = new Promise<void>((resolve) => { started = resolve })
+    const body = new ReadableStream<Uint8Array>({
+      start(writer) {
+        if (stream) writer.enqueue(Buffer.from(event({ choices: [], usage: { cost: 0.01 } })))
+      },
+      pull(writer) {
+        started()
+        if (atEOF) { writer.close(); controller.abort() }
+      },
+      cancel() { cancelCalls++; return new Promise(() => {}) },
+    })
+    const response = new Response(body, { headers: { "Content-Type": stream ? "text/event-stream" : "application/json" } })
+    const promise = review(evidence, { ...streamConfig(), stream }, controller.signal, async () => { calls++; return response }, {}, BUILTIN_PROMPTS,
+      undefined, (usage) => observed.push(usage))
+    // Start the rejection observer before inducing abort (or awaiting a pull that aborts at EOF).
+    const rejected = assert.rejects(promise, { name: "AbortError" })
+    await reading
+    if (!atEOF) { await sleep(0); controller.abort() }
+    await rejected
+    assert.equal(calls, 1)
+    assert.equal(body.locked, false)
+    assert.ok(cancelCalls <= 1)
+    if (stream && !atEOF) assert.deepEqual(observed, [{ cost: 0.01 }])
+  }
+})
+
+test("aborting noncooperative fetch cancels its late response and never emits late progress", { timeout: 3000 }, async () => {
+  const controller = new AbortController()
+  let deliver!: (response: Response) => void
+  let dispatched!: () => void
+  const started = new Promise<void>((resolve) => { dispatched = resolve })
+  const progress: ReviewProgress[] = []
+  const promise = review(evidence, streamConfig(), controller.signal, () => {
+    dispatched()
+    return new Promise((resolve) => { deliver = resolve })
+  }, {}, BUILTIN_PROMPTS, undefined, undefined, (value) => progress.push(value))
+  const rejected = assert.rejects(promise, { name: "AbortError" })
+  await started
+  controller.abort()
+  await rejected
+  let canceled = false
+  deliver(new Response(new ReadableStream({ cancel() { canceled = true } })))
+  await sleep(0)
+  assert.equal(canceled, true)
+  assert.deepEqual(progress, [{ attempt: 0, phase: "evaluating" }])
+})
+
+test("stream corrections and keepalives share the original deadline on a real HTTP fixture", async (t) => {
+  const timers: ReturnType<typeof setInterval>[] = []
+  t.after(() => timers.forEach(clearInterval))
+  const { config, requests } = await endpoint(t, (index, response) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream" })
+    if (!index) response.end(event(chunk("bad format", "stop")) + done)
+    else {
+      response.write(": keepalive\n\n")
+      timers.push(setInterval(() => response.write(": keepalive\n\n"), 10))
+    }
+  })
+  const progress: ReviewProgress[] = []
+  await assert.rejects(withDeadline(signal(), 150, (s) => review(evidence, { ...config, stream: true }, s, fetch, {}, BUILTIN_PROMPTS,
+    undefined, undefined, (value) => progress.push(value))), /timed out/)
+  assert.equal(requests.length, 2)
+  assert.deepEqual(progress.filter((value) => value.phase !== "streaming"), [{ attempt: 0, phase: "evaluating" }, { attempt: 1, phase: "retrying" }])
+  for (const request of requests) assert.equal(request.body.stream, true)
+})
+
+test("stream disconnection preserves decoded usage, sanitizes errors and never retries", async () => {
+  let index = 0, calls = 0
+  const observed: Usage[] = []
+  const body = new ReadableStream<Uint8Array>({ pull(writer) {
+    if (!index++) writer.enqueue(Buffer.from(event({ choices: [], usage: { cost: 0.01 } })))
+    else writer.error(new Error("PRIVATE TRANSPORT ERROR"))
+  } })
+  const response = new Response(body, { headers: { "Content-Type": "text/event-stream" } })
+  await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return response }, {}, BUILTIN_PROMPTS, undefined,
+    (usage) => observed.push(usage)), { message: "Reviewer response read failed" })
+  assert.equal(calls, 1)
+  assert.deepEqual(observed, [{ cost: 0.01 }])
+  assert.equal(body.locked, false)
+})
+
+test("abort at EOF after decoded terminal usage finalizes once and never returns an assessment", async () => {
+  const controller = new AbortController()
+  const observed: Usage[] = []
+  const progress: ReviewProgress[] = []
+  let index = 0
+  const body = new ReadableStream<Uint8Array>({ pull(writer) {
+    if (!index++) writer.enqueue(Buffer.from(event(chunk('{"safe":true,"desc":"x"}', "stop"))
+      + event({ choices: [], usage: { cost: 0.01 } }) + done))
+    else { writer.close(); controller.abort() }
+  } }, { highWaterMark: 0 })
+  const response = new Response(body, { headers: { "Content-Type": "text/event-stream" } })
+  await assert.rejects(review(evidence, streamConfig(), controller.signal, async () => response, {}, BUILTIN_PROMPTS, undefined,
+    (usage) => observed.push(usage), (value) => progress.push(value)), { name: "AbortError" })
+  assert.deepEqual(observed, [{ cost: 0.01 }])
+  assert.equal(body.locked, false)
+  assert.equal(progress.filter((value) => value.preview?.desc === "x").length, 1, "only a provisional report was emitted")
+})
+
+test("stream MIME mismatch and HTTP errors cancel without waiting for cleanup or making another POST", { timeout: 3000 }, async () => {
+  for (const [status, contentType, expected] of [[200, "application/json", /expected an SSE/], [503, "text/event-stream", /HTTP 503/]] as const) {
+    let canceled = false, calls = 0
+    const body = new ReadableStream({ cancel() { canceled = true; return new Promise(() => {}) } })
+    const response = new Response(body, { status, headers: { "Content-Type": contentType } })
+    await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return response }), expected)
+    assert.equal(canceled, true)
+    assert.equal(calls, 1)
+    assert.equal(body.locked, false)
+  }
+})
+
+test("real HTTP streaming retains the response model for generic usage-only pricing and full-size assessment", async (t) => {
+  const empty = JSON.stringify({ safe: true, desc: "" })
+  const desc = "x".repeat(65536 - empty.length)
+  const content = JSON.stringify({ safe: true, desc })
+  assert.equal(Buffer.byteLength(content), 65536)
+  const { config, requests } = await endpoint(t, (_, response) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" })
+    for (let offset = 0; offset < content.length; offset += 16000) response.write(event(chunk(content.slice(offset, offset + 16000))))
+    response.write(event(chunk("", "stop")))
+    response.end(event({ choices: [], usage: { prompt_tokens: 1000, completion_tokens: 100, cost: 99,
+      prompt_tokens_details: { cached_tokens: 600, cache_write_tokens: 100 } } }) + done)
+  })
+  const observed: Usage[] = [], models: string[] = []
+  const result = await review(evidence, { ...config, model: "requested-alias", stream: true }, signal(), fetch, {}, BUILTIN_PROMPTS,
+    (model) => { models.push(model); return { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } } }, (usage) => observed.push(usage))
+  assert.equal(result.desc, desc)
+  assert.equal(result.safe, true)
+  assert.ok(Math.abs(result.usage!.cost! - 0.002955) < 1e-12)
+  assert.deepEqual(models, ["fixture"])
+  assert.deepEqual(observed, [result.usage])
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0]!.body.stream, true)
+  assert.equal(requests[0]!.body.model, "requested-alias")
+})
+
+test("complete SSE reviews discard stale estimates from report and lifetime but preserve independently reported cost", async (t) => {
+  for (const reported of [false, true]) for (const output of [1, 100]) await t.test(`${reported ? "reported" : "estimated"}, final output ${output}`, async (t) => {
+    const directory = await mkdtemp(path.join(tmpdir(), "review-stale-estimate-"))
+    const store = new LifetimeUsage(directory)
+    const observed: Usage[] = [], writes: Promise<void>[] = []
+    t.after(async () => { await Promise.allSettled(writes); await rm(directory, { recursive: true, force: true }) })
+    const initial = { prompt_tokens: 100, completion_tokens: 1, ...(reported ? { cost: 0.000102 } : {}) }
+    const latest = { prompt_tokens: 100, completion_tokens: output, prompt_tokens_details: { cached_tokens: 101 } }
+    const wire = event({ ...chunk('{"safe":true,"desc":"Bounded effects."}', "stop"), usage: initial })
+      + event({ choices: [], usage: latest }) + event({ choices: [], usage: latest }) + done
+    let calls = 0
+    const config = { ...streamConfig(), baseURL: reported ? "https://openrouter.ai/api/v1" : "https://generic.test/v1" }
+    const result = await review(evidence, config, signal(), async () => { calls++; return streamText(wire) }, {}, BUILTIN_PROMPTS,
+      () => ({ input: 1, output: 2, cache: { read: 0, write: 0 } }), (usage) => {
+        observed.push(usage)
+        writes.push(store.record(usage))
+      })
+    await Promise.all(writes)
+    await store.flush()
+    const expected = { input: 100, output, ...(reported ? { cost: 0.000102 } : {}) }
+    assert.deepEqual(result, { safe: true, desc: "Bounded effects.", usage: expected })
+    assert.equal(usageText(result.usage!), `tokens in/out: 100/${output}${reported ? "\ncost: $0.0001" : ""}`)
+    assert.deepEqual(observed, [expected], "one final accounting observation, not cumulative-frame increments")
+    assert.equal(calls, 1)
+    const totals = await new LifetimeUsage(directory).totals()
+    assert.deepEqual({ ...totals, since: null }, { requests: 1, tokenRequests: 1, input: 100, output,
+      priced: reported ? 1 : 0, cost: reported ? 0.000102 : 0, since: null })
+    assert.equal(lifetimeCost(totals), reported ? "lifetime: $0.0001" : "lifetime: cost unavailable")
+  })
 })

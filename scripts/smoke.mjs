@@ -7,10 +7,15 @@ import path from "node:path"
 import { tmpdir } from "node:os"
 import { pathToFileURL } from "node:url"
 import { setTimeout as sleep } from "node:timers/promises"
-import { smokeRuntime } from "./smoke-runtime.mjs"
+import { smokeMetrics, smokeRuntime } from "./smoke-runtime.mjs"
+import { reviewerAudit, assertReviewerReuse } from "./smoke-reviewer.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
+const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
+const hostVersion = execFileSync(hostBinary, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
 const scenario = process.argv[2] ?? "correction"
+const measureReuse = process.argv.includes("--measure-reuse")
+if (measureReuse) assert.equal(scenario, "external", "reuse baseline uses the two-stage external fixture")
 assert.ok(["correction", "cancel", "error", "stalled-file", "external", "edit", "write", "patch", "edit-cancel", "edit-config-error", "edit-disabled", "bash-disabled", "external-disabled", "auto-shell", "auto-cancel", "auto-scroll", "auto-edit", "auto-external", "auto-immediate", "auto-zero", "auto-unsafe", "auto-error", "auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow", "auto-manual", "auto-initially-hidden"].includes(scenario))
 const auto = scenario.startsWith("auto-")
 const visibilityLoss = ["auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow"].includes(scenario)
@@ -165,13 +170,17 @@ let reviewerAborted = false
 let releaseReview
 let reviewHeldAt
 let releasedReviews = 0
-const server = createServer(async (req, res) => {
+const audit = reviewerAudit()
+const handleRequest = async (req, res) => {
   try {
+    assert.equal(req.socket.localPort, (req.url === "/review/chat/completions" ? reviewerServer : server).address().port,
+      "reviewer requests must use their separate origin")
     let text = ""
     for await (const chunk of req) text += chunk
     const body = JSON.parse(text)
     calls.push({ url: req.url, body })
     if (req.url === "/review/chat/completions") {
+      const observation = audit.request(req.method, text)
       assert.equal(req.headers.authorization, "Bearer fixture-review-key")
       reviewerCalls++
       record(`review-request-${reviewerCalls}`)
@@ -185,8 +194,11 @@ const server = createServer(async (req, res) => {
         const content = correction && reviewerCalls === 1
           ? '{"safe":"yes","desc":"Incorrect boolean type."}'
           : JSON.stringify({ safe: !["external", "patch", "auto-unsafe", "stalled-file"].includes(scenario), desc: scenario === "stalled-file" ? "Source contents unavailable after a bounded file-access timeout." : scenario === "auto-scroll" ? autoLongDescription : scenario === "correction" ? longDescription : isEdit ? "Proposed file changes. Partial coverage where diffs are omitted." : "Counts two fruit names, prints the count, and writes it to executed-marker." })
+        const usage = withUsage ? { prompt_tokens: 500, completion_tokens: 20 } : undefined
+        observation.usage(usage)
+        observation.response(content, correction && reviewerCalls === 1)
         res.end(JSON.stringify({ choices: [{ message: { content, reasoning_content: "HIDDEN-REASONING-SENTINEL" } }],
-          ...(withUsage ? { model: "review-fixture", usage: { prompt_tokens: 500, completion_tokens: 20 } } : {}),
+          ...(usage ? { model: "review-fixture", usage } : {}),
         }))
         record(`review-response-${reviewerCalls}`)
       }
@@ -228,7 +240,12 @@ const server = createServer(async (req, res) => {
     res.writeHead(500)
     res.end(String(error))
   }
-})
+}
+const server = createServer(handleRequest)
+const reviewerServer = createServer(handleRequest)
+const metrics = smokeMetrics(server, { pollIntervalMs: 100, hostVersion, origin: "main" })
+metrics.attach(reviewerServer, "reviewer")
+let outcome = "failed"
 const runtime = await smokeRuntime(temp)
 const tmux = runtime.tmux
 let screen = ""
@@ -239,8 +256,13 @@ try {
     server.once("error", reject)
     server.listen(0, "127.0.0.1", resolve)
   })
+  await new Promise((resolve, reject) => {
+    reviewerServer.once("error", reject)
+    reviewerServer.listen(0, "127.0.0.1", resolve)
+  })
   if (failAfterListen) throw new Error("Injected post-listen startup failure")
   const port = server.address().port
+  const reviewPort = reviewerServer.address().port
   const config = {
     $schema: "https://opencode.ai/config.json",
     model: `fixture/${fixtureModel}`,
@@ -251,14 +273,14 @@ try {
   }
   if (knownPricing) config.provider.reviewer = {
     npm: "@ai-sdk/openai-compatible", name: "Reviewer fixture",
-    options: { baseURL: `http://127.0.0.1:${port}/review`, apiKey: "fixture-review-key" },
+    options: { baseURL: `http://127.0.0.1:${reviewPort}/review`, apiKey: "fixture-review-key" },
     models: { "review-fixture": { name: "Review fixture", limit: { context: 32000, output: 1000 }, cost: { input: 1, output: 2, cache_read: 0, cache_write: 0 } } },
   }
   const tuiFile = path.join(temp, "tui.json")
   await writeFile(tuiFile, JSON.stringify({
     $schema: "https://opencode.ai/tui.json",
     theme: scenario === "correction" ? "tokyonight" : "opencode",
-    plugin: [[pluginFile, { baseURL: `http://127.0.0.1:${port}/review`, model: "review-fixture", apiKey: "fixture-review-key",
+    plugin: [[pluginFile, { baseURL: `http://127.0.0.1:${reviewPort}/review`, model: "review-fixture", apiKey: "fixture-review-key",
       reviewExternalDirectories: scenario !== "external-disabled",
       ...(scenario === "edit" || configFailure ? { instructions: customPrompts } : {}),
       ...(scenario === "patch" ? { maxFiles: 2 } : {}),
@@ -285,10 +307,12 @@ try {
   }
   await mkdir(path.join(root, ".runtime"), { recursive: true })
   tmuxStarted = true
+  metrics.mark("tmux-start-dispatched")
   await runtime.start("-d", "-s", "smoke", "-x", String(initialWidth), "-y", scenario === "cancel" ? "24" : "40", "-c", project,
     "env", ...Object.entries(env).map(([k, v]) => `${k}=${v}`),
-    process.env.OPENCODE_BIN ?? "opencode", project,
+    hostBinary, project,
     "--prompt", userPrompt)
+  metrics.mark("tmux-start-acknowledged")
   const capture = () => tmux("capture-pane", "-p", "-t", "smoke")
   const until = async (condition, timeout = 90000) => {
     const deadline = Date.now() + timeout
@@ -380,6 +404,7 @@ try {
     const noFooter = (s) => assert.doesNotMatch(s, /Allowed in|Checking…|Allowing…|Auto-approval|Cancel/)
     const countdown = async (stage = "pending") => {
       await until((s) => s.includes("✓ Safe") && s.includes(`Allowed in ${autoDelay}s`))
+      metrics.mark("countdown-visible", reviewerCalls)
       const started = Date.now()
       record(`${stage}-countdown-visible`)
       const footerRow = screen.split("\n").findIndex((line) => line.includes("Allowed in"))
@@ -581,6 +606,7 @@ try {
       }
     }
     await until((s) => !s.includes("Permission required") && !hasPanel(s), 10000)
+    metrics.mark("permission-and-panel-resolved", reviewerCalls)
     // Successful native tools continue the conversation; Escape ends the turn.
     // Observe that request, rather than mistaking a generated title for a reply.
     if (!canceled && !manualResult) await until(() => calls.some((call) => call.url === "/main/chat/completions"
@@ -694,6 +720,7 @@ try {
       toggleSidebar()
     }
     await until((screen) => screen.includes("Permission required") && hasExpected(screen) && formattingReady(screen) && (configFailure || disabledReview || reviewerCalls > 0))
+    metrics.mark(heldReview ? "loading-visible" : disabledReview ? "disabled-permission-visible" : "review-visible", reviewerCalls)
     if (disabledReview) {
       await sleep(2200) // Include a reconciliation interval; disabled work must not start later.
       screen = capture()
@@ -848,8 +875,10 @@ try {
       assert.deepEqual(sent.permission.patterns, [`${commandDirectory}/*`])
       assert.deepEqual(sent.permission.always, [`${commandDirectory}/*`])
       // Authorize only the directory boundary. OpenCode must still ask for bash.
+      metrics.mark("native-directory-allow-dispatched", reviewerCalls)
       tmux("send-keys", "-t", "smoke", "Enter")
       await until((s) => s.includes("Permission required") && s.includes("Shell command") && s.includes("✗ Unsafe") && formattingReady(s) && reviewerCalls === 2, 10000)
+      metrics.mark("review-visible", reviewerCalls)
       const next = JSON.parse(calls.filter((call) => call.url === "/review/chat/completions")[1].body.messages[1].content)
       assert.equal(next.permission.type, "bash")
       assert.notEqual(next.permission.id, sent.permission.id)
@@ -892,8 +921,10 @@ try {
       assert.equal(reviewerCalls, 1, "hiding the sidebar must not restart the pending review")
     }
     // A real human-style keystroke, not a plugin/API permission write.
+    metrics.mark(correction ? "native-allow-dispatched" : "native-reject-dispatched", reviewerCalls)
     tmux("send-keys", "-t", "smoke", correction ? "Enter" : "Escape")
     await until((s) => !s.includes("Permission required") && !hasPanel(s), 10000)
+    metrics.mark("permission-and-panel-resolved", reviewerCalls)
     if (scenario === "edit") {
       await until(async () => await readFile(path.join(project, "note.txt"), "utf8") === "after\n", 10000)
       assert.equal(await readFile(path.join(project, "delete.txt"), "utf8"), editOriginals["delete.txt"])
@@ -927,9 +958,10 @@ try {
         tmux("send-keys", "-t", "smoke", "-l", "Reviewer: Lifetime usage")
         await until((s) => (s.match(/Reviewer: Lifetime usage/g) ?? []).length >= 2, 10000)
         tmux("send-keys", "-t", "smoke", "Enter")
-        await until((s) => s.includes("Reviewer lifetime usage") && s.includes("2 completed requests with usage"), 10000)
+        await until((s) => s.includes("Reviewer lifetime usage") && s.includes("2 requests with recorded usage"), 10000)
         assert.match(screen, /lifetime: \$0\.0011/)
         assert.match(screen, /tokens in\/out: 1000\/40/)
+        assert.match(screen, /Token counts available: 2\/2 requests/)
         assert.match(screen, /Pricing available: 2\/2 requests/)
         assert.doesNotMatch(screen, /Permission analysis/)
       }
@@ -938,7 +970,7 @@ try {
       // Reuse the isolated HOME/state, but start a new host/plugin instance without a prompt.
       tmux("kill-session", "-t", "smoke")
       await runtime.start("-d", "-s", "smoke", "-x", "160", "-y", "40", "-c", project,
-        "env", ...Object.entries(env).map(([k, v]) => `${k}=${v}`), process.env.OPENCODE_BIN ?? "opencode", project)
+        "env", ...Object.entries(env).map(([k, v]) => `${k}=${v}`), hostBinary, project)
       await until((s) => s.includes("Ask anything"), 90000)
       await showLifetime()
       assert.equal(reviewerCalls, 2, "opening lifetime stats and restarting must not make reviewer requests")
@@ -948,6 +980,10 @@ try {
     await writeFile(path.join(root, `.runtime/${scenario}-requests.json`), JSON.stringify(calls, null, 2))
     console.log(`PASS ${scenario}: native approval, exact evidence, advisory behavior, panel cleanup${scenario === "cancel" ? ", >6s held response, observed HTTP cancellation, released late response and clean sidebar remount at 80x24" : scenario === "correction" ? ", long-analysis wheel/drag, live scrollbar theme and native fullscreen layering" : ""}. Isolated files: ${temp}`)
   }
+  audit.verify(configFailure || disabledReview ? [] : isExternal ? ["external-directory", "shell"] : [isEdit ? "edit" : "shell"], correction ? 2 : 1)
+  assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)
+  if (measureReuse) assertReviewerReuse(metrics.snapshot())
+  outcome = "passed"
 } catch (error) {
   await mkdir(path.join(root, ".runtime"), { recursive: true })
   if (tmuxStarted) {
@@ -966,8 +1002,14 @@ try {
 } finally {
   await runtime.dispose()
   releaseReview = undefined
-  server.closeAllConnections()
-  await new Promise((resolve) => server.close(resolve))
+  for (const listener of [server, reviewerServer]) listener.closeAllConnections()
+  await Promise.all([server, reviewerServer].map((listener) => new Promise((resolve) => listener.close(resolve))))
+  metrics.mark("fixture-disposed")
+  await mkdir(path.join(root, ".runtime"), { recursive: true })
+  const measurement = { ...metrics.snapshot(outcome), payloadAudit: audit.snapshot() }
+  await writeFile(path.join(root, `.runtime/${scenario}-metrics.json`), JSON.stringify(measurement, null, 2))
+  console.log(`METRICS ${scenario}: ${JSON.stringify(measurement.counts)}; .runtime/${scenario}-metrics.json`)
   assert.equal(server.listening, false, "fixture HTTP server must close even after startup failure")
+  assert.equal(reviewerServer.listening, false, "reviewer HTTP server must close even after startup failure")
   if (failAfterListen) console.log("PASS post-listen cleanup: fixture HTTP server closed")
 }

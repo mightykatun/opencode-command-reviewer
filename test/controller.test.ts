@@ -6,6 +6,7 @@ import { Controller as CoreController, displayText, visibleReview, type View } f
 import { loadContext, type ContextReader } from "../src/context.js"
 import { withDeadline } from "../src/reviewer.js"
 import type { Assessment } from "../src/types.js"
+import { SessionModes } from "../src/session-mode.js"
 
 // Existing directory lifecycle cases opt into the newly independent category.
 class Controller extends CoreController {
@@ -483,4 +484,157 @@ test("native-like permission names remain hidden until origin and enablement are
   assert.equal(controller.views[0]?.status, "unrelated")
   assert.equal(visibleReview(controller.views, "root", getSession), undefined)
   controller.dispose()
+})
+
+function modeFixture(settings: { session?: (id: string, signal: AbortSignal) => Promise<{ id: string; parentID?: string } | undefined>; read?: () => Promise<boolean> } = {}) {
+  return new SessionModes({ read: settings.read ?? (async () => true), write: async () => {}, flush: async () => {} },
+    settings.session ?? (async (id) => ({ id, ...(id === "child" ? { parentID: "root" } : id === "grandchild" ? { parentID: "child" } : {}) })))
+}
+
+test("disabled root and all descendants skip enrichment while independent roots review", async () => {
+  const modes = modeFixture()
+  await modes.set("root", false)
+  const calls: string[] = []
+  const controller = new CoreController(async (req) => { calls.push(req.id); return result }, () => {}, undefined, undefined, undefined, modes)
+  for (const id of ["root", "child", "grandchild", "other"]) controller.asked(request(id, id))
+  await tick()
+  assert.deepEqual(calls, ["other"])
+  assert.ok(controller.views.slice(0, 3).every((view) => view.status === "suspended"))
+  const revision = controller.revision
+  await modes.set("root", true)
+  controller.modeChanged("root")
+  controller.reconcile([request("root", "root")], revision)
+  await tick()
+  assert.deepEqual(calls, ["other"], "enable cannot consume a pre-switch snapshot")
+  const fresh = ["root", "child", "grandchild", "other"].map((id) => request(id, id))
+  controller.reconcile(fresh, controller.revision)
+  await tick()
+  controller.reconcile(fresh, controller.revision)
+  await tick()
+  assert.deepEqual(calls, ["other", "root", "child", "grandchild"])
+  await controller.dispose()
+})
+
+test("switch while root lookup is unresolved rechecks root-key state without enriching", async () => {
+  let resolve!: (value: { id: string; parentID: string }) => void
+  const modes = modeFixture({ session: async (id) => id === "child" ? new Promise((yes) => { resolve = yes }) : { id } })
+  let calls = 0
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  controller.asked(request("child-request", "child"))
+  await tick()
+  await modes.set("root", false)
+  controller.modeChanged("root")
+  resolve({ id: "child", parentID: "root" })
+  await tick()
+  assert.equal(calls, 0)
+  assert.equal(controller.views[0]?.status, "suspended")
+  await controller.dispose()
+})
+
+test("disable then enable during unresolved ancestry requires a post-switch snapshot", async () => {
+  let resolve!: (value: { id: string; parentID: string }) => void
+  const modes = modeFixture({ session: async (id) => id === "child" ? new Promise((yes) => { resolve = yes }) : { id } })
+  let calls = 0
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  controller.asked(request("a", "child"))
+  await tick()
+  await modes.set("root", false); controller.modeChanged("root")
+  await modes.set("root", true); controller.modeChanged("root")
+  resolve({ id: "child", parentID: "root" })
+  await tick()
+  assert.equal(calls, 0)
+  controller.reconcile([request("a", "child")], controller.revision)
+  await tick()
+  assert.equal(calls, 1)
+  await controller.dispose()
+})
+
+for (const failure of ["ancestry", "store"] as const) test(`${failure} failure cannot enrich or expose a later native review`, async () => {
+  let calls = 0
+  const modes = modeFixture(failure === "ancestry" ? { session: async () => undefined } : { read: async () => { throw new Error("bad store") } })
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  controller.asked(request("a"))
+  await tick()
+  assert.equal(calls, 0)
+  assert.equal(visibleReview([...controller.views, { request: request("z"), status: "complete", assessment: result }], "root", getSession), undefined)
+  await controller.dispose()
+})
+
+for (const outcome of ["result", "error"] as const) test(`disabled generation suppresses late identification and ${outcome} after fresh enable`, async () => {
+  const modes = modeFixture()
+  const pending: { identify: () => void; resolve: (value: Assessment) => void; reject: (error: Error) => void; signal: AbortSignal }[] = []
+  const controller = new CoreController((_, signal, identify) => new Promise((resolve, reject) => { pending.push({ signal, identify, resolve, reject }) }),
+    () => {}, undefined, undefined, undefined, modes)
+  controller.asked(request("a"))
+  await tick()
+  await modes.set("root", false); controller.modeChanged("root")
+  assert.ok(pending[0]!.signal.aborted)
+  await modes.set("root", true); controller.modeChanged("root")
+  controller.reconcile([request("a")], controller.revision)
+  await tick()
+  pending[0]!.identify()
+  if (outcome === "result") pending[0]!.resolve({ safe: false, desc: "obsolete" })
+  else pending[0]!.reject(new Error("obsolete failure"))
+  await tick()
+  assert.equal(controller.views[0]?.assessment, undefined)
+  pending[1]!.resolve(result)
+  await tick()
+  assert.equal(controller.views[0]?.assessment, result)
+  await controller.dispose()
+})
+
+for (const stage of ["countdown", "checking", "failed", "allowing"] as const) test(`${stage} tombstone survives fresh review and prevents another approval`, async () => {
+  const modes = modeFixture()
+  let reads = 0, writes = 0
+  let resolve!: (value: PermissionRequest[]) => void
+  let finish!: () => void
+  const controller = new CoreController(async () => result, () => {}, { reviewBash: true, reviewEdits: true, autoApprove: true }, {
+    visibleID: () => "a",
+    list: () => {
+      reads++
+      if (stage === "checking" && reads === 1) return new Promise((yes) => { resolve = yes })
+      if (stage === "failed") return Promise.reject(new Error("failed verification"))
+      return Promise.resolve([request("a")])
+    },
+    once: () => { writes++; return new Promise((yes) => { finish = yes }) },
+  }, undefined, modes)
+  controller.asked(request("a"))
+  await tick()
+  controller.presented("a")
+  const approval = stage === "countdown" ? Promise.resolve() : controller.approveNow("a")
+  await tick()
+  assert.equal(controller.views[0]?.autoApproval?.status, stage)
+  await modes.set("root", false); controller.modeChanged("root")
+  await modes.set("root", true); controller.modeChanged("root")
+  controller.reconcile([request("a")], controller.revision)
+  await tick()
+  controller.presented("a")
+  await controller.approveNow("a")
+  assert.equal(writes, stage === "allowing" ? 1 : 0)
+  assert.equal(controller.views[0]?.autoApproval?.status, ["failed", "allowing"].includes(stage) ? "failed" : "cancelled")
+  resolve?.([request("a")]); finish?.()
+  await approval
+  controller.replied("a")
+  controller.asked(request("a"))
+  await tick()
+  assert.equal(controller.views[0]?.autoApproval, undefined, "native resolution clears the tombstone")
+  await controller.dispose()
+})
+
+test("disposal aborts and drains removed review finalizers before caller flush", async () => {
+  let finish!: () => void
+  const events: string[] = []
+  const controller = new CoreController(async (_, signal) => {
+    try { await new Promise<void>((yes) => { finish = yes }); return result }
+    finally { assert.ok(signal.aborted); events.push("usage-finalized") }
+  }, () => {})
+  controller.asked(request("a"))
+  await tick()
+  controller.replied("a")
+  const disposal = controller.dispose().then(() => { events.push("flush") })
+  await tick()
+  assert.deepEqual(events, [])
+  finish()
+  await disposal
+  assert.deepEqual(events, ["usage-finalized", "flush"])
 })

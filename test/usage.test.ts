@@ -1,10 +1,11 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import type { Model } from "@opencode-ai/sdk/v2"
-import { modelPricing, responseUsage, sumUsage, usageText, type Pricing } from "../src/usage.js"
+import { modelPricing, responseUsage, sumUsage, usageAttempt, usageText, type Pricing, type Usage } from "../src/usage.js"
 
 const prices: Pricing = { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } }
 const response = (input = 1000, output = 100) => ({ model: "fixture", usage: { prompt_tokens: input, completion_tokens: output } })
+const openRouter = "https://openrouter.ai/api/v1"
 
 test("usage requires both actual endpoint counts; malformed or missing usage is never replaced with zeros", () => {
   for (const usage of [undefined, null, [], {}, { prompt_tokens: 1 }, { completion_tokens: 1 }, { prompt_tokens: "10", completion_tokens: 2 }, { prompt_tokens: -1, completion_tokens: 2 }, { prompt_tokens: 1.5, completion_tokens: 2 }, { prompt_tokens: 1, completion_tokens: Infinity }]) {
@@ -66,4 +67,135 @@ test("correction totals include every request and never silently undercount part
   assert.equal(sumUsage(undefined, { input: 10, output: 5 }), undefined)
   assert.equal(sumUsage({ input: 10, output: 5 }, undefined), undefined)
   assert.equal(sumUsage({ input: Number.MAX_SAFE_INTEGER, output: 0 }, { input: 1, output: 0 }), undefined)
+})
+
+test("exact normalized OpenRouter uses reported cost independently of tokens and never consults catalog pricing", () => {
+  const pricing = () => { assert.fail("OpenRouter must not use catalog pricing") }
+  for (const baseURL of [openRouter, `${openRouter}///`, "https://OPENROUTER.ai:443/api/v1/"]) {
+    for (const cost of [0, 0.0123]) {
+      for (const tokens of [{}, { prompt_tokens: 10 }, { prompt_tokens: "10", completion_tokens: 2 }, { prompt_tokens: -1, completion_tokens: 2 }]) {
+        assert.deepEqual(responseUsage({ usage: { ...tokens, cost, cost_details: { upstream_inference_cost: 99 } } }, "fixture", pricing, baseURL), { cost })
+      }
+      assert.deepEqual(responseUsage({ usage: { ...response().usage, cost } }, "fixture", pricing, baseURL), { input: 1000, output: 100, cost })
+    }
+    for (const cost of [undefined, null, "0.01", -1, Infinity, NaN, {}, []]) {
+      assert.equal(responseUsage({ usage: { cost, cost_details: { upstream_inference_cost: 0.01 } } }, "fixture", pricing, baseURL), undefined)
+      assert.deepEqual(responseUsage({ usage: { ...response().usage, cost } }, "fixture", pricing, baseURL), { input: 1000, output: 100 })
+    }
+  }
+  assert.equal(usageText({ cost: 0 }), "cost: $0.0000")
+  assert.equal(usageText({ cost: 0.0123 }), "cost: $0.0123")
+})
+
+test("other endpoints ignore reported cost and retain catalog estimation, including lookalike OpenRouter URLs", () => {
+  for (const baseURL of [undefined, "https://proxy.test/api/v1", "http://openrouter.ai/api/v1", "https://openrouter.ai/api/v2",
+    "https://openrouter.ai.evil.test/api/v1", "https://openrouter.ai:444/api/v1", `${openRouter}?x=1`, `${openRouter}#fragment`]) {
+    const envelope = { usage: { ...response().usage, cost: 99 } }
+    assert.deepEqual(responseUsage(envelope, "fixture", () => prices, baseURL), { input: 1000, output: 100, cost: 0.0045 })
+    assert.deepEqual(responseUsage(envelope, "fixture", undefined, baseURL), { input: 1000, output: 100 })
+    assert.equal(responseUsage({ usage: { cost: 99 } }, "fixture", () => prices, baseURL), undefined)
+  }
+  assert.deepEqual(responseUsage(response(), "fixture", () => { throw new Error("catalog unavailable") }), { input: 1000, output: 100 })
+})
+
+test("attempts replace cumulative components independently, finalize once and isolate observer mutations", () => {
+  const observed: Usage[] = []
+  const attempt = usageAttempt(openRouter, "fixture", undefined, (usage) => {
+    observed.push({ ...usage })
+    usage.cost = 999
+    throw new Error("storage failure")
+  })
+  attempt.observe({ usage: { prompt_tokens: 10, completion_tokens: 2 } })
+  attempt.observe({ usage: { cost: 0.02 } })
+  attempt.observe({ usage: { cost: 0.02 } })
+  attempt.observe({ usage: { prompt_tokens: 30, completion_tokens: 5 } })
+  attempt.observe({ usage: { cost: 0.01 } }) // Latest valid values can revise cost downward.
+  attempt.observe({ usage: { prompt_tokens: 20, completion_tokens: 4, cost: -1 } })
+  attempt.observe({ usage: { prompt_tokens: "invalid", completion_tokens: 99, cost: null } })
+  attempt.observe({ choices: [] })
+  assert.deepEqual(observed, [])
+  assert.deepEqual(attempt.current(), { input: 20, output: 4, cost: 0.01 })
+  attempt.current()!.input = 999
+  assert.deepEqual(attempt.finalize(), { input: 20, output: 4, cost: 0.01 })
+  attempt.observe({ usage: { cost: 100 } })
+  assert.deepEqual(attempt.finalize(), { input: 20, output: 4, cost: 0.01 })
+  assert.deepEqual(observed, [{ input: 20, output: 4, cost: 0.01 }])
+})
+
+test("attempt finalization retains received cost on cancellation/failure, but never invents usage", () => {
+  for (const failure of [new Error("stream disconnected"), AbortSignal.abort().reason]) {
+    const observed: Usage[] = []
+    const attempt = usageAttempt(openRouter, "fixture", undefined, (usage) => observed.push(usage))
+    assert.throws(() => {
+      try {
+        attempt.observe({ usage: { cost: 0 } })
+        throw failure
+      } finally { attempt.finalize() }
+    }, (error) => error === failure)
+    assert.deepEqual([...observed], [{ cost: 0 }])
+    const empty = usageAttempt(openRouter, "fixture", undefined, (usage) => observed.push(usage))
+    empty.observe({ usage: { cost: "bad", prompt_tokens: 10 } })
+    assert.equal(empty.finalize(), undefined)
+    assert.equal(observed.length, 1)
+  }
+})
+
+test("report completeness and overflow are independent for tokens and cost across correction attempts", () => {
+  assert.deepEqual(sumUsage({ cost: 0.01 }, { cost: 0.02, input: 10, output: 2 }), { cost: 0.03 })
+  assert.deepEqual(sumUsage({ input: 10, output: 2 }, { input: 20, output: 3, cost: 0.01 }), { input: 30, output: 5 })
+  assert.equal(sumUsage({ cost: 0.01 }, { input: 10, output: 2 }), undefined)
+  assert.equal(sumUsage({ cost: 0.01 }, undefined), undefined)
+  assert.equal(sumUsage(undefined, { cost: 0.01 }), undefined)
+  assert.deepEqual(sumUsage({ input: Number.MAX_SAFE_INTEGER, output: 0, cost: 0 }, { input: 1, output: 0, cost: 0.01 }), { cost: 0.01 })
+  assert.deepEqual(sumUsage({ input: 1, output: 2, cost: Number.MAX_VALUE }, { input: 2, output: 3, cost: Number.MAX_VALUE }), { input: 3, output: 5 })
+})
+
+test("generic attempts invalidate stale derived cost for newer unpriceable token snapshots, even unchanged counts", () => {
+  for (const output of [1, 100]) for (const reason of ["cache", "missing pricing", "catalog failure"]) {
+    const observed: Usage[] = []
+    let unavailable = false
+    const attempt = usageAttempt("https://generic.test/v1", "fixture", () => {
+      if (unavailable && reason === "missing pricing") return undefined
+      if (unavailable && reason === "catalog failure") throw new Error("catalog unavailable")
+      return { input: 1, output: 2, cache: { read: 0, write: 0 } }
+    }, (usage) => observed.push(usage))
+    attempt.observe(response(100, 1))
+    const priced = { input: 100, output: 1, cost: 0.000102 }
+    assert.deepEqual(attempt.current(), priced)
+    attempt.observe({ usage: { prompt_tokens: 100, completion_tokens: "invalid" } })
+    assert.deepEqual(attempt.current(), priced, "invalid token pairs do not replace a valid snapshot")
+    unavailable = true
+    attempt.observe({ usage: { prompt_tokens: 100, completion_tokens: output,
+      ...(reason === "cache" ? { prompt_tokens_details: { cached_tokens: 101 } } : {}) } })
+    const expected = { input: 100, output }
+    assert.deepEqual(attempt.current(), expected, reason)
+    attempt.observe({ choices: [] })
+    attempt.observe({ usage: { cost: 99 } })
+    assert.deepEqual(attempt.finalize(), expected)
+    assert.deepEqual(attempt.finalize(), expected)
+    assert.deepEqual(observed, [expected])
+  }
+})
+
+test("generic derived cost can recover from a later priceable snapshot, including a zero estimate", () => {
+  const attempt = usageAttempt("https://generic.test/v1", "fixture", () => ({ input: 1, output: 2, cache: { read: 0, write: 0 } }))
+  attempt.observe(response(100, 1))
+  attempt.observe({ usage: { prompt_tokens: 100, completion_tokens: 100, prompt_tokens_details: { cached_tokens: 101 } } })
+  assert.deepEqual(attempt.current(), { input: 100, output: 100 })
+  attempt.observe({ usage: { prompt_tokens: 100, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 100 } } })
+  assert.deepEqual(attempt.finalize(), { input: 100, output: 0, cost: 0 })
+})
+
+test("OpenRouter reported cost survives newer token snapshots with invalid cache metadata and absent cost", () => {
+  for (const cost of [0, 0.000102]) {
+    const observed: Usage[] = []
+    const attempt = usageAttempt(`${openRouter}/`, "fixture", () => { assert.fail("reported cost must not use catalog pricing") },
+      (usage) => observed.push(usage))
+    attempt.observe({ usage: { prompt_tokens: 100, completion_tokens: 1, cost } })
+    attempt.observe({ usage: { prompt_tokens: 100, completion_tokens: 100, prompt_tokens_details: { cached_tokens: 101 } } })
+    const expected = { input: 100, output: 100, cost }
+    assert.deepEqual(attempt.current(), expected)
+    assert.deepEqual(attempt.finalize(), expected)
+    assert.deepEqual(observed, [expected])
+  }
 })

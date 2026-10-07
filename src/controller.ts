@@ -1,23 +1,30 @@
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
-import type { ReviewResult } from "./types.js"
+import type { ReviewProgress, ReviewResult } from "./types.js"
 import type { Config } from "./config.js"
 import type { ApprovalTransport } from "./approval.js"
 import { isDeepStrictEqual } from "node:util"
 import { withDeadline } from "./reviewer.js"
 import { candidateEnabled, type ReviewOptions } from "./classification.js"
+import type { SessionModeGate } from "./session-mode.js"
+import { SCANNER_INTERVAL_MS } from "./appearance.js"
 
 export type AutoApproval = { status: "countdown"; seconds: number } | { status: "checking" | "allowing" | "cancelled" | "failed" }
 
 export interface View {
   request: PermissionRequest
-  status: "identifying" | "unidentified" | "analyzing" | "complete" | "unavailable" | "unrelated"
+  status: "identifying" | "unidentified" | "analyzing" | "complete" | "unavailable" | "unrelated" | "suspended"
   assessment?: ReviewResult
+  progress?: ReviewProgress
   error?: string
   autoApproval?: AutoApproval
 }
 
-type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void) => Promise<ReviewResult | null>
-interface Entry { view: View; abort: AbortController; cancelTimer?: () => void; deadline?: number; approvalAbort?: AbortController }
+type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void, onProgress: (progress: ReviewProgress) => void) => Promise<ReviewResult | null>
+interface Entry {
+  view: View; abort: AbortController; root?: string; gateRevision: number
+  cancelTimer?: () => void; deadline?: number; approvalAbort?: AbortController
+  attempt: number; progressGeneration: number; pendingProgress?: ReviewProgress; cancelProgress?: () => void
+}
 
 export interface ApprovalClock {
   now(): number
@@ -27,7 +34,7 @@ const clock: ApprovalClock = {
   now: () => performance.now(),
   after: (ms, callback) => { const timer = setTimeout(callback, ms); return () => clearTimeout(timer) },
 }
-type Options = ReviewOptions & Partial<Pick<Config, "autoApprove" | "autoApproveDelaySeconds">>
+type Options = ReviewOptions & Partial<Pick<Config, "autoApprove" | "autoApproveDelaySeconds" | "stream">>
 export interface Approval extends ApprovalTransport {
   /** Recompute actual presentation/order, rather than trusting a stale UI effect. */
   visibleID(): string | undefined
@@ -39,12 +46,34 @@ export class Controller {
   private stopped = false
   private version = 0
   private visibleID: string | undefined
+  private modeChanges = new Map<string, number>()
+  private manual = new Map<string, "cancelled" | "failed">()
+  private workers = new Set<Promise<unknown>>()
   constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
     private options: Options = { reviewBash: true, reviewEdits: true },
-    private approval?: Approval, private time: ApprovalClock = clock) {}
+    private approval?: Approval, private time: ApprovalClock = clock, private modes?: SessionModeGate) {}
   get revision() { return this.version }
   get views() { return [...this.entries.values()].map((entry) => entry.view) }
   private publish() { if (!this.stopped) this.changed(this.views) }
+
+  /** Local state is already switched; invalidate snapshots before any publication. */
+  modeChanged(root: string) {
+    if (this.stopped) return
+    this.modeChanges.set(root, ++this.version)
+    for (const entry of this.entries.values()) if (entry.root === root) this.suspend(entry)
+    this.publish()
+  }
+
+  private suspend(entry: Entry) {
+    const id = entry.view.request.id
+    const state = entry.view.autoApproval?.status
+    if (state) this.manual.set(id, state === "failed" || state === "allowing" ? "failed" : "cancelled")
+    entry.cancelTimer?.()
+    this.clearProgress(entry)
+    entry.approvalAbort?.abort()
+    entry.abort.abort()
+    entry.view = { request: entry.view.request, status: "suspended" }
+  }
 
   /** Called only after the assessment has actually been rendered, or to hide it. */
   presented(id?: string) {
@@ -69,6 +98,7 @@ export class Controller {
     entry.cancelTimer?.()
     entry.cancelTimer = undefined
     entry.approvalAbort?.abort()
+    this.manual.set(id, "cancelled")
     entry.view = { ...entry.view, autoApproval: { status: "cancelled" } }
     this.publish()
   }
@@ -77,8 +107,62 @@ export class Controller {
     return !this.stopped && !entry.abort.signal.aborted && this.entries.get(entry.view.request.id) === entry
   }
 
+  private reviewing(entry: Entry) {
+    return this.active(entry) && entry.view.status === "analyzing"
+      && (!this.modes || (entry.root !== undefined && this.modes.enabled(entry.root)
+        && (this.modeChanges.get(entry.root) ?? 0) <= entry.gateRevision))
+  }
+
+  private clearProgress(entry: Entry) {
+    entry.progressGeneration++
+    entry.cancelProgress?.()
+    entry.cancelProgress = undefined
+    entry.pendingProgress = undefined
+  }
+
+  private progress(entry: Entry, value: ReviewProgress) {
+    if (!this.reviewing(entry) || !Number.isSafeInteger(value.attempt) || value.attempt < 0 || value.attempt < entry.attempt) return
+    if (value.attempt > entry.attempt) {
+      // Only an explicit attempt start can advance the generation. Delayed chunks
+      // from an old attempt cannot restart it or clear a newer report.
+      if (value.attempt !== entry.attempt + 1 || value.phase !== (value.attempt ? "retrying" : "evaluating")) return
+      this.clearProgress(entry)
+      entry.attempt = value.attempt
+      entry.view = { ...entry.view, progress: { attempt: value.attempt, phase: value.phase } }
+      this.publish()
+      return
+    }
+    if (value.phase !== "streaming" || this.options.stream !== true) return
+    if (!value.preview) {
+      this.clearProgress(entry)
+      entry.view = { ...entry.view, progress: { attempt: value.attempt, phase: value.phase } }
+      this.publish()
+      return
+    }
+    const preview = { ...(typeof value.preview.safe === "boolean" ? { safe: value.preview.safe } : {}),
+      ...(typeof value.preview.desc === "string" ? { desc: value.preview.desc } : {}) }
+    entry.pendingProgress = { attempt: value.attempt, phase: "streaming", preview }
+    if (preview.safe !== entry.view.progress?.preview?.safe) {
+      const desc = entry.view.progress?.preview?.desc
+      entry.view = { ...entry.view, progress: { attempt: value.attempt, phase: "streaming",
+        preview: { ...(preview.safe === undefined ? {} : { safe: preview.safe }), ...(desc === undefined ? {} : { desc }) } } }
+      this.publish() // Rating is immediate; text remains on the coalesced cadence.
+    }
+    if (!this.reviewing(entry) || entry.cancelProgress || !entry.pendingProgress) return
+    const generation = entry.progressGeneration
+    const attempt = entry.attempt
+    entry.cancelProgress = this.time.after(SCANNER_INTERVAL_MS, () => {
+      if (!this.reviewing(entry) || entry.progressGeneration !== generation || entry.attempt !== attempt) return
+      entry.cancelProgress = undefined
+      const progress = entry.pendingProgress
+      entry.pendingProgress = undefined
+      if (progress) { entry.view = { ...entry.view, progress }; this.publish() }
+    })
+  }
+
   private eligible(entry: Entry) {
     return this.active(entry) && this.options.autoApprove === true && entry.view.status === "complete"
+      && (!this.modes || (entry.root !== undefined && this.modes.enabled(entry.root)))
       && entry.view.assessment?.safe === true && this.visibleID === entry.view.request.id
       && this.approval?.visibleID() === entry.view.request.id
   }
@@ -124,10 +208,12 @@ export class Controller {
         // Publishing can synchronously trigger native resolution or visibility loss.
         signal.throwIfAborted()
         if (!this.eligible(entry)) {
+          this.manual.set(id, "cancelled")
           entry.view = { ...entry.view, autoApproval: { status: "cancelled" } }
           this.publish()
           return
         }
+        this.manual.set(id, "failed") // A dispatched write must never be tried again after a mode switch.
         await this.approval!.once(entry.view.request, signal)
         signal.throwIfAborted()
         this.replied(id)
@@ -135,6 +221,7 @@ export class Controller {
     } catch {
       // A native reply may abort our in-flight HTTP response after accepting it.
       if (!this.active(entry) || entry.view.autoApproval?.status === "cancelled") return
+      this.manual.set(id, "failed")
       entry.view = { ...entry.view, autoApproval: { status: "failed" } }
       this.publish()
       // Reconcile an uncertain outcome, without ever retrying the write.
@@ -152,31 +239,57 @@ export class Controller {
     const enabled = candidateEnabled(request, this.options)
     const entry: Entry = {
       abort: new AbortController(),
+      attempt: -1, progressGeneration: 0,
+      gateRevision: this.version,
       view: {
         request,
         status: enabled ? "identifying" : "unrelated",
+        ...(this.manual.has(request.id) ? { autoApproval: { status: this.manual.get(request.id)! } } : {}),
       },
     }
     this.entries.set(request.id, entry)
     this.publish()
     if (entry.view.status === "unrelated") return
     const active = () => !this.stopped && !entry.abort.signal.aborted && this.entries.get(request.id) === entry
-    void Promise.resolve().then(() => {
+    const worker = Promise.resolve().then(async () => {
       entry.abort.signal.throwIfAborted()
+      if (this.modes) {
+        try {
+          const root = await this.modes.root(request.sessionID, entry.abort.signal)
+          if (!active()) return null
+          entry.root = root
+          await this.modes.load(root, entry.abort.signal)
+          if (!active()) return null
+          if (!this.modes.enabled(root) || (this.modeChanges.get(root) ?? 0) > entry.gateRevision) {
+            this.suspend(entry); this.publish(); return null
+          }
+        } catch {
+          if (active()) { this.suspend(entry); this.publish() }
+          return null
+        }
+      }
       return this.evaluate(request, entry.abort.signal, () => {
         // A timed-out evaluator may still call back after its review has settled.
         if (active() && (entry.view.status === "identifying" || entry.view.status === "analyzing")) {
           entry.view = { ...entry.view, status: "analyzing" }; this.publish()
         }
-      })
+      }, (progress) => this.progress(entry, progress))
     }).then((assessment) => {
-      if (active()) { entry.view = assessment ? { ...entry.view, status: "complete", assessment } : { ...entry.view, status: "unrelated" }; this.publish() }
-    }, (error: unknown) => {
+      this.clearProgress(entry)
       if (active()) {
-        entry.view = { ...entry.view, status: entry.view.status === "identifying" ? "unidentified" : "unavailable", error: error instanceof Error ? error.message : "Review failed" }
+        entry.view = assessment ? { ...entry.view, status: "complete", assessment, progress: undefined }
+          : { ...entry.view, status: "unrelated", progress: undefined }
+        this.publish()
+      }
+    }, (error: unknown) => {
+      this.clearProgress(entry)
+      if (active()) {
+        entry.view = { ...entry.view, status: entry.view.status === "identifying" ? "unidentified" : "unavailable", progress: undefined, error: error instanceof Error ? error.message : "Review failed" }
         this.publish()
       }
     })
+    this.workers.add(worker)
+    void worker.finally(() => this.workers.delete(worker))
   }
 
   replied(id: string) {
@@ -184,7 +297,10 @@ export class Controller {
     // Increment even for an unknown ID: an in-flight snapshot may still contain it.
     this.version++
     this.entries.get(id)?.cancelTimer?.()
+    const entry = this.entries.get(id)
+    if (entry) this.clearProgress(entry)
     this.entries.get(id)?.abort.abort()
+    this.manual.delete(id)
     if (this.entries.delete(id)) this.publish()
   }
 
@@ -200,13 +316,22 @@ export class Controller {
     if (this.stopped || this.version !== revision) return
     const ids = new Set(requests.map((request) => request.id))
     for (const id of this.entries.keys()) if (!ids.has(id)) this.replied(id)
-    for (const request of requests) this.asked(request)
+    for (const request of requests) {
+      const entry = this.entries.get(request.id)
+      if (entry && !entry.root) entry.gateRevision = this.version
+      if (entry?.view.status === "suspended" && (!entry.root || this.modes?.enabled(entry.root))) {
+        this.entries.delete(request.id)
+      }
+      this.asked(request)
+    }
   }
 
-  dispose() {
+  async dispose() {
     this.stopped = true
-    for (const entry of this.entries.values()) { entry.cancelTimer?.(); entry.abort.abort() }
+    for (const entry of this.entries.values()) { entry.cancelTimer?.(); this.clearProgress(entry); entry.abort.abort() }
     this.entries.clear()
+    await Promise.allSettled([...this.workers])
+    this.manual.clear()
   }
 }
 
@@ -227,7 +352,7 @@ export function visibleReview(
     if (!first || request.sessionID < first.request.sessionID ||
       (request.sessionID === first.request.sessionID && request.id < first.request.id)) first = view
   }
-  return first && first.status !== "unrelated" && first.status !== "identifying" && first.status !== "unidentified" ? first : undefined
+  return first && first.status !== "unrelated" && first.status !== "identifying" && first.status !== "unidentified" && first.status !== "suspended" ? first : undefined
 }
 
 export function displayText(text: string): string {

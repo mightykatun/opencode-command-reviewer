@@ -1,3 +1,31 @@
+# Unreleased
+
+- Target OpenCode **1.18.35**, local Linux TUI. Optional `stream: true` enables SSE
+  transport with early provisional ratings and progressive Markdown; the default
+  remains `false`. Pending reviews show **Evaluating** or **Retrying**. Only a
+  completed, validated and rendered Safe report can start auto-approval.
+- Add local `/reviewer-enable` and `/reviewer-disable` commands and matching palette
+  actions for the root conversation and descendants. Mode persists for resume;
+  disabling aborts review work and countdowns while native permissions stay pending.
+  Re-enabling reviews pending requests afresh without reviving canceled countdowns
+  in the running plugin. Native approval controls retain their meanings.
+- Use OpenRouter-reported `usage.cost` at its exact endpoint; generic endpoints
+  retain catalog estimates. Record received usage once per attempt, including
+  interrupted/unsuccessful reviews, with independent token and cost coverage.
+  Unreported charges remain unknown. New snapshots use `usage-v2`; legacy `usage-v1`
+  history is read without rewriting its original estimates. Mode uses `session-mode-v1`.
+- Add bounded SSE/assessment parsers, content-free opt-in diagnostic observers and
+  focused streaming, session-mode and HTTP-reuse fixtures. Final checks passed:
+  typecheck, 483 unit tests, five measurement tests, four cleanup tests, 21 focused
+  real-TUI combinations and reproducible five-file packaging. Exact runs are
+  recorded in `IMPLEMENTATION_PLAN.md`. These local fixtures do not establish
+  live-provider performance, NFS/SSHFS behavior or a full legacy runtime-matrix rerun.
+
+Update the bundle and restart OpenCode. Existing configurations keep non-streaming
+behavior; add `"stream": true` to opt in. Preserve both usage-history directories.
+Conversation-mode save failures explicitly report local-only application and
+possible use of the previous setting on resume.
+
 # v0.3.0 release notes
 
 Prepared for the local v0.3.0 checkpoint and release tag. Publication remains a
@@ -83,9 +111,8 @@ verified by injected filesystem-stall tests.
 - Reproducible packaging passed with exactly five files. Bundle SHA-256:
   `c884fb8b956add95ed1066a608cbcb5211ca144e75c51b2a321d457aedebe866`.
 
-The exact matrix is recorded in `IMPLEMENTATION_PLAN.md`. Fixtures use isolated
-temporary files, local MCP/model servers, and private tmux supervision. They verify
-integration mechanics, not live-model judgment.
+Fixtures used isolated temporary files, local MCP/model servers, and private tmux
+supervision. They verified integration mechanics, not live-model judgment.
 
 ## Update after publication
 

@@ -1,6 +1,7 @@
 import type { Model, Provider } from "@opencode-ai/sdk/v2"
 
-export interface Usage { input: number; output: number; cost?: number }
+/** Token counts are a pair; cost is independently available. */
+export interface Usage { input?: number; output?: number; cost?: number }
 export type Pricing = Model["cost"]
 export type PricingLookup = (model: string) => Pricing | undefined
 
@@ -21,10 +22,22 @@ export function modelPricing(providers: readonly Pick<Provider, "options" | "mod
   return matches[0]!.cost
 }
 
-export function responseUsage(envelope: unknown, requestedModel: string, pricing?: PricingLookup): Usage | undefined {
+export function responseUsage(envelope: unknown, requestedModel: string, pricing?: PricingLookup, baseURL?: string): Usage | undefined {
   const body = record(envelope), usage = record(body.usage)
+  const tokens = count(usage.prompt_tokens) && count(usage.completion_tokens)
+    ? { input: usage.prompt_tokens, output: usage.completion_tokens } : undefined
+  if (endpoint(baseURL) === "https://openrouter.ai/api/v1") {
+    // Reported cost already includes provider billing. Never add upstream cost or an estimate.
+    return rate(usage.cost) ? { ...tokens, cost: usage.cost } : tokens
+  }
+  try { return estimatedUsage(body, requestedModel, pricing) }
+  catch { return tokens } // Catalog failure must not affect the assessment or valid counts.
+}
+
+function estimatedUsage(body: Record<string, unknown>, requestedModel: string, pricing?: PricingLookup): Usage | undefined {
+  const usage = record(body.usage)
   if (!count(usage.prompt_tokens) || !count(usage.completion_tokens)) return
-  const result: Usage = { input: usage.prompt_tokens, output: usage.completion_tokens }
+  const result = { input: usage.prompt_tokens, output: usage.completion_tokens }
   const prices = pricing?.(typeof body.model === "string" ? body.model : requestedModel)
   if (!prices) return result
   const details = record(usage.prompt_tokens_details)
@@ -41,15 +54,51 @@ export function responseUsage(envelope: unknown, requestedModel: string, pricing
   return Number.isFinite(cost) ? { ...result, cost } : result
 }
 
-/** An incomplete correction chain must not look like complete report usage. */
+/** One accumulator per POST. Feed decoded envelopes, including future SSE usage events.
+ * Reported cost is independent of token counts. Derived cost belongs to the latest valid
+ * token snapshot and must disappear if that snapshot cannot be priced.
+ * Always finalize in the transport attempt's finally, even after failure or cancellation.
+ */
+export function usageAttempt(baseURL: string, requestedModel: string, pricing?: PricingLookup, onUsage?: (usage: Usage) => void) {
+  const reportedCost = endpoint(baseURL) === "https://openrouter.ai/api/v1"
+  let usage: Usage | undefined
+  let finalized = false
+  const current = () => usage ? { ...usage } : undefined
+  return {
+    observe(envelope: unknown): void {
+      if (finalized) return
+      const next = responseUsage(envelope, requestedModel, pricing, baseURL)
+      if (next) usage = reportedCost ? { ...usage, ...next } : next
+    },
+    current,
+    finalize(): Usage | undefined {
+      if (!finalized) {
+        finalized = true
+        if (usage) {
+          try { onUsage?.({ ...usage }) } catch { /* The observer owns persistence diagnostics. */ }
+        }
+      }
+      return current()
+    },
+  }
+}
+
+/** Report components must cover the entire correction chain, independently of lifetime recording. */
 export function sumUsage(previous: Usage | undefined, next: Usage | undefined): Usage | undefined {
   if (!previous || !next) return
-  const input = previous.input + next.input, output = previous.output + next.output
-  if (!count(input) || !count(output)) return
+  const result: Usage = {}
+  if (count(previous.input) && count(previous.output) && count(next.input) && count(next.output)) {
+    const input = previous.input + next.input, output = previous.output + next.output
+    if (count(input) && count(output)) { result.input = input; result.output = output }
+  }
   const cost = previous.cost !== undefined && next.cost !== undefined ? previous.cost + next.cost : undefined
-  return { input, output, ...(cost !== undefined && Number.isFinite(cost) ? { cost } : {}) }
+  if (rate(cost)) result.cost = cost
+  return Object.keys(result).length ? result : undefined
 }
 
 export function usageText(usage: Usage): string {
-  return `tokens in/out: ${usage.input}/${usage.output}${usage.cost === undefined ? "" : `\ncost: $${usage.cost.toFixed(4)}`}`
+  return [
+    ...(count(usage.input) && count(usage.output) ? [`tokens in/out: ${usage.input}/${usage.output}`] : []),
+    ...(usage.cost === undefined ? [] : [`cost: $${usage.cost.toFixed(4)}`]),
+  ].join("\n")
 }

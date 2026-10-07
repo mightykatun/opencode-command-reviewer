@@ -142,6 +142,16 @@ export interface Assessment {
   desc: string
 }
 
+/** Provisional transport observations only. Never an assessment or approval eligibility.
+ * Attempts are zero-based; evaluating/retrying (and absent preview) clear prior content.
+ * The display layer must sanitize prefixes before rendering.
+ */
+export interface ReviewProgress {
+  attempt: number
+  phase: "evaluating" | "retrying" | "streaming"
+  preview?: Partial<Assessment>
+}
+
 /** Endpoint metadata stays outside the model's strict assessment JSON. */
 export interface ReviewResult extends Assessment {
   usage?: import("./usage.js").Usage

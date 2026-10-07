@@ -6,13 +6,17 @@ import { execFileSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
-import { smokeRuntime } from "./smoke-runtime.mjs"
+import { smokeMetrics, smokeRuntime } from "./smoke-runtime.mjs"
+import { reviewerAudit, sendReviewStream } from "./smoke-reviewer.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
+const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
+const hostVersion = execFileSync(hostBinary, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
 const scenario = process.argv[2] ?? "mcp"
 assert.ok(["mcp", "mcp-resource", "custom", "custom-bash", "external-read", "external-search", "external-edit", "external-patch"].includes(scenario))
 const flag = (name) => process.argv.includes(`--${name}`)
 const auto = flag("auto"), disabled = flag("disabled"), correction = flag("correction")
+const stream = flag("stream")
 const mcp = scenario.startsWith("mcp"), custom = scenario.startsWith("custom"), directory = scenario.startsWith("external-")
 const patch = scenario === "external-patch"
 const fixtureModel = patch ? "gpt-fixture" : "fixture"
@@ -54,6 +58,8 @@ await writeFile(path.join(ledger, "00000000-0000-0000-0000-000000000001.json"), 
   requests: 1, input: 100, output: 20, priced: 1, cost: 0.01, since: 1 }))
 
 const requests = [], rpc = [], perRequest = new Map()
+const fixtureErrors = [], terminalAttempts = []
+const audit = reviewerAudit({ stream })
 let sent = false, completed = false, executions = 0, release
 const prompt = `Perform the isolated ${scenario} fixture operation once.`
 const server = createServer(async (req, res) => {
@@ -80,16 +86,36 @@ const server = createServer(async (req, res) => {
     }
     requests.push({ url: req.url, body })
     if (req.url === "/review/chat/completions") {
+      const observation = audit.request(req.method, text)
       const evidence = JSON.parse(body.messages[1].content)
       const attempt = (perRequest.get(evidence.permission.id) ?? 0) + 1
       perRequest.set(evidence.permission.id, attempt)
       if (flag("held") && requests.filter((entry) => entry.url.startsWith("/review")).length === 1) await new Promise((resolve) => { release = resolve })
       if (flag("error")) { res.writeHead(503); res.end("PRIVATE fixture error"); return }
-      const content = correction && attempt === 1 ? "bad JSON" : JSON.stringify({ safe: !flag("unsafe"), desc: "Bounded isolated fixture operation. Only the current allowance is assessed." })
-      res.writeHead(200, { "Content-Type": "application/json" })
-      res.end(JSON.stringify({ model: "review", choices: [{ message: { role: "assistant", content }, finish_reason: "stop" }],
-        ...(!flag("no-usage") && !(flag("missing-usage") && attempt === 1) ? { usage: { prompt_tokens: 100, completion_tokens: 20 } } : {}),
-      })); return
+      const content = correction && attempt === 1 ? "bad JSON" : JSON.stringify({ safe: !flag("unsafe"),
+        desc: stream ? "Bounded **isolated** fixture operation.\n\nOnly the current allowance is assessed. Café fixture." : "Bounded isolated fixture operation. Only the current allowance is assessed." })
+      const usage = !flag("no-usage") && !(flag("missing-usage") && attempt === 1)
+        ? { prompt_tokens: 100, completion_tokens: 20,
+          ...(stream ? { prompt_tokens_details: { cached_tokens: 20, cache_write_tokens: 5 } } : {}) } : undefined
+      if (stream) {
+        await sendReviewStream(res, { content, usage, observation,
+          phase: (event) => metrics.mark(event, reviews().length),
+          beforeTerminal: async () => {
+            if (mcp) assert.equal(executions, 0, "MCP cannot execute before terminal review completion")
+            if (custom) await assert.rejects(readFile(path.join(project, "executions")))
+            if (directory) assert.equal(await readFile(target, "utf8"), "before fixture\n", "directory/edit/patch cannot modify the target from a preview")
+            assert.doesNotMatch(capture().split("\n").map((line) => line.slice(118)).join("\n"), /Allowed in|Checking…|Allowing…/,
+              "full JSON, stop and usage frames must not start auto-approval before DONE/EOF")
+          },
+        })
+      } else {
+        observation.usage(usage)
+        res.writeHead(200, { "Content-Type": "application/json" })
+        res.end(JSON.stringify({ model: "review", choices: [{ message: { role: "assistant", content }, finish_reason: "stop" }], ...(usage ? { usage } : {}) }))
+      }
+      observation.response(content, correction && attempt === 1)
+      terminalAttempts.push(reviews().length)
+      return
     }
     if (body.messages.some((message) => message.role === "tool" && message.tool_call_id === "call_fixture")) completed = true
     const use = !sent && body.tools?.some((entry) => entry.function?.name === tool)
@@ -104,8 +130,14 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" })
       res.end(JSON.stringify({ id: "fixture", object: "chat.completion", created: 1, model: "fixture", choices: [{ index: 0, message: delta, finish_reason: use ? "tool_calls" : "stop" }] }))
     }
-  } catch (error) { res.writeHead(500); res.end(String(error)) }
+  } catch (error) {
+    fixtureErrors.push(String(error))
+    if (res.headersSent) res.destroy()
+    else { res.writeHead(500); res.end(String(error)) }
+  }
 })
+const metrics = smokeMetrics(server, { pollIntervalMs: 80, hostVersion })
+let outcome = "failed"
 const runtime = await smokeRuntime(temp)
 const tmux = runtime.tmux
 let screen = "", started = false
@@ -136,13 +168,16 @@ try {
   const tui = path.join(temp, "tui.json")
   await writeFile(tui, JSON.stringify({ theme: "opencode", plugin: [[plugin, { baseURL: `http://127.0.0.1:${port}/review`, model: "review",
     reviewBash: flag("native-bash-enabled"), reviewEdits: true, reviewMcp: mcp && !disabled, reviewCustomTools: custom && !disabled,
-    reviewExternalDirectories: directory && !disabled, autoApprove: auto, autoApproveDelaySeconds: 2 }]] }))
+    reviewExternalDirectories: directory && !disabled, autoApprove: auto, autoApproveDelaySeconds: 2, stream }]] }))
   const env = { HOME: temp, XDG_CONFIG_HOME: path.join(temp, "config"), XDG_DATA_HOME: path.join(temp, "data"), XDG_STATE_HOME: path.join(temp, "state"), XDG_CACHE_HOME: path.join(temp, "cache"),
     OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_CONFIG: "", OPENCODE_CONFIG_DIR: path.join(temp, "config"), OPENCODE_TUI_CONFIG: tui,
     OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_EXTERNAL_SKILLS: "1", OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1" }
-  await runtime.start("-d", "-s", "smoke", "-x", "160", "-y", "40", "-c", project, "env", ...Object.entries(env).map(([key, value]) => `${key}=${value}`), process.env.OPENCODE_BIN ?? "opencode", project, "--prompt", prompt)
+  metrics.mark("tmux-start-dispatched")
+  await runtime.start("-d", "-s", "smoke", "-x", "160", "-y", "40", "-c", project, "env", ...Object.entries(env).map(([key, value]) => `${key}=${value}`), hostBinary, project, "--prompt", prompt)
+  metrics.mark("tmux-start-acknowledged")
   started = true
   await until((s) => s.includes("Permission required") && (disabled || reviews().length > 0))
+  metrics.mark("native-permission-visible", reviews().length)
   assert.equal(executions, 0)
   if (custom) {
     assert.match(await readFile(path.join(project, "before-permission"), "utf8"), /entered/)
@@ -153,6 +188,7 @@ try {
     await until((s) => !!release && s.includes("Permission analysis") && /[■⬝]{8}|\[⋯\]/.test(s))
     if (flag("stats")) assert.doesNotMatch(screen, /tokens in\/out:|lifetime:/, "loading must not show historical lifetime by itself")
     await save("loading")
+    metrics.mark("held-review-released", reviews().length)
     release()
   }
   const expected = flag("error") ? "Analysis unavailable" : flag("unsafe") ? "✗ Unsafe" : "✓ Safe"
@@ -161,7 +197,8 @@ try {
     assert.equal(reviews().length, 0)
     assert.doesNotMatch(capture(), /Permission analysis/)
   } else {
-    await until((s) => s.includes(expected))
+    await until((s) => s.includes(expected) && (!stream || flag("error") || terminalAttempts.length === reviews().length))
+    metrics.mark("review-visible", reviews().length)
     const evidence = JSON.parse(reviews()[0].body.messages[1].content)
     assert.equal(evidence.kind, mcp ? "mcp" : custom ? "custom" : "external-directory")
     assert.equal(evidence.tool, tool)
@@ -216,6 +253,8 @@ try {
   await save("pending")
   if (auto && !disabled && !flag("unsafe") && !flag("error")) {
     await until((s) => s.includes("Allowed in 2s"))
+    assert.equal(terminalAttempts.length, reviews().length, "all format attempts must finish before countdown")
+    metrics.mark("countdown-visible", reviews().length)
     lastCountdown = Date.now()
     if (flag("cancel")) {
       const lines = screen.split("\n"), row = lines.findIndex((line) => line.includes("Allowed in")), x = lines[row].indexOf("Cancel") + 2
@@ -227,6 +266,7 @@ try {
       tmux("send-keys", "-t", "smoke", "Enter")
     } else if (scenario === "external-edit") {
       await until((s) => reviews().some((entry) => JSON.parse(entry.body.messages[1].content).kind === "edit") && s.includes("Allowed in 2s") && s.includes("✓ Safe"), 10000)
+      assert.equal(terminalAttempts.length, reviews().length, "native edit needs its own terminal assessment")
       assert.ok(Date.now() - lastCountdown >= 1750, "directory stage needs its own visible countdown")
       assert.equal(await readFile(target, "utf8"), "before fixture\n")
       lastCountdown = Date.now()
@@ -247,6 +287,7 @@ try {
   await until(() => completed, 15000)
   if (lastCountdown && !flag("cancel")) assert.ok(Date.now() - lastCountdown >= 1750, "each request needs a full visible countdown")
   await until((s) => !s.includes("Permission required") && !s.includes("Permission analysis"), 5000)
+  metrics.mark("permission-and-panel-resolved", reviews().length)
   if (mcp) assert.equal(executions, 1)
   if (scenario === "mcp-resource") assert.equal(rpc.find(entry => entry.method === "resources/read").params.uri, resourceURI)
   if (custom) assert.equal(await readFile(path.join(project, "executions"), "utf8"), "executed\n")
@@ -275,14 +316,32 @@ try {
     tmux("send-keys", "-t", "smoke", "-l", "Reviewer: Lifetime usage")
     await until((s) => (s.match(/Reviewer: Lifetime usage/g) ?? []).length >= 2, 5000)
     tmux("send-keys", "-t", "smoke", "Enter")
-    await until((s) => s.includes("Reviewer lifetime usage") && s.includes(flag("storage-error") ? "Lifetime usage unavailable" : `${1 + recorded} completed requests with usage`), 5000)
+    await until((s) => s.includes("Reviewer lifetime usage") && s.includes(flag("storage-error") ? "Lifetime usage unavailable" : `${1 + recorded} requests with recorded usage`), 5000)
+    if (!flag("storage-error")) {
+      // The v1 seed contributes one priced/token-counted request and $0.01.
+      // Missing usage contributes nothing; unpriced usage retains its token counts.
+      const total = 1 + recorded, priced = 1 + (flag("unpriced") ? 0 : recorded)
+      const cost = (0.01 + (flag("unpriced") ? 0 : recorded * (stream ? 0.000115 : 0.00014))).toFixed(4)
+      assert.equal(screen.match(/\b\d+ requests with recorded usage\b/)?.[0], `${total} requests with recorded usage`)
+      assert.equal(screen.match(/tokens in\/out: \d+\/\d+(?: \(partial coverage\))?/)?.[0], `tokens in/out: ${100 * total}/${20 * total}`)
+      assert.equal(screen.match(/Token counts available: \d+\/\d+ requests/)?.[0], `Token counts available: ${total}/${total} requests`)
+      assert.equal(screen.match(/Pricing available: \d+\/\d+ requests/)?.[0], `Pricing available: ${priced}/${total} requests`)
+      assert.equal(screen.match(/lifetime: \$\d+\.\d{4}(?: \(partial pricing\))?/)?.[0], `lifetime: $${cost}${priced < total ? " (partial pricing)" : ""}`)
+      assert.match(screen, /Recorded since: 1970-01-01/, "legacy history must retain its first-recorded date")
+    }
     assert.doesNotMatch(screen, /Permission analysis/)
     await save("lifetime-dialog")
     tmux("send-keys", "-t", "smoke", "Escape")
   }
   await save("resolved")
+  assert.deepEqual(fixtureErrors, [], "fixture transport and pre-terminal assertions must succeed")
+  const expectedKinds = scenario === "external-edit" ? [...(disabled ? [] : ["external-directory"]), "edit"]
+    : disabled ? [] : [mcp ? "mcp" : custom ? "custom" : "external-directory"]
+  audit.verify(expectedKinds, correction && !flag("error") ? 2 : 1)
+  assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)
   await writeFile(path.join(root, `.runtime/permission-${tag}-requests.json`), JSON.stringify({ requests, rpc }, null, 2))
   console.log(`PASS ${tag}: real native ${tool}, correct evidence/prompt routing, ${reviews().length} reviewer attempts, once-only fixture completion and panel cleanup. ${temp}`)
+  outcome = "passed"
 } catch (error) {
   if (started) { try { await save("failed") } catch {} }
   await mkdir(path.join(root, ".runtime"), { recursive: true })
@@ -294,4 +353,9 @@ try {
   await runtime.dispose()
   server.closeAllConnections()
   await new Promise((resolve) => server.close(resolve))
+  metrics.mark("fixture-disposed")
+  await mkdir(path.join(root, ".runtime"), { recursive: true })
+  const measurement = { ...metrics.snapshot(outcome), payloadAudit: audit.snapshot() }
+  await writeFile(path.join(root, `.runtime/permission-${tag}-metrics.json`), JSON.stringify(measurement, null, 2))
+  console.log(`METRICS ${tag}: ${JSON.stringify(measurement.counts)}; .runtime/permission-${tag}-metrics.json`)
 }
