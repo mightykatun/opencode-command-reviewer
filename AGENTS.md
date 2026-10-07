@@ -148,6 +148,8 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 ## Evidence and reviewer contract
 
 - Discovery is bounded literal Python/shell tokenization, not shell evaluation.
+  Supported literal `cat`/`head` operands are captured as full bounded snapshots,
+  not as emulated command output. Unknown options/expansions stay unresolved.
   Never execute substitutions/helpers, expand `~`, use PATH to find bare scripts,
   or recursively inspect imports/task runners. Flag uncertain paths/control flow
   rather than guessing; keep the original command.
@@ -158,9 +160,20 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - Edit evidence is separate from shell evidence. Use pending host diffs without
   applying edits or reading full targets. Preserve permission identity/scope, normalize
   per-file paths/operations/move destinations, and omit raw input/metadata copies.
-  `maxFiles` caps considered change entries; `maxEvidenceBytes` caps included UTF-8
+  `maxFiles` defaults to 6 and uses shared distinct-file counting for both kinds,
+  including unavailable candidates; resolved symlink aliases count once. Each
+  permission gets a fresh budget. Repeated edit entries retain their separate
+  diffs. `maxEvidenceBytes` defaults to 131072 and caps included UTF-8
   diff bytes. Omit whole diffs with reasons, retain scope, and flag partial coverage.
   Never guess operations/paths from aggregate labels or synthesize a safety rating.
+- Omitted files carry JSON-quoted `[!]` warnings; omitted edits carry numeric
+  `[Δ]` line counts only from validated unified-diff hunks or valid host counts.
+  Do not include omitted content or invent zero counts for unavailable diffs.
+- Reviewer usage stays outside the strict assessment JSON and model evidence.
+  Sum all format attempts; omit the footer if any attempt lacks valid counts.
+  Cost uses the public host model catalog with exact endpoint/model matching,
+  cache rates and context tiers; unknown pricing shows tokens only. Render in
+  theme textMuted after the report inside its scrollbox. No native usage writes.
 - Use non-streaming Chat Completions with textual JSON evidence; no tool calling or
   provider-specific JSON mode. Instruction overrides cannot replace the fixed
   evidence/output contract: exactly `{"safe": boolean, "desc": "nonempty text"}`.

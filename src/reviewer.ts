@@ -1,6 +1,7 @@
 import type { Config } from "./config.js"
-import type { Assessment, ReviewEvidence } from "./types.js"
+import type { Assessment, ReviewEvidence, ReviewResult } from "./types.js"
 import { BUILTIN_PROMPTS, CONTRACT, correctionPrompt, type PromptSet } from "./prompts.js"
+import { responseUsage, sumUsage, type PricingLookup, type Usage } from "./usage.js"
 
 class FormatError extends Error {}
 
@@ -66,7 +67,8 @@ export async function review(
   fetcher: typeof fetch = fetch,
   environment: NodeJS.ProcessEnv = process.env,
   prompts: PromptSet = BUILTIN_PROMPTS,
-): Promise<Assessment> {
+  pricing?: PricingLookup,
+): Promise<ReviewResult> {
   const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)
   if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset or empty`)
   const prompt = evidence.kind === "edit" ? prompts.edit : prompts.shell
@@ -74,6 +76,7 @@ export async function review(
     { role: "system", content: [prompt.instructions, ...(config.autoApprove ? [prompts.extraCareful] : []), CONTRACT].join("\n\n") },
     { role: "user", content: JSON.stringify(evidence) },
   ]
+  let usage: Usage | undefined
   for (let attempt = 0; attempt <= config.formatRetries; attempt++) {
     signal.throwIfAborted()
     let response: Response
@@ -112,7 +115,9 @@ export async function review(
       throw new Error("Reviewer API did not return a text assessment")
     }
     signal.throwIfAborted()
-    try { return parseAssessment(message.content) }
+    const currentUsage = responseUsage(envelope, config.model, pricing)
+    usage = attempt === 0 ? currentUsage : sumUsage(usage, currentUsage)
+    try { return { ...parseAssessment(message.content), ...(usage ? { usage } : {}) } }
     catch (error) {
       if (!(error instanceof FormatError)) throw error
       if (attempt === config.formatRetries) throw new Error("Reviewer response format invalid after configured attempts")

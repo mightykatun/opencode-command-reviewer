@@ -50,20 +50,24 @@ Put options beside the plugin path in `tui.json`. Only **`baseURL` and `model`**
 | `autoApproveDelaySeconds` | `15` | Integer **0–3600** seconds. `0` approves once visible and verified. |
 | `formatRetries` | `1` | Integer **0–100** additional attempts to correct invalid assessment JSON; no HTTP/network retries. |
 | `timeoutMs` | `30000` | Integer **1–3,600,000** ms for context, evidence, and review/corrections together; separately bounds startup prompt loading. |
-| `maxFiles` | `4` | Integer **1–1,000** shell source references or first edit-change entries considered for capture. |
-| `maxEvidenceBytes` | `65536` | Integer **1–16,777,216** UTF-8 bytes: command + captured sources, or included edit diffs. Excludes prompts and metadata. |
+| `maxFiles` | `6` | Integer **1–1,000** distinct candidate files per review, shared counting rules for shell and edit tools. Repeated paths and resolved symlink aliases count once; unavailable candidates also count. |
+| `maxEvidenceBytes` | `131072` | Integer **1–16,777,216** UTF-8 bytes: command + captured files, or included edit diffs. Excludes prompts and metadata. |
 
 Booleans must be `true`/`false`, numbers must be integers, and strings are trimmed and must be nonempty. Unknown keys, explicit `null`, and invalid supplied values are rejected even for disabled features. Omit both API-key options for unauthenticated endpoints.
 
 Disable either review type independently; disabling both leaves all decisions manual. Oversized sources or whole diffs are omitted with reasons; an oversized command fails review. **Restart after configuration changes.**
 
+Shell evidence includes literal Python/shell sources and supported `cat`/`head` file operands. Each permission gets a fresh file/byte budget; repeated edit entries retain their separate diffs. Omitted files carry `[!] File "path" not included in context.`; omitted edits also carry `[Δ] "path": +N −M lines` when a valid diff or host counts provide the numbers. Paths are JSON-quoted, and unknown counts are never invented. No omitted file content is sent.
+
 ## Using the reviewer
 
 The sidebar shows **Safe** (green), **Unsafe** (red), or **Analysis unavailable** (orange), using the active theme. Explanations support Markdown and mouse-wheel/scrollbar scrolling. Only the assessment description is shown, not separate provider reasoning fields.
 
+A dimmed footer shows `in: N tokens | out: N tokens | cost: $X.XXXX` when endpoint usage and matching pricing are available. Totals include format-correction requests. Cost is an estimate from OpenCode's configured model catalog, matched by endpoint and model, including cache and context-tier rates. Unknown pricing shows token counts only; missing/invalid usage in any attempt omits the footer. These are reviewer-request statistics.
+
 The panel follows the first pending permission in the root session or its direct children. Directory access and command execution may require separate reviews. If the sidebar is hidden, use OpenCode's **Show sidebar** command (default: `Ctrl+X`, then `B`).
 
-**Data sent:** the current request, latest genuine root-user prompt, project context, and bounded script source or proposed edit diffs go to your reviewer endpoint **before approval**. Source capture can follow symlinks outside the project. HTTP is supported but unencrypted. Ratings reflect the supplied evidence, not a safety guarantee; dependencies and omitted content are not fully inspected.
+**Data sent:** the current request, latest genuine root-user prompt, project context, and bounded file snapshots or proposed edit diffs go to your reviewer endpoint **before approval**. `cat`/`head` operands supply full bounded snapshots, not command output. File capture can follow symlinks outside the project. HTTP is supported but unencrypted. Ratings reflect the supplied evidence, not a safety guarantee; dependencies and omitted content are not fully inspected.
 
 ### Auto-approval
 

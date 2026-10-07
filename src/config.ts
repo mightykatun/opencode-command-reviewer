@@ -58,7 +58,7 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     autoApproveDelaySeconds: number("autoApproveDelaySeconds", 15, 0, 3600),
     formatRetries: number("formatRetries", 1, 0, 100),
     timeoutMs: number("timeoutMs", 30000, 1, 3600000),
-    maxFiles: number("maxFiles", 4, 1, 1000),
-    maxEvidenceBytes: number("maxEvidenceBytes", 65536, 1, 16 * 1024 * 1024),
+    maxFiles: number("maxFiles", 6, 1, 1000),
+    maxEvidenceBytes: number("maxEvidenceBytes", 131072, 1, 16 * 1024 * 1024),
   }
 }

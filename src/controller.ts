@@ -1,5 +1,5 @@
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
-import type { Assessment } from "./types.js"
+import type { ReviewResult } from "./types.js"
 import type { Config } from "./config.js"
 import type { ApprovalTransport } from "./approval.js"
 import { isDeepStrictEqual } from "node:util"
@@ -10,12 +10,12 @@ export type AutoApproval = { status: "countdown"; seconds: number } | { status: 
 export interface View {
   request: PermissionRequest
   status: "identifying" | "unidentified" | "analyzing" | "complete" | "unavailable" | "unrelated"
-  assessment?: Assessment
+  assessment?: ReviewResult
   error?: string
   autoApproval?: AutoApproval
 }
 
-type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void) => Promise<Assessment | null>
+type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void) => Promise<ReviewResult | null>
 interface Entry { view: View; abort: AbortController; cancelTimer?: () => void; deadline?: number; approvalAbort?: AbortController }
 
 export interface ApprovalClock {

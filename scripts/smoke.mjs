@@ -19,6 +19,8 @@ const isExternal = ["external", "external-disabled", "auto-external"].includes(s
 const disabledReview = scenario.endsWith("-disabled")
 const heldReview = scenario === "cancel" || scenario === "edit-cancel"
 const correction = scenario === "correction" || scenario === "edit"
+const withUsage = ["correction", "edit", "write", "patch", "auto-shell", "auto-scroll"].includes(scenario)
+const knownPricing = withUsage && scenario !== "write"
 const configFailure = scenario === "edit-config-error"
 const fixtureModel = scenario === "patch" ? "gpt-fixture" : "fixture"
 const initialWidth = scenario === "cancel" || scenario === "auto-initially-hidden" ? 80 : 160
@@ -160,7 +162,9 @@ const server = createServer(async (req, res) => {
         const content = correction && reviewerCalls === 1
           ? '{"safe":"yes","desc":"Incorrect boolean type."}'
           : JSON.stringify({ safe: !["external", "patch", "auto-unsafe"].includes(scenario), desc: scenario === "auto-scroll" ? autoLongDescription : scenario === "correction" ? longDescription : isEdit ? "Proposed file changes. Partial coverage where diffs are omitted." : "Counts two fruit names, prints the count, and writes it to executed-marker." })
-        res.end(JSON.stringify({ choices: [{ message: { content, reasoning_content: "HIDDEN-REASONING-SENTINEL" } }] }))
+        res.end(JSON.stringify({ choices: [{ message: { content, reasoning_content: "HIDDEN-REASONING-SENTINEL" } }],
+          ...(withUsage ? { model: "review-fixture", usage: { prompt_tokens: 500, completion_tokens: 20 } } : {}),
+        }))
         record(`review-response-${reviewerCalls}`)
       }
       if (scenario === "edit" && reviewerCalls === 1) await writeFile(path.join(customPrompts, "EDIT-REVIEW-PROMPT.md"), "CHANGED AFTER STARTUP")
@@ -221,6 +225,11 @@ try {
     autoupdate: false,
     permission: { bash: "ask", edit: "ask", external_directory: "ask" },
     provider: { fixture: { npm: "@ai-sdk/openai-compatible", name: "Fixture", options: { baseURL: `http://127.0.0.1:${port}/main`, apiKey: "fixture-only" }, models: { [fixtureModel]: { name: "Fixture", limit: { context: 32000, output: 1000 } } } } },
+  }
+  if (knownPricing) config.provider.reviewer = {
+    npm: "@ai-sdk/openai-compatible", name: "Reviewer fixture",
+    options: { baseURL: `http://127.0.0.1:${port}/review`, apiKey: "fixture-review-key" },
+    models: { "review-fixture": { name: "Review fixture", limit: { context: 32000, output: 1000 }, cost: { input: 1, output: 2, cache_read: 0, cache_write: 0 } } },
   }
   const tuiFile = path.join(temp, "tui.json")
   await writeFile(tuiFile, JSON.stringify({
@@ -294,6 +303,19 @@ try {
     assert.ok(!screen.includes("Counts two fruit names"), "wheel should move the analysis viewport")
     assert.match(screen, /Allow once.*Allow always.*Reject/, "native approval controls must survive scrolling")
   }
+  const assertUsage = async () => {
+    const input = correction ? 1000 : 500, output = correction ? 40 : 20
+    if (scenario === "correction" || scenario === "auto-scroll") {
+      for (let i = 0; i < 20 && !capture().includes("cost: $"); i++) { mouse(65, 140, 20); await sleep(40) }
+    }
+    await until((s) => s.includes(`in: ${input} tokens`) && s.includes(`out: ${output} tokens`), 5000)
+    const ansi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
+    assert.equal(styleAt(ansi, `in: ${input} tokens`).fg, styleAt(ansi, "fullscreen").fg, "usage footer must use the active theme's muted color")
+    const sidebarText = screen.split("\n").map((line) => line.slice(118)).join("\n")
+    if (knownPricing) assert.match(sidebarText, correction ? /cost: \$0\.0011/ : /cost: \$0\.0005/)
+    else assert.doesNotMatch(sidebarText, /cost:/, "unknown pricing must not invent a cost")
+    await writeFile(path.join(root, `.runtime/${scenario}-usage.ansi`), ansi)
+  }
   if (auto) {
     const save = async (name) => {
       screen = capture()
@@ -334,6 +356,7 @@ try {
         "assessment must be painted before the full countdown is visible")
       await unchanged()
       const ansi = await save(stage)
+      if (scenario === "auto-shell") await assertUsage()
       assert.equal(styleAt(ansi, "✓ Safe").fg, "127,216,143")
       assert.equal(styleAt(ansi, "✓ Safe").bold, true)
       return { started, footerRow }
@@ -421,6 +444,7 @@ try {
         await stableTick()
         assert.ok(!screen.includes(finalLine), "long Markdown including code must overflow")
         await wheelToEnd()
+        await assertUsage()
         await stableTick()
         await save("wheel-final")
         const thumbRow = () => {
@@ -638,6 +662,10 @@ try {
           assert.equal(sent.changes[3].movePath, path.join(project, "moved.txt"))
           assert.ok(!firstReview.body.messages[1].content.includes("DELETE-SENTINEL"))
           assert.ok(!firstReview.body.messages[1].content.includes("MOVE-SENTINEL"))
+          for (const change of sent.changes.slice(2)) {
+            assert.equal(change.warning, `[!] File ${JSON.stringify(change.path)} not included in context.`)
+            assert.match(change.delta, /: \+\d+ −\d+ lines$/)
+          }
         } else {
           assert.equal(sent.partial, false)
           assert.equal(sent.changes[0].path, path.join(project, "note.txt"))
@@ -667,6 +695,8 @@ try {
     } else assert.equal(reviewerCalls, configFailure || disabledReview ? 0 : 1)
     await writeFile(path.join(root, `.runtime/${scenario}-pending.txt`), screen)
     const styledScreen = tmux("capture-pane", "-p", "-e", "-t", "smoke")
+    if (withUsage && scenario !== "correction") await assertUsage()
+    if (!withUsage) assert.doesNotMatch(screen.split("\n").map((line) => line.slice(initialWidth - 42)).join("\n"), /in: \d+ tokens/, "missing endpoint usage must leave no footer")
     await writeFile(path.join(root, `.runtime/${scenario}-pending.ansi`), styledScreen)
     if (!disabledReview) assert.match(styledScreen.split("\n").find((line) => line.includes("Permission analysis")) ?? "", /\x1b\[1m/, "overlay heading should be bold")
     if (scenario === "correction" || scenario === "external") {
@@ -681,6 +711,7 @@ try {
       const initialScrollbar = assertScrollbarTheme(styledScreen)
       assert.ok(!screen.includes(finalLine), "long analysis must initially overflow")
       await wheelToEnd()
+      await assertUsage()
       await writeFile(path.join(root, ".runtime/correction-wheel-final.txt"), screen)
       await drag(38, 6)
       await until((s) => formattingReady(s) && !s.includes(finalLine), 10000)

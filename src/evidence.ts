@@ -3,6 +3,7 @@ import { constants } from "node:fs"
 import { open, realpath } from "node:fs/promises"
 import { parse } from "shell-quote"
 import type { EditChange, EditContext, EditEvidence, Evidence, FileEvidence, Limits } from "./types.js"
+import { FileLimit, diffDelta, omittedFile } from "./files.js"
 
 const VARIABLE = "\u0000UNRESOLVED_VARIABLE\u0000"
 const python = /^python(?:[23](?:\.\d+)*)?$/
@@ -171,6 +172,28 @@ export function discover(command: string, cwd: string | null, depth = 0): {
       note("Executable name contains unresolved expansion; script coverage is incomplete.")
       return
     }
+    if (base === "cat" || base === "head") {
+      const operands: string[] = []
+      let options = true
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i]!
+        if (options && arg === "--") { options = false; continue }
+        if (options && arg.startsWith("-") && arg !== "-") {
+          if (base === "cat" && (/^-[AbEenstTuv]+$/.test(arg) || ["--show-all", "--number-nonblank", "--show-ends", "--number", "--squeeze-blank", "--show-tabs", "--show-nonprinting"].includes(arg))) continue
+          if (base === "head") {
+            if (/^-[qvz]+$/.test(arg) || ["--quiet", "--silent", "--verbose", "--zero-terminated"].includes(arg)) continue
+            if (["-n", "-c", "--lines", "--bytes"].includes(arg) && /^-?\d+[kKMGTPEZY]?(?:B|iB)?$/.test(args[i + 1] ?? "")) { i++; continue }
+            if (/^(?:-[nc]?|--(?:lines|bytes)=)-?\d+[kKMGTPEZY]?(?:B|iB)?$/.test(arg)) continue
+          }
+          note(`Unsupported ${base} option; file operands were not resolved.`)
+          return
+        }
+        if (arg === "-") note(`${base} reads stdin; no file was resolved for that operand.`)
+        else operands.push(arg)
+      }
+      operands.forEach((operand) => add(operand))
+      return
+    }
     if (python.test(base) || shell.test(base)) {
       const isPython = python.test(base)
       for (let i = 0; i < args.length; i++) {
@@ -323,23 +346,32 @@ export async function collectEvidence(
   const discovery = discover(input.command, input.cwd)
   const evidence: Evidence = { ...input, files: [], limitations: [
     ...(input.limitations ?? []),
-    "Only literal Python/shell source is collected. Files are snapshots taken during review. Imports, dependencies, other runtimes and calls inside source files are not recursively inspected.",
+    "Only literal Python/shell source and supported cat/head file operands are collected. Files are full review-time snapshots, not command output. Imports, dependencies, other runtimes and calls inside source files are not recursively inspected.",
     ...discovery.limitations,
   ] }
   if (!input.userPrompt) evidence.limitations.push("User prompt unavailable.")
   let remaining = limits.maxEvidenceBytes - commandBytes
-  const seen = new Set<string>()
-  let count = 0
+  const limit = new FileLimit(limits.maxFiles)
+  const selected = new Map<string | symbol, { reference: Reference; filename: string | null; withinLimit: boolean; aliases: string[] }>()
   for (const reference of discovery.references) {
     signal.throwIfAborted()
-    const key = JSON.stringify(reference)
-    if (seen.has(key)) continue
-    seen.add(key)
-    if (count++ >= limits.maxFiles) {
-      evidence.files.push({ filename: reference.filename, status: "file-count limit reached; contents not provided; assess risk accordingly" })
+    const filename = path.isAbsolute(reference.filename) ? reference.filename : reference.cwd ? `${reference.cwd}/${reference.filename}` : null
+    const { key, withinLimit } = await limit.consider(filename, signal)
+    const previous = selected.get(key)
+    if (previous) {
+      previous.reference.executable &&= reference.executable
+      if (filename && filename !== previous.filename && !previous.aliases.includes(filename)) previous.aliases.push(filename)
+    } else selected.set(key, { reference: { ...reference }, filename, withinLimit, aliases: [] })
+  }
+  for (const { reference, filename, withinLimit, aliases } of selected.values()) {
+    signal.throwIfAborted()
+    if (!withinLimit) {
+      evidence.files.push({ filename: reference.filename, ...(filename ? { path: filename } : {}), ...(aliases.length ? { aliases } : {}), status: "file-count limit reached", warning: omittedFile(filename ?? reference.filename) })
       continue
     }
     const file = await capture(reference, remaining, signal)
+    if (aliases.length) file.aliases = aliases
+    if (file.contents === undefined) file.warning = omittedFile(file.path ?? file.filename)
     evidence.files.push(file)
     remaining -= Buffer.byteLength(file.contents ?? "")
   }
@@ -348,7 +380,7 @@ export async function collectEvidence(
 }
 
 /** Use host-computed diffs, never apply edits or duplicate unbounded tool input. */
-export function collectEditEvidence(input: EditContext, limits: Limits, signal: AbortSignal): EditEvidence {
+export async function collectEditEvidence(input: EditContext, limits: Limits, signal: AbortSignal): Promise<EditEvidence> {
   signal.throwIfAborted()
   const { metadata, ...scope } = input.permission
   const limitations = [...input.limitations,
@@ -357,10 +389,11 @@ export function collectEditEvidence(input: EditContext, limits: Limits, signal: 
   const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
   const patch = input.tool === "apply_patch"
   const files = patch ? Array.isArray(metadata.files) ? metadata.files : []
-    : [{ filePath: metadata.filepath, patch: metadata.diff, type: input.tool }]
+    : [{ filePath: metadata.filepath, patch: metadata.diff, type: input.tool, additions: metadata.additions, deletions: metadata.deletions }]
   if (!files.length) limitations.push("Per-file patch metadata unavailable; affected changes could not be enumerated.")
   let remaining = limits.maxEvidenceBytes
   const changes: EditChange[] = []
+  const limit = new FileLimit(limits.maxFiles)
   for (let index = 0; index < files.length; index++) {
     signal.throwIfAborted()
     const file = record(files[index])
@@ -370,7 +403,8 @@ export function collectEditEvidence(input: EditContext, limits: Limits, signal: 
       operation, status: "omitted",
       ...(typeof file.movePath === "string" ? { movePath: file.movePath } : {}),
     }
-    if (index >= limits.maxFiles) change.reason = "file-count limit reached"
+    const { withinLimit } = await limit.consider(change.path && path.isAbsolute(change.path) ? change.path : null, signal)
+    if (!withinLimit) change.reason = "file-count limit reached"
     else if (!change.path || !path.isAbsolute(change.path)) change.reason = "absolute target path unavailable"
     else if (operation === "unknown" || (patch && (operation === "edit" || operation === "write"))) change.reason = "file operation unavailable or unsupported"
     else if (operation === "move" && (!change.movePath || !path.isAbsolute(change.movePath))) change.reason = "absolute move destination unavailable"
@@ -380,6 +414,13 @@ export function collectEditEvidence(input: EditContext, limits: Limits, signal: 
       change.status = "included"
       change.diff = file.patch
       remaining -= Buffer.byteLength(file.patch)
+    }
+    if (change.status === "omitted") {
+      change.warning = omittedFile(change.path)
+      const counts = diffDelta(file.patch, signal)
+        ?? (Number.isSafeInteger(file.additions) && Number(file.additions) >= 0 && Number.isSafeInteger(file.deletions) && Number(file.deletions) >= 0
+          ? { added: Number(file.additions), removed: Number(file.deletions) } : undefined)
+      if (counts) change.delta = `[Δ] ${JSON.stringify(change.path)}: +${counts.added} −${counts.removed} lines`
     }
     changes.push(change)
   }

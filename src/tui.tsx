@@ -9,6 +9,7 @@ import { review, withDeadline } from "./reviewer.js"
 import { BUILTIN_PROMPTS, loadPrompts } from "./prompts.js"
 import { approvalTransport } from "./approval.js"
 import { reviewSyntaxStyles, scannerFrame, SCANNER_FRAME_COUNT, SCANNER_INTERVAL_MS } from "./appearance.js"
+import { modelPricing, usageText } from "./usage.js"
 
 function ReviewLoading(props: { api: TuiPluginApi }) {
   const [frame, setFrame] = createSignal(0)
@@ -139,8 +140,9 @@ const tui: TuiPlugin = async (api, options) => {
       if (!context) return null
       onIdentified()
       if (!config) throw new Error(configError)
-      const evidence = context.kind === "edit" ? collectEditEvidence(context, config, signal) : await collectEvidence(context, config, signal)
-      return review(evidence, config, signal, undefined, undefined, prompts)
+      const evidence = context.kind === "edit" ? await collectEditEvidence(context, config, signal) : await collectEvidence(context, config, signal)
+      return review(evidence, config, signal, undefined, undefined, prompts,
+        (model) => modelPricing(api.state.provider, config!.baseURL, model))
     })
   }, setViews, reviewOptions, { ...approvalTransport(api.client, api.state.path.directory), visibleID: () => visibleApproval() })
 
@@ -266,7 +268,12 @@ const tui: TuiPlugin = async (api, options) => {
                         </text>
                       </Show>
                     }>
-                      {(assessment) => <ReviewDescription api={api} text={assessment().desc} ref={(value) => { description = value }} />}
+                      {(assessment) => <>
+                        <ReviewDescription api={api} text={assessment().desc} ref={(value) => { description = value }} />
+                        <Show when={assessment().usage}>{(usage) =>
+                          <text marginTop={1} fg={api.theme.current.textMuted} width="100%" flexShrink={0}>{usageText(usage())}</text>
+                        }</Show>
+                      </>}
                     </Show>
                   </scrollbox>
                   <ReviewFooter api={api} view={view()} controller={controller} enabled={config?.autoApprove === true} />

@@ -322,7 +322,7 @@ test("captures real source snapshots including external files and symlinks", asy
   await writeFile(path.join(dir, "external.py"), "print('pear')\n")
   await symlink(path.join(dir, "external.py"), path.join(dir, "project/link.py"))
   const result = await collectEvidence({ command: "python link.py; python ../external.py", cwd: path.join(dir, "project"), userPrompt: "Count fruit" }, limits, signal())
-  assert.equal(result.files.length, 2)
+  assert.equal(result.files.length, 1)
   assert.ok(result.files.every((f) => f.contents === "print('pear')\n"))
   assert.equal(result.userPrompt, "Count fruit")
 })

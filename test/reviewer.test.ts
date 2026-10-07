@@ -43,8 +43,8 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   assert.equal(cfg.baseURL, "http://localhost:1234/v1")
   assert.equal(cfg.timeoutMs, 30000)
   assert.equal(cfg.formatRetries, 1)
-  assert.equal(cfg.maxFiles, 4)
-  assert.equal(cfg.maxEvidenceBytes, 65536)
+  assert.equal(cfg.maxFiles, 6)
+  assert.equal(cfg.maxEvidenceBytes, 131072)
   assert.equal(cfg.reviewBash, true)
   assert.equal(cfg.reviewEdits, true)
   assert.equal(cfg.autoApprove, false)
@@ -74,8 +74,8 @@ test("numeric settings default only on omission and enforce integer boundaries b
   for (const [name, fallback, min, max] of [
     ["formatRetries", 1, 0, 100],
     ["timeoutMs", 30000, 1, 3600000],
-    ["maxFiles", 4, 1, 1000],
-    ["maxEvidenceBytes", 65536, 1, 16 * 1024 * 1024],
+    ["maxFiles", 6, 1, 1000],
+    ["maxEvidenceBytes", 131072, 1, 16 * 1024 * 1024],
     ["autoApproveDelaySeconds", 15, 0, 3600],
   ] as const) {
     await t.test(name, async (t) => {
@@ -394,7 +394,7 @@ test("redirects are not followed and cannot forward review evidence", async (t) 
 
 test("edit evidence uses its own assessment/correction prompts and preserves partial coverage on the wire", async (t) => {
   const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index % 2 ? '{"safe":false,"desc":"Partial review: deleted file content omitted."}' : '{"safe":"yes","desc":"bad type"}')))
-  const edit = collectEditEvidence({
+  const edit = await collectEditEvidence({
     kind: "edit", tool: "apply_patch", userPrompt: "Update a setting", limitations: [], session: evidence.session,
     location: { instanceDirectory: "/project", instanceWorktree: "/project" },
     permission: { id: "edit", type: "edit", patterns: ["config", "data"], always: ["*"], tool: { messageID: "m", callID: "c" }, metadata: {
@@ -428,7 +428,7 @@ test("edit evidence uses its own assessment/correction prompts and preserves par
 
 test("auto mode adds only the extra-careful template to both review kinds, including corrections", async (t) => {
   const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index % 2 ? '{"safe":true,"desc":"Bounded effects."}' : "invalid JSON")))
-  const edit = collectEditEvidence({
+  const edit = await collectEditEvidence({
     kind: "edit", tool: "edit", userPrompt: "Update note", limitations: [], session: evidence.session,
     location: { instanceDirectory: "/project", instanceWorktree: "/project" },
     permission: { ...evidence.permission!, type: "edit", metadata: { filepath: "/project/note", diff: "-old\n+new" } },
@@ -452,4 +452,27 @@ test("provider reasoning stays outside the displayed assessment", async (t) => {
     content: '{"safe":true,"desc":"Visible effects."}', reasoning: "hidden reasoning", reasoning_content: "hidden thoughts",
   } }] })))
   assert.deepEqual(await review(evidence, config, signal()), { safe: true, desc: "Visible effects." })
+})
+
+test("review usage sums correction requests outside assessment JSON and evidence", async (t) => {
+  const { config, requests } = await endpoint(t, (index, res) => res.end(JSON.stringify({
+    model: "fixture", usage: { prompt_tokens: 100 + index, completion_tokens: 10 },
+    choices: [{ message: { content: index ? '{"safe":true,"desc":"Visible effects."}' : "bad format" } }],
+  })))
+  const result = await review(evidence, config, signal(), fetch, {}, BUILTIN_PROMPTS,
+    () => ({ input: 1, output: 2, cache: { read: 0, write: 0 } }))
+  assert.deepEqual(result, { safe: true, desc: "Visible effects.", usage: { input: 201, output: 20, cost: 0.000241 } })
+  assert.equal(requests.length, 2)
+  for (const request of requests) assert.deepEqual(JSON.parse(request.body.messages[1].content), evidence)
+  assert.throws(() => parseAssessment('{"safe":true,"desc":"x","usage":{"prompt_tokens":10}}'))
+})
+
+test("missing usage in either correction response omits the report usage line", async (t) => {
+  for (const missing of [0, 1]) {
+    const { config } = await endpoint(t, (index, res) => res.end(JSON.stringify({
+      ...(index === missing ? {} : { usage: { prompt_tokens: 10, completion_tokens: 5 } }),
+      choices: [{ message: { content: index ? '{"safe":true,"desc":"Visible effects."}' : "bad format" } }],
+    })))
+    assert.deepEqual(await review(evidence, config, signal()), { safe: true, desc: "Visible effects." })
+  }
 })

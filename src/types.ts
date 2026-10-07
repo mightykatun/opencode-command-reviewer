@@ -6,8 +6,10 @@ export interface Limits {
 export interface FileEvidence {
   filename: string
   path?: string
+  aliases?: string[]
   status: string
   contents?: string
+  warning?: string
 }
 
 export interface Evidence {
@@ -48,6 +50,8 @@ export interface EditChange {
   status: "included" | "omitted"
   reason?: string
   diff?: string
+  warning?: string
+  delta?: string
 }
 
 export interface EditEvidence {
@@ -87,4 +91,9 @@ export interface ProjectLocation {
 export interface Assessment {
   safe: boolean
   desc: string
+}
+
+/** Endpoint metadata stays outside the model's strict assessment JSON. */
+export interface ReviewResult extends Assessment {
+  usage?: import("./usage.js").Usage
 }
