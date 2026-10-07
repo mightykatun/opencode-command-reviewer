@@ -69,11 +69,13 @@ function fixture(t: TestContext, settings: {
   }
   const controller: Controller = new Controller((req, signal, identified) => {
     evaluated.push(req.id)
-    return settings.evaluate ? settings.evaluate(req, signal, identified) : Promise.resolve(safe)
+    if (settings.evaluate) return settings.evaluate(req, signal, identified)
+    identified()
+    return Promise.resolve(safe)
   }, (views) => {
     publications.push([...views])
     settings.changed?.(views, controller)
-  }, { reviewBash: true, reviewEdits: true, autoApprove: true, ...settings.options }, settings.writer === false ? undefined : {
+  }, { reviewBash: true, reviewEdits: true, reviewExternalDirectories: true, autoApprove: true, ...settings.options }, settings.writer === false ? undefined : {
     visibleID: visible,
     list: (signal) => { reads.push(signal); return transport.list(signal) },
     once: (req, signal) => { writes.push({ request: req, signal }); return transport.once(req, signal) },
@@ -111,10 +113,10 @@ const gates: { name: string; options?: Partial<Options>; writer?: boolean; permi
   { name: "no writer", writer: false, status: "complete" },
   { name: "Unsafe", evaluate: async () => ({ safe: false, desc: "Deletes unrelated data." }), status: "complete" },
   { name: "no assessment", evaluate: async () => null, status: "unrelated" },
-  { name: "review unavailable", evaluate: async () => { throw new Error("Unavailable") }, status: "unavailable" },
+  { name: "review unavailable", evaluate: async (_, __, identified) => { identified(); throw new Error("Unavailable") }, status: "unavailable" },
   { name: "unidentified directory", permission: "external_directory", evaluate: async () => { throw new Error("Unknown context") }, status: "unidentified" },
   { name: "disabled bash", options: { reviewBash: false }, status: "unrelated", evaluated: 0 },
-  { name: "disabled shell directory", permission: "external_directory", options: { reviewBash: false }, status: "unrelated", evaluated: 0 },
+  { name: "disabled directory", permission: "external_directory", options: { reviewExternalDirectories: false }, status: "unrelated", evaluated: 0 },
   { name: "disabled edit", permission: "edit", options: { reviewEdits: false }, status: "unrelated", evaluated: 0 },
   { name: "unrelated native kind", permission: "read", status: "unrelated", evaluated: 0 },
 ]
@@ -135,7 +137,7 @@ for (const gate of gates) test(`${gate.name} never lists or writes, even with ex
 
 test("countdown starts only after completed Safe assessment AND a subsequent displayed frame", async (t) => {
   const review = deferred<Assessment>()
-  const f = fixture(t, { evaluate: () => review.promise })
+  const f = fixture(t, { evaluate: (_, __, identified) => { identified(); return review.promise } })
   await f.add()
   f.present()
   f.clock.jump(60_000)

@@ -4,21 +4,21 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile, open, type FileHandle
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { execFileSync } from "node:child_process"
-import { BUILTIN_PROMPTS, CONTRACT, correctionPrompt, loadPrompts } from "../src/prompts.js"
+import { BUILTIN_PROMPTS, CONTRACT, CORRECTION, correctionPrompt, loadPrompts } from "../src/prompts.js"
+import inventory from "../src/prompt-files.json" with { type: "json" }
 import { parseConfig } from "../src/config.js"
 
-test("shell and edit prompts use their named files and share the separate fixed contract", async () => {
-  for (const [kind, prefix] of [["shell", "PERMISSION"], ["edit", "EDIT"]] as const) {
-    const assessment = (await readFile(new URL(`../prompts/${prefix}-REVIEW-PROMPT.md`, import.meta.url), "utf8")).trim()
-    const correction = (await readFile(new URL(`../prompts/${prefix}-REVIEW-CORRECTION.md`, import.meta.url), "utf8")).trim()
+test("all review kinds use named assessment files and one fixed correction contract", async () => {
+  for (const kind of ["shell", "edit", "mcp", "custom", "external-directory"] as const) {
+    const assessment = (await readFile(new URL(`../${inventory[kind]}`, import.meta.url), "utf8")).trim()
     assert.equal(BUILTIN_PROMPTS[kind].instructions, assessment)
-    assert.equal(BUILTIN_PROMPTS[kind].correction, correction)
-    assert.match(correction, /\{\{validationError\}\}/)
     assert.match(assessment, /one-time allowance \(Allow once\)/)
     assert.match(assessment, /Do not explain, warn about, or rate.*Allow always/)
-    assert.match(correction, kind === "shell" ? /bash-only closing permission guidance.*without assessing hypothetical future grants/ : /without commentary about Allow always/)
-    assert.ok(correctionPrompt("feedback $&", correction).includes("feedback $&"))
+    assert.ok(!("correction" in BUILTIN_PROMPTS[kind]))
   }
+  assert.equal(CORRECTION, (await readFile(new URL("../contracts/PERMISSION-REVIEW-CORRECTION.md", import.meta.url), "utf8")).trim())
+  assert.match(CORRECTION, /\{\{validationError\}\}/)
+  assert.ok(correctionPrompt("feedback $&").includes("feedback $&"))
   assert.equal(CONTRACT, (await readFile(new URL("../contracts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim())
   assert.match(CONTRACT, /proposed diffs/)
   assert.match(CONTRACT, /exactly two fields/)
@@ -44,14 +44,14 @@ test("prompt files override independently with immutable startup snapshots and p
   assert.equal(await loadPrompts(undefined, signal), BUILTIN_PROMPTS)
   assert.deepEqual(await loadPrompts(dir, signal), BUILTIN_PROMPTS)
   await writeFile(path.join(dir, "EDIT-REVIEW-PROMPT.md"), " custom edit guidance \n")
-  await writeFile(path.join(dir, "PERMISSION-REVIEW-CORRECTION.md"), "shell correction: {{validationError}}")
+  await writeFile(path.join(dir, "MCP-REVIEW-PROMPT.md"), "custom MCP instructions")
   await writeFile(path.join(dir, "README.md"), "unrelated files are not prompts")
   const first = await loadPrompts(dir, signal)
   assert.equal(first.edit.instructions, "custom edit guidance")
-  assert.equal(first.edit.correction, BUILTIN_PROMPTS.edit.correction)
+  assert.equal(first.mcp.instructions, "custom MCP instructions")
   assert.equal(first.shell.instructions, BUILTIN_PROMPTS.shell.instructions)
   assert.equal(first.extraCareful, BUILTIN_PROMPTS.extraCareful)
-  assert.equal(correctionPrompt("feedback $&", first.shell.correction), "shell correction: feedback $&")
+  assert.equal(correctionPrompt("feedback $&"), CORRECTION.replaceAll("{{validationError}}", () => "feedback $&"))
   await writeFile(path.join(dir, "EDIT-REVIEW-PROMPT.md"), "changed on disk")
   assert.equal(first.edit.instructions, "custom edit guidance")
   assert.equal((await loadPrompts(dir, signal)).edit.instructions, "changed on disk")
@@ -59,28 +59,43 @@ test("prompt files override independently with immutable startup snapshots and p
   assert.notEqual(BUILTIN_PROMPTS.edit.instructions, first.edit.instructions)
 })
 
-test("all five named files load and correction substitutions preserve literal feedback", async (t) => {
+test("all six assessment/guidance files load independently", async (t) => {
   const dir = await mkdtemp(path.join(tmpdir(), "review-prompts-"))
   t.after(() => rm(dir, { recursive: true, force: true }))
-  for (const prefix of ["PERMISSION", "EDIT"]) {
-    await writeFile(path.join(dir, `${prefix}-REVIEW-PROMPT.md`), `${prefix} custom guidance`)
-    await writeFile(path.join(dir, `${prefix}-REVIEW-CORRECTION.md`), `${prefix} {{validationError}} / {{validationError}}`)
+  for (const kind of ["shell", "edit", "mcp", "custom", "external-directory"] as const) {
+    await writeFile(path.join(dir, path.basename(inventory[kind])), `${kind} custom guidance`)
   }
   await writeFile(path.join(dir, "EXTRA-CAREFUL-REVIEW-PROMPT.md"), "Custom extra-careful guidance")
   const prompts = await loadPrompts(dir, new AbortController().signal)
   await writeFile(path.join(dir, "EXTRA-CAREFUL-REVIEW-PROMPT.md"), "Changed on disk")
   assert.equal(prompts.extraCareful, "Custom extra-careful guidance")
-  assert.equal(prompts.shell.instructions, "PERMISSION custom guidance")
-  assert.equal(prompts.edit.instructions, "EDIT custom guidance")
-  assert.equal(correctionPrompt("$&", prompts.edit.correction), "EDIT $& / $&")
+  for (const kind of ["shell", "edit", "mcp", "custom", "external-directory"] as const) {
+    assert.equal(prompts[kind].instructions, `${kind} custom guidance`)
+    assert.ok(Object.isFrozen(prompts[kind]))
+  }
+})
+
+test("legacy and new-category correction overrides fail with migration filenames", async (t) => {
+  for (const name of ["PERMISSION-REVIEW-CORRECTION.md", "EDIT-REVIEW-CORRECTION.md", "MCP-REVIEW-CORRECTION.md"]) {
+    const dir = await mkdtemp(path.join(tmpdir(), "review-prompts-"))
+    t.after(() => rm(dir, { recursive: true, force: true }))
+    await writeFile(path.join(dir, name), "{{validationError}} private override")
+    await assert.rejects(loadPrompts(dir, new AbortController().signal), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.match(error.message, /Correction contracts are fixed; remove legacy override files/)
+      assert.ok(error.message.includes(name))
+      assert.doesNotMatch(error.message, /private override/)
+      return true
+    })
+  }
 })
 
 test("supplied invalid prompt files fail rather than falling back or leaking file contents", async (t) => {
-  for (const scenario of ["blank", "binary", "utf8", "oversized", "directory", "dangling", "fifo", "placeholder", "contract", "extra-careful"]) {
+  for (const scenario of ["blank", "binary", "utf8", "oversized", "directory", "dangling", "fifo", "contract", "extra-careful"]) {
     await t.test(scenario, async (t) => {
       const dir = await mkdtemp(path.join(tmpdir(), "review-prompts-"))
       t.after(() => rm(dir, { recursive: true, force: true }))
-      const name = scenario === "placeholder" ? "EDIT-REVIEW-CORRECTION.md" : scenario === "contract" ? "PERMISSION-REVIEW-CONTRACT.md" : scenario === "extra-careful" ? "EXTRA-CAREFUL-REVIEW-PROMPT.md" : "EDIT-REVIEW-PROMPT.md"
+      const name = scenario === "contract" ? "PERMISSION-REVIEW-CONTRACT.md" : scenario === "extra-careful" ? "EXTRA-CAREFUL-REVIEW-PROMPT.md" : "EDIT-REVIEW-PROMPT.md"
       const file = path.join(dir, name)
       if (scenario === "directory") await mkdir(file)
       else if (scenario === "dangling") await symlink(path.join(dir, "missing"), file)
@@ -126,4 +141,27 @@ test("prompt reads close handles on read failure and mid-read cancellation", asy
     await assert.rejects(loadPrompts(dir, abort.signal), cancel ? { name: "AbortError" } : /Invalid prompt file/)
     assert.equal(handle?.fd, -1)
   })
+})
+
+test("cancellation at prompt EOF does not start a late stat and closes the descriptor", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "review-prompts-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const file = path.join(dir, "EDIT-REVIEW-PROMPT.md")
+  await writeFile(file, "custom prompt")
+  const probe = await open(file, "r")
+  const prototype = Object.getPrototypeOf(probe)
+  const read = probe.read, stat = probe.stat
+  await probe.close()
+  const abort = new AbortController()
+  let stats = 0, handle: FileHandle | undefined
+  t.mock.method(prototype, "stat", function(this: FileHandle) { stats++; return stat.call(this) })
+  t.mock.method(prototype, "read", async function(this: FileHandle, ...args: Parameters<FileHandle["read"]>) {
+    handle = this
+    const value = await read.apply(this, args)
+    if (!value.bytesRead) abort.abort()
+    return value
+  })
+  await assert.rejects(loadPrompts(dir, abort.signal), { name: "AbortError" })
+  assert.equal(stats, 1)
+  assert.equal(handle?.fd, -1)
 })

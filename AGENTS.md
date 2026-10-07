@@ -38,11 +38,22 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - Runtime/UI or host-integration changes warrant real-TUI fixtures after a build.
   Run one with `node scripts/smoke.mjs external`; other scenarios are `correction`,
   `cancel`, `error`, `edit`, `write`, `patch`, `edit-cancel`, and `edit-config-error`.
+  `stalled-file` injects a stalled evidence open through the bundle's read-only
+  `withFileAccess` adapter factory and verifies palette responsiveness plus a
+  bounded omission in the real host. It does not patch host filesystem globals.
   Review-switch scenarios are `edit-disabled`, `bash-disabled`, and `external-disabled`.
   Auto-mode scenarios are `auto-shell`, `auto-edit`, `auto-external`, `auto-zero`,
   `auto-immediate`, `auto-manual`, `auto-unsafe`, `auto-error`, `auto-cancel`,
   `auto-hide`, `auto-dialog`, `auto-fullscreen`, `auto-narrow`,
   `auto-initially-hidden`, and `auto-scroll`.
+  `scripts/smoke-permissions.mjs` covers `mcp`, `mcp-resource`, `custom`,
+  `custom-bash`, `external-read`, `external-search`, `external-edit`, and `external-patch`.
+  `external-patch` verifies a deletion summary before directory-only approval with
+  native edit permission already allowed.
+  Flags include `--auto`, `--disabled`, `--cancel`, `--unsafe`, `--error`,
+  `--correction`, `--held`, `--no-usage`, `--missing-usage`, `--unpriced`,
+  `--storage-error`, `--native-bash-enabled`, `--resource-whitespace`, and `--stats`. `npm run test:runtime-permissions` runs a
+  focused matrix. Seeded lifetime assertions verify the real rendered UI.
   Requires Linux, Git, Python 3, tmux and `opencode` on PATH;
   `OPENCODE_BIN` selects another binary.
 - Runtime fixtures isolate HOME/XDG/project directories under the OS temp directory,
@@ -67,7 +78,8 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 ## Wiring and build quirks
 
 - `src/tui.tsx` adapts the host SDK and wires `controller.ts` lifecycle/visibility
-  to `context.ts` provenance, `evidence.ts` source capture, and `reviewer.ts` transport.
+  to `evaluate.ts` dispatch, `classification.ts` origin checks, `context.ts`
+  provenance, the evidence collectors, and `reviewer.ts` transport.
   One deadline wraps context, files, HTTP requests and format corrections.
   `approval.ts` narrows the host writer to `once` in the invocation host instance,
   never the command workdir. Controller verification/reply share five seconds;
@@ -81,27 +93,44 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - Defaults/validation live in `src/config.ts`, evidence shapes in `src/types.ts`,
   overridable prompt text in `prompts/`, fixed contract in `contracts/`, and response validation in
   `src/reviewer.ts`; consult these rather than duplicating contracts in documentation.
-- `src/prompts.ts` reads built-in Markdown in source tests; `scripts/build.mjs`
-  embeds it in the bundle. Built-in prompt edits require rebuilding and restarting.
+- `src/prompt-files.json` is the shared source/build inventory. `src/prompts.ts`
+  reads its Markdown in source tests; `scripts/build.mjs` embeds it in the bundle.
+  Built-in prompt edits require rebuilding and restarting.
   `instructions` is an absolute custom prompt-directory path, loaded once at startup
   with per-file fallback, a 64 KiB/file cap and the configured timeout. Custom files
-  need only a restart. Keep contracts outside overrides; retain `{{validationError}}`
-  in correction templates. Runtime fixtures load an isolated copy of the bundle.
+  need only a restart. Both evidence/output and correction contracts are fixed;
+  retain `{{validationError}}` in `contracts/PERMISSION-REVIEW-CORRECTION.md`.
+  Reject legacy correction overrides with migration filenames. Runtime fixtures
+  load an isolated copy of the bundle.
 
 ## Permission lifecycle and display
 
-- Review native `bash`, shell-associated `external_directory`, and `edit` requests
-  from native `edit`/`write`/`apply_patch` tools. Edit-associated external-directory
-  checks stay hidden; actual edit permission provides the host-computed diffs.
-  Directory access can precede execution approval: preserve each request's ID,
+- Review native `bash` and native `edit`/`write`/`apply_patch` changes; independently
+  enabled kinds include MCP, registered custom-tool permission checks, and all
+  linked `external_directory` requests. Each kind has its own prompt. Directory
+  checks, including edit preflight, get separate reviews from operation approvals.
+  Directory approval may resume the tool without another prompt; do not assume
+  an operation-specific check is guaranteed. Preserve each request's ID,
   exact type, scope and metadata, even for the same tool call. `always` contains
   proposed remembered patterns, not existing grants.
 - Deduplicate by permission-request ID. Visibility follows the root session's first
   pending permission, including direct children; an unrelated first request must
-  not show a later command's assessment. Identify directory requests before display.
-- `reviewBash` and `reviewEdits` default true. Disabled kinds remain hidden ordering
-  blockers but never start context/evidence/model work. `reviewBash` also gates
-  shell-associated external-directory analysis; these switches do not grant access.
+  not show a later command's assessment. Identify every request's origin and enabled
+  category before display; a native-looking permission string is insufficient.
+- `reviewBash` and `reviewEdits` default true. `reviewMcp`, `reviewCustomTools`, and
+  `reviewExternalDirectories` default false. The latter owns every directory
+  request independently of the operation switches. Disabled kinds remain hidden
+  ordering blockers and skip enrichment/model work; unknown origins may require
+  a minimal invocation/registry lookup to identify their category. If all candidate
+  kinds are disabled, skip even that lookup. These switches do not grant access.
+- MCP classification cross-checks linked running invocations, registry exclusion,
+  connected-server identity, and the host's exact permission shape. Do not split
+  tool names at underscores to guess server identity. Resource server names and
+  URIs are matched verbatim; only absent/null/empty optional server values are omitted.
+  Collisions/ambiguous origins
+  remain manual. MCP resource operations can request `read`. Custom tools may ask
+  arbitrary or native-like permissions from inside execution; earlier code may
+  already have run. Never treat a custom `bash` permission as a native command.
 - `autoApprove` defaults false; `autoApproveDelaySeconds` defaults 15 and accepts
   integer 0–3600. Safe is the only rating eligible; partial evidence is not an
   additional veto. Each request needs its own full visible countdown. Cancel or
@@ -157,6 +186,36 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 
 ## Evidence and reviewer contract
 
+- `deadline.ts` owns shared remaining time and phase diagnostics. Optional context
+  gets at most 5 seconds/one third of remaining time and finishes before the first
+  filesystem probe starts its budget. `file-access.ts` gives each
+  request a shared 5-second/one-third filesystem budget, 500 ms path probes and
+  1.5-second captures; two outstanding evidence transactions per plugin instance.
+  Timed-out transactions retain their slots through actual settlement/cleanup.
+  Skip saturated work rather than queueing it; close late-opened handles and stop
+  aborted continuations. Parent aborts are never converted into optional omissions.
+  Kernel I/O is not guaranteed cancellable. In-memory edit diffs survive failed
+  canonicalization; unresolved aliases count independently with factual notices.
+- New tool/directory evidence has bounded plain JSON, 32 levels and 16,384 values.
+  Preserve mandatory arguments and exact permission scope or fail explicitly.
+  Omit optional definitions as whole sections with reasons. For native directory
+  access, optional metadata may be omitted while exact scope is retained; custom
+  permission metadata is mandatory because it can define the operation.
+  New variable JSON payloads share `maxEvidenceBytes`; common session/user context
+  and generated notices are outside it. Do not use `maxFiles` to limit JSON keys.
+- Read definitions only through the invocation host's public catalog. No direct
+  MCP calls, resource downloads, custom-module imports, or target file reads to
+  enrich MCP/custom/directory reviews. Directory scopes remain host-declared,
+  without canonical-target claims. Do not copy host/MCP credentials into evidence.
+  User-supplied arguments can contain private data and are documented as sent.
+
+- Native directory patch reviews retain bounded add/update/delete/move header
+  summaries and declared move destinations without contents, filesystem resolution,
+  or applying hunks. Relative paths stay relative to the invocation directory.
+  Scan at most 16 MiB/65,536 lines; missing or oversized mandatory summaries fail
+  analysis. Summaries share the JSON budget, not `maxFiles`. Omitted native edit
+  bodies set partial coverage; they do not erase the operation being authorized.
+
 - Discovery is bounded literal Python/shell tokenization, not shell evaluation.
   Supported literal `cat`/`head` operands are captured as full bounded snapshots,
   not as emulated command output. Unknown options/expansions stay unresolved.
@@ -183,7 +242,9 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Sum all format attempts; omit the footer if any attempt lacks valid counts.
   Cost uses the public host model catalog with exact endpoint/model matching,
   cache rates and context tiers; unknown pricing shows tokens only. Render in
-  theme textMuted after the report inside its scrollbox. No native usage writes.
+  theme textMuted after the report inside its scrollbox. Inline lifetime belongs
+  inside this valid-request-usage block, never alone while loading, failed, or
+  missing usage. The lifetime palette command remains independent. No native usage writes.
 - Lifetime accounting observes completed endpoint responses with valid usage before
   assessment validation, including correction attempts. Exclude canceled/missing-usage
   requests; preserve unpriced counts rather than treating them as free. Keep accounting

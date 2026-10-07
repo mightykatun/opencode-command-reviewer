@@ -5,12 +5,13 @@ import { mkdtemp, mkdir, writeFile, readFile, access, copyFile } from "node:fs/p
 import { execFileSync } from "node:child_process"
 import path from "node:path"
 import { tmpdir } from "node:os"
+import { pathToFileURL } from "node:url"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime } from "./smoke-runtime.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
 const scenario = process.argv[2] ?? "correction"
-assert.ok(["correction", "cancel", "error", "external", "edit", "write", "patch", "edit-cancel", "edit-config-error", "edit-disabled", "bash-disabled", "external-disabled", "auto-shell", "auto-cancel", "auto-scroll", "auto-edit", "auto-external", "auto-immediate", "auto-zero", "auto-unsafe", "auto-error", "auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow", "auto-manual", "auto-initially-hidden"].includes(scenario))
+assert.ok(["correction", "cancel", "error", "stalled-file", "external", "edit", "write", "patch", "edit-cancel", "edit-config-error", "edit-disabled", "bash-disabled", "external-disabled", "auto-shell", "auto-cancel", "auto-scroll", "auto-edit", "auto-external", "auto-immediate", "auto-zero", "auto-unsafe", "auto-error", "auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow", "auto-manual", "auto-initially-hidden"].includes(scenario))
 const auto = scenario.startsWith("auto-")
 const visibilityLoss = ["auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow"].includes(scenario)
 const autoDelay = scenario === "auto-zero" ? 0 : scenario === "auto-scroll" ? 25
@@ -110,9 +111,31 @@ execFileSync("git", ["init", "--quiet", project])
 const commandDirectory = isExternal ? path.join(temp, "outside") : project
 if (commandDirectory !== project) await mkdir(commandDirectory)
 await mkdir(path.join(temp, "config"))
+if (process.argv.includes("--seed-lifetime")) {
+  const ledger = path.join(temp, "state/opencode/opencode-reviewer/usage-v1")
+  await mkdir(ledger, { recursive: true })
+  await writeFile(path.join(ledger, "00000000-0000-0000-0000-000000000001.json"), JSON.stringify({ version: 1,
+    requests: 1, input: 10, output: 2, priced: 1, cost: 0.01, since: 1 }))
+}
 const source = 'from pathlib import Path\nfruits = ["apple", "pear"]\nprint(len(fruits))\nPath("executed-marker").write_text(str(len(fruits)))\n'
   + (auto ? 'import time\nwith Path("execution-log").open("a") as log:\n    log.write(str(time.time_ns() // 1000000) + "\\n")\n' : "")
 await writeFile(path.join(commandDirectory, "fruits.py"), source)
+const stalledFile = path.join(temp, "stalled-open-entered")
+if (scenario === "stalled-file") {
+  const base = path.join(temp, "reviewer-base.mjs")
+  await copyFile(pluginFile, base)
+  await writeFile(pluginFile, `
+import plugin, { withFileAccess } from ${JSON.stringify(pathToFileURL(base).href)}
+import { open, realpath, writeFile } from "node:fs/promises"
+export default { id: plugin.id, tui: withFileAccess({ realpath,
+  open: async (...args) => {
+    if (args[0] !== ${JSON.stringify(path.join(commandDirectory, "fruits.py"))}) return open(...args)
+    await writeFile(${JSON.stringify(stalledFile)}, "entered")
+    return new Promise(() => {})
+  }
+}) }
+`)
+}
 const editOriginals = { "note.txt": "before\n", "delete.txt": "DELETE-SENTINEL\n", "move.txt": "MOVE-SENTINEL\n" }
 if (isEdit) for (const [name, text] of Object.entries(editOriginals)) await writeFile(path.join(project, name), text)
 const toolName = scenario === "patch" ? "apply_patch" : scenario === "write" ? "write" : isEdit ? "edit" : "bash"
@@ -131,7 +154,6 @@ if (scenario === "edit" || configFailure) {
   if (configFailure) await writeFile(path.join(customPrompts, "PERMISSION-REVIEW-CONTRACT.md"), "disallowed override")
   else {
     await writeFile(path.join(customPrompts, "EDIT-REVIEW-PROMPT.md"), "CUSTOM EDIT FIXTURE: explain the proposed changes and omissions.")
-    await writeFile(path.join(customPrompts, "EDIT-REVIEW-CORRECTION.md"), "CUSTOM EDIT CORRECTION: {{validationError}}. Return valid assessment JSON.")
   }
 }
 const calls = []
@@ -162,7 +184,7 @@ const server = createServer(async (req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" })
         const content = correction && reviewerCalls === 1
           ? '{"safe":"yes","desc":"Incorrect boolean type."}'
-          : JSON.stringify({ safe: !["external", "patch", "auto-unsafe"].includes(scenario), desc: scenario === "auto-scroll" ? autoLongDescription : scenario === "correction" ? longDescription : isEdit ? "Proposed file changes. Partial coverage where diffs are omitted." : "Counts two fruit names, prints the count, and writes it to executed-marker." })
+          : JSON.stringify({ safe: !["external", "patch", "auto-unsafe", "stalled-file"].includes(scenario), desc: scenario === "stalled-file" ? "Source contents unavailable after a bounded file-access timeout." : scenario === "auto-scroll" ? autoLongDescription : scenario === "correction" ? longDescription : isEdit ? "Proposed file changes. Partial coverage where diffs are omitted." : "Counts two fruit names, prints the count, and writes it to executed-marker." })
         res.end(JSON.stringify({ choices: [{ message: { content, reasoning_content: "HIDDEN-REASONING-SENTINEL" } }],
           ...(withUsage ? { model: "review-fixture", usage: { prompt_tokens: 500, completion_tokens: 20 } } : {}),
         }))
@@ -237,6 +259,7 @@ try {
     $schema: "https://opencode.ai/tui.json",
     theme: scenario === "correction" ? "tokyonight" : "opencode",
     plugin: [[pluginFile, { baseURL: `http://127.0.0.1:${port}/review`, model: "review-fixture", apiKey: "fixture-review-key",
+      reviewExternalDirectories: scenario !== "external-disabled",
       ...(scenario === "edit" || configFailure ? { instructions: customPrompts } : {}),
       ...(scenario === "patch" ? { maxFiles: 2 } : {}),
       ...(scenario === "edit" || scenario === "bash-disabled" || scenario === "external-disabled" ? { reviewBash: false } : {}),
@@ -276,7 +299,7 @@ try {
     }
     throw new Error("Timed out waiting for expected terminal state")
   }
-  const expected = scenario === "error" || scenario === "auto-error" || configFailure ? "! Analysis unavailable" : ["external", "patch", "auto-unsafe"].includes(scenario) ? "✗ Unsafe" : "✓ Safe"
+  const expected = scenario === "error" || scenario === "auto-error" || configFailure ? "! Analysis unavailable" : ["external", "patch", "auto-unsafe", "stalled-file"].includes(scenario) ? "✗ Unsafe" : "✓ Safe"
   const spinnerFrame = (s) => s.split("\n").find((line) => /[■⬝]{8}/.test(line.slice(initialWidth - 42)))?.match(/[■⬝]{8}/)?.[0]
   const hasExpected = (s) => disabledReview ? !hasPanel(s) : heldReview ? !!spinnerFrame(s) : s.includes(expected)
   const hasPanel = (s) => /Permission analysis|Counts two fruit names|Analysis unavailable/.test(s)
@@ -577,6 +600,10 @@ try {
         assert.equal(sent.tool, "edit")
         assert.equal(sent.changes[0].path, path.join(project, "note.txt"))
         assert.match(sent.changes[0].diff, /-before\n\+after/)
+      } else if (sent.kind === "external-directory") {
+        assert.equal(sent.tool, "bash")
+        assert.deepEqual(sent.operation.input, toolInput)
+        assert.ok(!("files" in sent))
       } else {
         assert.equal(sent.command, "python3 fruits.py")
         assert.equal(sent.cwd, commandDirectory)
@@ -638,6 +665,21 @@ try {
     const formattingReady = (s) => scenario === "correction"
       ? s.includes("File: writes to executed-marker.") && s.includes("\\u001b[2J\\u202e") && s.includes("Documentation")
       : isEdit && !heldReview && !configFailure && !disabledReview ? s.includes("Proposed file changes") : scenario !== "external" || s.includes("Counts two fruit names")
+    if (scenario === "stalled-file") {
+      await until(async (s) => s.includes("Permission required") && !!spinnerFrame(s) && await access(stalledFile).then(() => true, () => false))
+      assert.equal(reviewerCalls, 0, "the filesystem stall precedes the model request")
+      const start = Date.now()
+      tmux("send-keys", "-t", "smoke", "C-p")
+      await until((s) => s.includes("Commands") && !hasPanel(s), 3000)
+      tmux("send-keys", "-t", "smoke", "Escape")
+      await until((s) => s.includes(expected) && s.includes("Source contents unavailable"), 5000)
+      assert.ok(Date.now() - start < 5000, "optional file I/O must not consume the 30-second review deadline")
+      assert.equal(reviewerCalls, 1)
+      const omitted = JSON.parse(calls.find((call) => call.url === "/review/chat/completions").body.messages[1].content).files[0]
+      assert.equal(omitted.contents, undefined)
+      assert.match(omitted.status, /File capture timed out/)
+      console.log("PASS stalled-file UI: palette remained interactive during stalled open; bounded omission reached reviewer")
+    }
     if (scenario === "cancel") {
       await until((s) => s.includes("Permission required") && reviewerCalls > 0)
       // Deliberately exceed the old six-second response race while the HTTP reply
@@ -696,10 +738,16 @@ try {
           assert.equal(sent.changes[0].path, path.join(project, "note.txt"))
           assert.match(sent.changes[0].diff, /-before\n\+after/)
         }
+      } else if (sent.kind === "external-directory") {
+        assert.equal(sent.tool, "bash")
+        assert.deepEqual(sent.operation.input, toolInput)
+        assert.equal(sent.location.instanceDirectory, project)
+        assert.equal(sent.permission.type, "external_directory")
+        assert.ok(!("files" in sent))
       } else {
         assert.equal(sent.command, "python3 fruits.py")
         assert.equal(sent.cwd, commandDirectory)
-        assert.equal(sent.files[0].contents, source)
+        assert.equal(sent.files[0].contents, scenario === "stalled-file" ? undefined : source)
         assert.equal(sent.execution.instanceDirectory, project)
         assert.equal(sent.execution.instanceWorktree, project)
         assert.equal(sent.execution.canonicalCwd, commandDirectory)
@@ -712,7 +760,7 @@ try {
     if (correction) {
       assert.equal(reviewerCalls, 2)
       const second = calls.filter((call) => call.url === "/review/chat/completions")[1].body
-      assert.match(second.messages[3].content, scenario === "edit" ? /CUSTOM EDIT CORRECTION/ : /Format validation failed/)
+      assert.match(second.messages[3].content, /Format validation failed/)
       assert.equal(second.messages[0].content, firstReview.body.messages[0].content, "prompts are a startup snapshot, not reloaded on correction")
       assert.match(screen, isEdit ? /Proposed file changes/ : /Counts two fruit names/)
       await sleep(400)
@@ -721,7 +769,7 @@ try {
     await writeFile(path.join(root, `.runtime/${scenario}-pending.txt`), screen)
     const styledScreen = tmux("capture-pane", "-p", "-e", "-t", "smoke")
     if (withUsage && scenario !== "correction") await assertUsage()
-    if (!withUsage) assert.doesNotMatch(screen.split("\n").map((line) => line.slice(initialWidth - 42)).join("\n"), /tokens in\/out: \d+\/\d+/, "missing endpoint usage must leave no footer")
+    if (!withUsage) assert.doesNotMatch(screen.split("\n").map((line) => line.slice(initialWidth - 42)).join("\n"), /tokens in\/out: \d+\/\d+|lifetime:/, "missing endpoint usage must leave no request or standalone lifetime footer")
     await writeFile(path.join(root, `.runtime/${scenario}-pending.ansi`), styledScreen)
     if (!disabledReview) assert.match(styledScreen.split("\n").find((line) => line.includes("Permission analysis")) ?? "", /\x1b\[1m/, "overlay heading should be bold")
     if (scenario === "correction" || scenario === "external") {
@@ -819,7 +867,7 @@ try {
       await until((s) => s.includes("Permission required") && s.includes("Shell command"), 10000)
       await sleep(2200)
       assertReviewLayout(capture(), initialWidth)
-      assert.equal(reviewerCalls, 0, "reviewBash=false suppresses both directory and bash stages")
+      assert.equal(reviewerCalls, 0, "disabled directory and bash switches suppress both stages")
       await assert.rejects(access(path.join(commandDirectory, "executed-marker")))
     }
     if (scenario === "cancel") {

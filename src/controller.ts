@@ -4,6 +4,7 @@ import type { Config } from "./config.js"
 import type { ApprovalTransport } from "./approval.js"
 import { isDeepStrictEqual } from "node:util"
 import { withDeadline } from "./reviewer.js"
+import { candidateEnabled, type ReviewOptions } from "./classification.js"
 
 export type AutoApproval = { status: "countdown"; seconds: number } | { status: "checking" | "allowing" | "cancelled" | "failed" }
 
@@ -26,7 +27,7 @@ const clock: ApprovalClock = {
   now: () => performance.now(),
   after: (ms, callback) => { const timer = setTimeout(callback, ms); return () => clearTimeout(timer) },
 }
-type Options = Pick<Config, "reviewBash" | "reviewEdits"> & Partial<Pick<Config, "autoApprove" | "autoApproveDelaySeconds">>
+type Options = ReviewOptions & Partial<Pick<Config, "autoApprove" | "autoApproveDelaySeconds">>
 export interface Approval extends ApprovalTransport {
   /** Recompute actual presentation/order, rather than trusting a stale UI effect. */
   visibleID(): string | undefined
@@ -148,13 +149,12 @@ export class Controller {
   asked(request: PermissionRequest) {
     if (this.stopped || this.entries.has(request.id)) return
     this.version++
-    const enabled = request.permission === "edit" ? this.options.reviewEdits
-      : (request.permission === "bash" || request.permission === "external_directory") && this.options.reviewBash
+    const enabled = candidateEnabled(request, this.options)
     const entry: Entry = {
       abort: new AbortController(),
       view: {
         request,
-        status: !enabled ? "unrelated" : request.permission === "external_directory" ? "identifying" : "analyzing",
+        status: enabled ? "identifying" : "unrelated",
       },
     }
     this.entries.set(request.id, entry)

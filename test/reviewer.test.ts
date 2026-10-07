@@ -9,15 +9,16 @@ import path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { parseConfig } from "../src/config.js"
 import { parseAssessment, review, withDeadline } from "../src/reviewer.js"
-import { BUILTIN_PROMPTS, CONTRACT, loadPrompts } from "../src/prompts.js"
+import { BUILTIN_PROMPTS, CONTRACT, CORRECTION, loadPrompts } from "../src/prompts.js"
 import { collectEditEvidence } from "../src/evidence.js"
-import type { Evidence } from "../src/types.js"
+import type { Evidence, ReviewEvidence } from "../src/types.js"
 import type { Usage } from "../src/usage.js"
 
 const evidence: Evidence = {
+  kind: "shell",
   command: "python fruits.py", cwd: "/external", userPrompt: "Count fruits",
   files: [{ filename: "fruits.py", status: "captured", contents: "print('pear')" }], limitations: [],
-  permission: { id: "request", type: "external_directory", patterns: ["/external/*"], always: ["/external/*"], metadata: { directories: ["/external"] }, tool: { messageID: "m", callID: "c" } },
+  permission: { id: "request", type: "bash", patterns: ["python fruits.py"], always: ["python *"], metadata: { command: "python fruits.py", workdir: "/external" }, tool: { messageID: "m", callID: "c" } },
   session: { root: { id: "root", parentID: null, directory: "/project/start", projectID: "repo", workspaceID: null }, current: null, currentProject: null, rootProject: { id: "repo", worktree: "/project", vcs: "git", name: "Initial repo" } },
   execution: { tool: "bash", requestedWorkdir: "/external", instanceDirectory: "/project/start", instanceWorktree: "/project", cwdSource: "absolute tool.workdir", canonicalCwd: "/external" },
 }
@@ -48,6 +49,9 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   assert.equal(cfg.maxEvidenceBytes, 131072)
   assert.equal(cfg.reviewBash, true)
   assert.equal(cfg.reviewEdits, true)
+  assert.equal(cfg.reviewMcp, false)
+  assert.equal(cfg.reviewCustomTools, false)
+  assert.equal(cfg.reviewExternalDirectories, false)
   assert.equal(cfg.autoApprove, false)
   assert.equal(cfg.autoApproveDelaySeconds, 15)
   for (const override of [ { baseURL: "file:///tmp" }, { baseURL: "https://secret@example.org" }, { model: "" }, { apiKeyEnv: "bad name" }, { timeoutMs: 0 }, { formatRetries: -1 }, { formatRetries: 1.2 }, { retries: 3 } ]) {
@@ -62,8 +66,8 @@ test("review switches are independent strict booleans with enabled defaults", ()
     assert.equal(config.reviewBash, reviewBash)
     assert.equal(config.reviewEdits, reviewEdits)
   }
-  for (const name of ["reviewBash", "reviewEdits", "autoApprove"] as const) {
-    assert.equal(parseConfig({ ...options, [name]: undefined })[name], name !== "autoApprove")
+  for (const name of ["reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove"] as const) {
+    assert.equal(parseConfig({ ...options, [name]: undefined })[name], name === "reviewBash" || name === "reviewEdits")
     for (const value of [true, false]) assert.equal(parseConfig({ ...options, [name]: value })[name], value)
     for (const value of [null, 0, 1, "true", "false", {}, []]) {
       assert.throws(() => parseConfig({ ...options, [name]: value }), { message: `${name} must be a boolean` })
@@ -288,7 +292,7 @@ test("format correction uses validation feedback and configurable retry count", 
   assert.deepEqual(requests.map((request) => request.target), Array(3).fill("/v1/chat/completions"))
   const prompt = (await readFile(new URL("../prompts/PERMISSION-REVIEW-PROMPT.md", import.meta.url), "utf8")).trim()
   const contract = (await readFile(new URL("../contracts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim()
-  const correction = (await readFile(new URL("../prompts/PERMISSION-REVIEW-CORRECTION.md", import.meta.url), "utf8")).trim()
+  const correction = (await readFile(new URL("../contracts/PERMISSION-REVIEW-CORRECTION.md", import.meta.url), "utf8")).trim()
   assert.match(correction, /\{\{validationError\}\}/)
   assert.equal(requests[0]!.body.messages[0].content, `${prompt}\n\n${contract}`)
   assert.equal(requests[1]!.body.messages[3].content, correction.replace("{{validationError}}", "Invalid assessment fields or types"))
@@ -393,7 +397,7 @@ test("redirects are not followed and cannot forward review evidence", async (t) 
   assert.equal(destination.requests.length, 0)
 })
 
-test("edit evidence uses its own assessment/correction prompts and preserves partial coverage on the wire", async (t) => {
+test("edit evidence uses its own assessment and fixed correction, retaining partial coverage", async (t) => {
   const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index % 2 ? '{"safe":false,"desc":"Partial review: deleted file content omitted."}' : '{"safe":"yes","desc":"bad type"}')))
   const edit = await collectEditEvidence({
     kind: "edit", tool: "apply_patch", userPrompt: "Update a setting", limitations: [], session: evidence.session,
@@ -408,7 +412,6 @@ test("edit evidence uses its own assessment/correction prompts and preserves par
   const customDir = await mkdtemp(path.join(tmpdir(), "review-prompts-"))
   t.after(() => rm(customDir, { recursive: true, force: true }))
   await writeFile(path.join(customDir, "EDIT-REVIEW-PROMPT.md"), "Custom edit instructions")
-  await writeFile(path.join(customDir, "EDIT-REVIEW-CORRECTION.md"), "Custom edit correction {{validationError}}")
   await writeFile(path.join(customDir, "PERMISSION-REVIEW-PROMPT.md"), "Shell-only guidance")
   const custom = await loadPrompts(customDir, signal())
   for (const prompts of [BUILTIN_PROMPTS, custom]) {
@@ -420,7 +423,7 @@ test("edit evidence uses its own assessment/correction prompts and preserves par
     assert.ok(!JSON.stringify(requests[index]!.body).includes("raw secret aggregate"))
     assert.ok(!JSON.stringify(requests[index]!.body).includes("omitted secret"))
     assert.ok(!JSON.stringify(requests[index]!.body).includes("Shell-only guidance"))
-    assert.equal(requests[index + 1]!.body.messages[3].content, prompts.edit.correction.replace("{{validationError}}", "Invalid assessment fields or types"))
+    assert.equal(requests[index + 1]!.body.messages[3].content, CORRECTION.replace("{{validationError}}", "Invalid assessment fields or types"))
     assert.deepEqual(JSON.parse(requests[index + 1]!.body.messages[1].content), edit)
     assert.equal(requests[index]!.body.tools, undefined)
     assert.equal(requests[index]!.body.stream, false)
@@ -453,6 +456,27 @@ test("provider reasoning stays outside the displayed assessment", async (t) => {
     content: '{"safe":true,"desc":"Visible effects."}', reasoning: "hidden reasoning", reasoning_content: "hidden thoughts",
   } }] })))
   assert.deepEqual(await review(evidence, config, signal()), { safe: true, desc: "Visible effects." })
+})
+
+test("new review kinds select only their own instructions and share the fixed correction contract", async (t) => {
+  const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index % 2 ? '{"safe":true,"desc":"Bounded operation."}' : "bad format")))
+  for (const kind of ["mcp", "custom", "external-directory"] as const) for (const autoApprove of [false, true]) {
+    const common = { kind, tool: "fixture_tool", userPrompt: "Perform fixture operation", limitations: [],
+      permission: { ...evidence.permission!, type: kind === "external-directory" ? "external_directory" : "fixture_tool" }, location: { instanceDirectory: "/fixture", instanceWorktree: "/fixture" }, partial: false }
+    const input: ReviewEvidence = kind === "external-directory"
+      ? { ...common, kind, operation: { input: { path: "/outside" }, inputStatus: "complete" }, permission: { ...common.permission, metadataStatus: "complete" } }
+      : { ...common, kind, input: { target: "fixture" }, origin: { source: kind === "mcp" ? "host MCP routing" : "host registry", server: null }, definition: { status: "unavailable", reason: "Fixture definition unavailable" } }
+    const start = requests.length
+    await review(input, { ...config, autoApprove }, signal())
+    assert.equal(requests.length - start, 2)
+    for (const request of requests.slice(start)) {
+      assert.equal(request.body.messages[0].content, [BUILTIN_PROMPTS[kind].instructions, ...(autoApprove ? [BUILTIN_PROMPTS.extraCareful] : []), CONTRACT].join("\n\n"))
+      assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
+      assert.equal(request.body.tools, undefined)
+      assert.equal(request.body.stream, false)
+    }
+    assert.equal(requests[start + 1]!.body.messages[3].content, CORRECTION.replace("{{validationError}}", "Invalid JSON"))
+  }
 })
 
 test("review usage sums correction requests outside assessment JSON and evidence", async (t) => {

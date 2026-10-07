@@ -1,9 +1,9 @@
 import path from "node:path"
 import { constants } from "node:fs"
-import { open, realpath } from "node:fs/promises"
 import { parse } from "shell-quote"
 import type { EditChange, EditContext, EditEvidence, Evidence, FileEvidence, Limits } from "./types.js"
 import { FileLimit, diffDelta, omittedFile } from "./files.js"
+import { fileAccess, fileFailure, type FileScope } from "./file-access.js"
 
 const VARIABLE = "\u0000UNRESOLVED_VARIABLE\u0000"
 const python = /^python(?:[23](?:\.\d+)*)?$/
@@ -282,7 +282,7 @@ export function discover(command: string, cwd: string | null, depth = 0): {
   return { references, limitations }
 }
 
-async function capture(reference: Reference, budget: number, signal: AbortSignal): Promise<FileEvidence> {
+async function capture(reference: Reference, budget: number, signal: AbortSignal, scope: FileScope): Promise<FileEvidence> {
   const result: FileEvidence = { filename: reference.filename, status: "unavailable" }
   if (!reference.cwd && !path.isAbsolute(reference.filename)) return { ...result, status: "working directory unresolved; contents not provided" }
   // Do not normalize `..` before the filesystem traverses preceding symlinks.
@@ -290,68 +290,75 @@ async function capture(reference: Reference, budget: number, signal: AbortSignal
   result.path = filename
   signal.throwIfAborted()
   try {
-    const canonical = await realpath(filename)
+    const canonical = await scope.canonical(filename)
     signal.throwIfAborted()
-    const handle = await open(canonical, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW)
-    try {
-      const before = await handle.stat()
-      if (!before.isFile()) return { ...result, status: "not a regular file; contents not provided" }
-      if (before.size > budget) return { ...result, status: "file too large for remaining evidence budget; contents not provided; assess risk accordingly" }
-      // Keep an overflow-probe byte even for empty or exact-budget files. Stat
-      // size is only an initial estimate: short reads and growth still need EOF.
-      let buffer = Buffer.alloc(before.size + 1)
-      let size = 0
-      while (size <= budget) {
+    if (!canonical.path) return { ...result, status: `cannot read file (${canonical.reason}); contents not provided` }
+    return await scope.capture(async (signal, io) => {
+      const handle = await io.open(canonical.path!, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW)
+      try {
         signal.throwIfAborted()
-        if (size === buffer.length) {
-          const larger = Buffer.alloc(Math.min(budget + 1, buffer.length * 2))
-          buffer.copy(larger, 0, 0, size)
-          buffer = larger
+        const before = await handle.stat()
+        signal.throwIfAborted()
+        if (!before.isFile()) return { ...result, status: "not a regular file; contents not provided" }
+        if (before.size > budget) return { ...result, status: "file too large for remaining evidence budget; contents not provided; assess risk accordingly" }
+        // Keep an overflow-probe byte even for empty or exact-budget files. Stat
+        // size is only an initial estimate: short reads and growth still need EOF.
+        let buffer = Buffer.alloc(before.size + 1)
+        let size = 0
+        while (size <= budget) {
+          signal.throwIfAborted()
+          if (size === buffer.length) {
+            const larger = Buffer.alloc(Math.min(budget + 1, buffer.length * 2))
+            buffer.copy(larger, 0, 0, size)
+            buffer = larger
+          }
+          const read = await handle.read(buffer, size, buffer.length - size, size)
+          signal.throwIfAborted()
+          if (!read.bytesRead) break
+          size += read.bytesRead
         }
-        const read = await handle.read(buffer, size, buffer.length - size, size)
-        if (!read.bytesRead) break
-        size += read.bytesRead
-      }
-      if (size > budget) return { ...result, status: "file grew beyond evidence budget; contents not provided" }
-      const after = await handle.stat()
-      if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-        return { ...result, status: "file changed while being read; contents not provided" }
-      }
-      let contents: string
-      // ignoreBOM disables BOM stripping, preserving both source bytes and shebang position.
-      try { contents = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, size)) }
-      catch { return { ...result, status: "not valid UTF-8 source; contents not provided" } }
-      if (contents.includes("\u0000")) return { ...result, status: "binary content; contents not provided" }
-      // Direct executable paths qualify only if extension or shebang identifies Python/shell.
-      if (reference.executable && !/\.(py|sh|bash|zsh|ksh)$/.test(filename) && !/^#![^\n]*(?:\bpython[\d.]*|\b(?:ba|da|k|z)?sh)\b/.test(contents)) {
-        return { ...result, status: "direct executable is not identifiable as Python/shell source; contents not provided" }
-      }
-      return { ...result, status: "captured", contents }
-    } finally { await handle.close() }
+        if (size > budget) return { ...result, status: "file grew beyond evidence budget; contents not provided" }
+        const after = await handle.stat()
+        signal.throwIfAborted()
+        if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+          return { ...result, status: "file changed while being read; contents not provided" }
+        }
+        let contents: string
+        // ignoreBOM disables BOM stripping, preserving both source bytes and shebang position.
+        try { contents = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, size)) }
+        catch { return { ...result, status: "not valid UTF-8 source; contents not provided" } }
+        if (contents.includes("\u0000")) return { ...result, status: "binary content; contents not provided" }
+        // Direct executable paths qualify only if extension or shebang identifies Python/shell.
+        if (reference.executable && !/\.(py|sh|bash|zsh|ksh)$/.test(filename) && !/^#![^\n]*(?:\bpython[\d.]*|\b(?:ba|da|k|z)?sh)\b/.test(contents)) {
+          return { ...result, status: "direct executable is not identifiable as Python/shell source; contents not provided" }
+        }
+        return { ...result, status: "captured", contents }
+      } finally { await handle.close() }
+    })
   } catch (error) {
     signal.throwIfAborted()
-    const code = (error as NodeJS.ErrnoException).code
-    return { ...result, status: `cannot read file (${code ?? "filesystem error"}); contents not provided` }
+    return { ...result, status: `cannot read file (${fileFailure(error)}); contents not provided` }
   }
 }
 
 export async function collectEvidence(
-  input: Omit<Evidence, "files" | "limitations"> & { limitations?: string[] },
+  input: Omit<Evidence, "kind" | "files" | "limitations"> & { kind?: "shell"; limitations?: string[] },
   limits: Limits,
   signal: AbortSignal,
+  scope: FileScope = fileAccess.scope(signal),
 ): Promise<Evidence> {
   signal.throwIfAborted()
   const commandBytes = Buffer.byteLength(input.command)
   if (commandBytes > limits.maxEvidenceBytes) throw new Error("Command exceeds configured evidence budget")
   const discovery = discover(input.command, input.cwd)
-  const evidence: Evidence = { ...input, files: [], limitations: [
+  const evidence: Evidence = { ...input, kind: "shell", files: [], limitations: [
     ...(input.limitations ?? []),
     "Only literal Python/shell source and supported cat/head file operands are collected. Files are full review-time snapshots, not command output. Imports, dependencies, other runtimes and calls inside source files are not recursively inspected.",
     ...discovery.limitations,
   ] }
   if (!input.userPrompt) evidence.limitations.push("User prompt unavailable.")
   let remaining = limits.maxEvidenceBytes - commandBytes
-  const limit = new FileLimit(limits.maxFiles)
+  const limit = new FileLimit(limits.maxFiles, scope)
   const selected = new Map<string | symbol, { reference: Reference; filename: string | null; withinLimit: boolean; aliases: string[] }>()
   for (const reference of discovery.references) {
     signal.throwIfAborted()
@@ -369,20 +376,21 @@ export async function collectEvidence(
       evidence.files.push({ filename: reference.filename, ...(filename ? { path: filename } : {}), ...(aliases.length ? { aliases } : {}), status: "file-count limit reached", warning: omittedFile(filename ?? reference.filename) })
       continue
     }
-    const file = await capture(reference, remaining, signal)
+    const file = await capture(reference, remaining, signal, scope)
     if (aliases.length) file.aliases = aliases
     if (file.contents === undefined) file.warning = omittedFile(file.path ?? file.filename)
     evidence.files.push(file)
     remaining -= Buffer.byteLength(file.contents ?? "")
   }
   signal.throwIfAborted()
+  evidence.limitations.push(...limit.limitations)
   return evidence
 }
 
 /** Use host-computed diffs, never apply edits or duplicate unbounded tool input. */
-export async function collectEditEvidence(input: EditContext, limits: Limits, signal: AbortSignal): Promise<EditEvidence> {
+export async function collectEditEvidence(input: EditContext, limits: Limits, signal: AbortSignal, scope: FileScope = fileAccess.scope(signal)): Promise<EditEvidence> {
   signal.throwIfAborted()
-  const { metadata, ...scope } = input.permission
+  const { metadata, ...permissionScope } = input.permission
   const limitations = [...input.limitations,
     "Proposed diffs come from the pending host permission, not from applying edits. Full files, dependencies and post-approval formatter changes are not inspected; host diffs may normalize whitespace or omit BOMs.",
   ]
@@ -393,7 +401,7 @@ export async function collectEditEvidence(input: EditContext, limits: Limits, si
   if (!files.length) limitations.push("Per-file patch metadata unavailable; affected changes could not be enumerated.")
   let remaining = limits.maxEvidenceBytes
   const changes: EditChange[] = []
-  const limit = new FileLimit(limits.maxFiles)
+  const limit = new FileLimit(limits.maxFiles, scope)
   for (let index = 0; index < files.length; index++) {
     signal.throwIfAborted()
     const file = record(files[index])
@@ -427,10 +435,11 @@ export async function collectEditEvidence(input: EditContext, limits: Limits, si
   const partial = !changes.length || changes.some((change) => change.status === "omitted")
   if (partial) limitations.push("Edit evidence is incomplete. Omitted changes are not assessed by the supplied diffs; do not assume the whole proposal is safe.")
   if (!input.userPrompt) limitations.push("User prompt unavailable.")
+  limitations.push(...limit.limitations)
   signal.throwIfAborted()
   return {
     kind: "edit", tool: input.tool, userPrompt: input.userPrompt, session: input.session,
     location: input.location, changes, partial, limitations,
-    permission: { ...scope, metadataStatus: "Host change metadata normalized into changes; raw metadata and tool input are omitted to avoid duplicate or unbounded change text." },
+    permission: { ...permissionScope, metadataStatus: "Host change metadata normalized into changes; raw metadata and tool input are omitted to avoid duplicate or unbounded change text." },
   }
 }

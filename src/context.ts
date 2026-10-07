@@ -1,14 +1,43 @@
 import path from "node:path"
-import { realpath } from "node:fs/promises"
-import type { Message, OpencodeClient, Part, PermissionRequest, Project, Session } from "@opencode-ai/sdk/v2"
-import type { EditContext, Evidence, ProjectLocation, SessionLocation } from "./types.js"
+import type { AssistantMessage, Message, OpencodeClient, Part, PermissionRequest, Project, Session } from "@opencode-ai/sdk/v2"
+import type { EditContext, Evidence, ProjectLocation, SessionLocation, ToolDefinition } from "./types.js"
+import { fileAccess, type FileScope } from "./file-access.js"
+import { DeadlineError, remainingTime, withDeadline } from "./deadline.js"
 
 export interface ContextReader {
   session(id: string, signal: AbortSignal): Promise<Session | undefined>
   messages(id: string, signal: AbortSignal): Promise<readonly { info: Message; parts: Part[] }[]>
   message(sessionID: string, messageID: string, signal: AbortSignal): Promise<{ info: Message; parts: Part[] } | undefined>
   projects(signal: AbortSignal): Promise<readonly Project[]>
+  toolIDs?(signal: AbortSignal): Promise<readonly string[]>
+  definition?(info: AssistantMessage, tool: string, signal: AbortSignal): Promise<ToolDefinition | undefined>
+  mcpServers?(): readonly { name: string; status: string }[]
 }
+
+export async function loadInvocation(request: PermissionRequest, reader: ContextReader, signal: AbortSignal) {
+  signal.throwIfAborted()
+  if (!request.tool) throw new Error("Pending tool linkage unavailable")
+  const message = await reader.message(request.sessionID, request.tool.messageID, signal)
+  signal.throwIfAborted()
+  if (!message || message.info.role !== "assistant" || message.info.sessionID !== request.sessionID || message.info.id !== request.tool.messageID) {
+    throw new Error("Pending tool message unavailable or mismatched")
+  }
+  const parts = message.parts.filter((part) => part.type === "tool" && part.callID === request.tool!.callID)
+  const part = parts[0]
+  if (parts.length !== 1 || !part || part.type !== "tool" || part.sessionID !== request.sessionID
+    || part.messageID !== request.tool.messageID || part.state.status !== "running"
+    || !part.state.input || typeof part.state.input !== "object" || Array.isArray(part.state.input)) {
+    throw new Error("Pending tool arguments unavailable or mismatched")
+  }
+  const invocation = message.info.path
+  return { message, info: message.info, tool: part.tool, input: part.state.input,
+    location: {
+      instanceDirectory: typeof invocation?.cwd === "string" && path.isAbsolute(invocation.cwd) ? invocation.cwd : null,
+      instanceWorktree: typeof invocation?.root === "string" && path.isAbsolute(invocation.root) ? invocation.root : null,
+    },
+  }
+}
+export type Invocation = Awaited<ReturnType<typeof loadInvocation>>
 
 type CommandContext = Omit<Evidence, "files">
 
@@ -49,7 +78,7 @@ export function latestUserPrompt(messages: readonly { info: Message; parts: Part
   return findUserPrompt(messages, sessionID)?.text ?? null
 }
 
-export async function loadContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal): Promise<CommandContext | null> {
+export async function loadContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal, scope: FileScope = fileAccess.scope(signal)): Promise<CommandContext | null> {
   if (request.permission !== "bash" && request.permission !== "external_directory") return null
   if (!request.tool) {
     if (request.permission === "external_directory") return null
@@ -85,22 +114,25 @@ export async function loadContext(request: PermissionRequest, reader: ContextRea
       : instanceDirectory ? requestedWorkdir ? "tool.workdir relative to assistant.path.cwd" : "assistant.path.cwd" : "unavailable",
     canonicalCwd: null,
   }
-  if (cwd) {
-    try { execution.canonicalCwd = await realpath(cwd) }
-    catch { limitations.push("Execution directory could not be canonicalized; cwd is the declared launch path, not a verified physical path.") }
-  }
+  // Finish optional host lookups before the first filesystem probe starts its
+  // shared budget. Slow conversation reads must not starve healthy source I/O.
   const conversation = await loadConversationContext(request, reader, signal)
+  if (cwd) {
+    const canonical = await scope.canonical(cwd)
+    execution.canonicalCwd = canonical.path
+    if (!canonical.path) limitations.push(`Execution directory could not be canonicalized (${canonical.reason}); cwd is the declared launch path, not a verified physical path.`)
+  }
   return {
-    ...conversation, command, cwd, execution,
+    ...conversation, kind: "shell", command, cwd, execution,
     limitations: [...limitations, ...conversation.limitations],
     permission: permissionContext(request),
   }
 }
 
-function permissionContext(request: PermissionRequest): NonNullable<Evidence["permission"]> {
+export function permissionContext(request: PermissionRequest, clone = true): NonNullable<Evidence["permission"]> {
   return {
-    id: request.id, type: request.permission, patterns: [...request.patterns], always: [...request.always],
-    metadata: structuredClone(request.metadata), tool: request.tool ? { ...request.tool } : null,
+    id: request.id, type: request.permission, patterns: clone ? [...request.patterns] : request.patterns, always: clone ? [...request.always] : request.always,
+    metadata: clone ? structuredClone(request.metadata) : request.metadata, tool: request.tool ? { ...request.tool } : null,
   }
 }
 
@@ -127,37 +159,45 @@ export async function loadEditContext(request: PermissionRequest, reader: Contex
   return { ...conversation, kind: "edit", tool: part.tool, location, permission: permissionContext(request) }
 }
 
-async function loadConversationContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal) {
+export async function loadConversationContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal) {
   signal.throwIfAborted()
   const limitations: string[] = []
   let current: Session | undefined
   let root: Session | undefined
   let prompt: string | null = null
-  try {
-    const loaded = await reader.session(request.sessionID, signal)
+  const contextEnd = performance.now() + Math.min(5000, remainingTime(signal) / 3)
+  const contextMs = () => Math.max(0, contextEnd - performance.now())
+  const ancestry = async (contextSignal: AbortSignal) => {
+    const loaded = await reader.session(request.sessionID, contextSignal)
+    contextSignal.throwIfAborted()
     if (loaded?.id !== request.sessionID) throw new Error("Session mismatch")
     current = loaded
     let ancestor = current
     const seen = new Set<string>()
     while (ancestor.parentID) {
-      signal.throwIfAborted()
+      contextSignal.throwIfAborted()
       if (seen.has(ancestor.id) || seen.size >= 16) throw new Error("Parent chain incomplete")
       seen.add(ancestor.id)
       const expected: string = ancestor.parentID
-      const parent = await reader.session(expected, signal)
+      const parent = await reader.session(expected, contextSignal)
+      contextSignal.throwIfAborted()
       if (parent?.id !== expected) throw new Error("Parent session unavailable")
       ancestor = parent
     }
     root = ancestor
-    prompt = latestUserPrompt(await reader.messages(root.id, signal), root.id)
-  } catch (error) {
+    const messages = await reader.messages(root.id, contextSignal)
+    contextSignal.throwIfAborted()
+    prompt = latestUserPrompt(messages, root.id)
+  }
+  try { await withDeadline(signal, contextMs(), ancestry, "Conversation context lookup") }
+  catch (error) {
     signal.throwIfAborted()
-    limitations.push(error instanceof HistoryIncompleteError ? error.message : "Some session ancestry or root-user-prompt context is unavailable.")
+    limitations.push(error instanceof HistoryIncompleteError || error instanceof DeadlineError ? error.message : "Some session ancestry or root-user-prompt context is unavailable.")
   }
   let projects: readonly Project[] = []
   if (current || root) {
-    try { projects = await reader.projects(signal) }
-    catch { signal.throwIfAborted(); limitations.push("OpenCode project metadata unavailable.") }
+    try { projects = await withDeadline(signal, contextMs(), (contextSignal) => reader.projects(contextSignal), "Project context lookup") }
+    catch (error) { signal.throwIfAborted(); limitations.push(error instanceof DeadlineError ? error.message : "OpenCode project metadata unavailable.") }
   }
   const sessionLocation = (s: Session | undefined): SessionLocation | null => s ? {
     id: s.id, parentID: s.parentID ?? null, directory: s.directory, projectID: s.projectID, workspaceID: s.workspaceID ?? null,

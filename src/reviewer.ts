@@ -2,6 +2,8 @@ import type { Config } from "./config.js"
 import type { Assessment, ReviewEvidence, ReviewResult } from "./types.js"
 import { BUILTIN_PROMPTS, CONTRACT, correctionPrompt, type PromptSet } from "./prompts.js"
 import { responseUsage, sumUsage, type PricingLookup, type Usage } from "./usage.js"
+import { reviewStage } from "./deadline.js"
+export { withDeadline } from "./deadline.js"
 
 class FormatError extends Error {}
 
@@ -14,28 +16,6 @@ export function parseAssessment(content: string): Assessment {
     throw new FormatError("Invalid assessment fields or types")
   }
   return { safe: record.safe, desc: record.desc.trim() }
-}
-
-/** One deadline for context collection, filesystem reads, requests and corrections. */
-export async function withDeadline<T>(parent: AbortSignal, ms: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
-  parent.throwIfAborted()
-  const deadline = new AbortController()
-  const signal = AbortSignal.any([parent, deadline.signal])
-  const timer = setTimeout(() => deadline.abort(new Error("Review timed out")), ms)
-  let abort: () => void = () => {}
-  try {
-    return await Promise.race([
-      Promise.resolve().then(() => { signal.throwIfAborted(); return run(signal) }),
-      new Promise<never>((_, reject) => {
-        abort = () => reject(signal.reason)
-        signal.addEventListener("abort", abort, { once: true })
-        if (signal.aborted) abort()
-      }),
-    ])
-  } finally {
-    clearTimeout(timer)
-    signal.removeEventListener("abort", abort)
-  }
 }
 
 const MAX_RESPONSE_BYTES = 65536
@@ -72,7 +52,7 @@ export async function review(
 ): Promise<ReviewResult> {
   const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)
   if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset or empty`)
-  const prompt = evidence.kind === "edit" ? prompts.edit : prompts.shell
+  const prompt = prompts[evidence.kind]
   const messages = [
     { role: "system", content: [prompt.instructions, ...(config.autoApprove ? [prompts.extraCareful] : []), CONTRACT].join("\n\n") },
     { role: "user", content: JSON.stringify(evidence) },
@@ -80,6 +60,7 @@ export async function review(
   let usage: Usage | undefined
   for (let attempt = 0; attempt <= config.formatRetries; attempt++) {
     signal.throwIfAborted()
+    reviewStage(signal, "Reviewer response")
     let response: Response
     try {
       response = await fetcher(`${config.baseURL}/chat/completions`, {
@@ -96,13 +77,14 @@ export async function review(
       throw new Error(`Reviewer HTTP ${response.status}`)
     }
     let envelope: unknown
+    reviewStage(signal, "Reviewer response body")
     try { envelope = JSON.parse(await responseText(response, signal)) }
     catch (error) {
       signal.throwIfAborted()
       if (error instanceof SyntaxError) throw new Error("Reviewer returned invalid API JSON")
       throw error
     }
-    signal.throwIfAborted()
+    reviewStage(signal, "Assessment validation")
     let currentUsage: Usage | undefined
     try { currentUsage = responseUsage(envelope, config.model, pricing) }
     catch { currentUsage = responseUsage(envelope, config.model) }
@@ -130,7 +112,7 @@ export async function review(
       if (attempt === config.formatRetries) throw new Error("Reviewer response format invalid after configured attempts")
       messages.push(
         { role: "assistant", content: message.content },
-        { role: "user", content: correctionPrompt(error.message, prompt.correction) },
+        { role: "user", content: correctionPrompt(error.message) },
       )
     }
   }

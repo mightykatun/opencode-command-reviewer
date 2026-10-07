@@ -2,9 +2,10 @@ import { createEffect, createMemo, createSignal, Index, Match, onCleanup, Show, 
 import { CliRenderEvents, CodeRenderable, RGBA, SyntaxStyle, type BoxRenderable, type MarkdownRenderable, type Renderable } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { parseConfig, type Config } from "./config.js"
-import { loadContext, loadEditContext, loadRootMessages, type ContextReader } from "./context.js"
+import { loadRootMessages, type ContextReader } from "./context.js"
 import { Controller, displayText, visibleReview, type View } from "./controller.js"
-import { collectEditEvidence, collectEvidence } from "./evidence.js"
+import { evaluateEvidence } from "./evaluate.js"
+import { FileAccess, type FileIO } from "./file-access.js"
 import { review, withDeadline } from "./reviewer.js"
 import { BUILTIN_PROMPTS, loadPrompts } from "./prompts.js"
 import { approvalTransport } from "./approval.js"
@@ -125,10 +126,22 @@ function contextReader(api: TuiPluginApi): ContextReader {
       return result.data
     },
     messages: (sessionID, signal) => loadRootMessages(api.client, sessionID, location().directory, signal),
+    toolIDs: async (signal) => {
+      const result = await api.client.tool.ids(location(), { signal })
+      if (!result.data) throw new Error("Tool registry unavailable")
+      return result.data
+    },
+    definition: async (info, tool, signal) => {
+      if (typeof info.providerID !== "string" || typeof info.modelID !== "string") return
+      const result = await api.client.tool.list({ ...location(), provider: info.providerID, model: info.modelID }, { signal })
+      const matches = result.data?.filter((item) => item.id === tool)
+      return matches?.length === 1 ? matches[0] : undefined
+    },
+    mcpServers: () => api.state.mcp(),
   }
 }
 
-const tui: TuiPlugin = async (api, options) => {
+async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], fileIO?: FileIO) {
   let config: Config | undefined
   let reviewOptions: Config | undefined
   let prompts = BUILTIN_PROMPTS
@@ -136,7 +149,7 @@ const tui: TuiPlugin = async (api, options) => {
   try {
     const parsed = parseConfig(options)
     reviewOptions = parsed
-    prompts = await withDeadline(api.lifecycle.signal, parsed.timeoutMs, (signal) => loadPrompts(parsed.instructions, signal))
+    prompts = await withDeadline(api.lifecycle.signal, parsed.timeoutMs, (signal) => loadPrompts(parsed.instructions, signal), "Prompt loading")
     config = parsed
   } catch (error) { configError = error instanceof Error ? error.message : "Invalid configuration" }
   api.lifecycle.signal.throwIfAborted()
@@ -144,17 +157,13 @@ const tui: TuiPlugin = async (api, options) => {
   const [views, setViews] = createSignal<View[]>([])
   const [sidebar, setSidebar] = createSignal<{ sessionID: string; token: symbol }>()
   const reader = contextReader(api)
+  const files = new FileAccess(fileIO)
   let visibleApproval: () => string | undefined = () => undefined
   const controller = new Controller(async (request, parent, onIdentified) => {
     return withDeadline(parent, config?.timeoutMs ?? 30000, async (signal) => {
-      const context = request.permission === "edit"
-        ? await loadEditContext(request, reader, signal)
-        : await loadContext(request, reader, signal)
-      if (!context) return null
-      onIdentified()
-      if (!config) throw new Error(configError)
-      const evidence = context.kind === "edit" ? await collectEditEvidence(context, config, signal) : await collectEvidence(context, config, signal)
-      return review(evidence, config, signal, undefined, undefined, prompts,
+      const evidence = await evaluateEvidence(request, reader, reviewOptions ?? { reviewBash: true, reviewEdits: true }, config, configError, signal, onIdentified, files)
+      if (!evidence) return null
+      return review(evidence, config!, signal, undefined, undefined, prompts,
         (model) => modelPricing(api.state.provider, config!.baseURL, model), lifetime.record)
     })
   }, setViews, reviewOptions, { ...approvalTransport(api.client, api.state.path.directory), visibleID: () => visibleApproval() })
@@ -284,14 +293,14 @@ const tui: TuiPlugin = async (api, options) => {
                     }>
                       {(assessment) => <>
                         <ReviewDescription api={api} text={assessment().desc} ref={(value) => { description = value }} />
-                        <Show when={assessment().usage}>{(usage) =>
+                        <Show when={assessment().usage}>{(usage) => <>
                           <text marginTop={1} fg={api.theme.current.textMuted} width="100%" flexShrink={0}>{usageText(usage())}</text>
-                        }</Show>
+                          <Show when={lifetime.text()}>{(text) =>
+                            <text fg={api.theme.current.textMuted} width="100%" flexShrink={0}>{text()}</text>
+                          }</Show>
+                        </>}</Show>
                       </>}
                     </Show>
-                    <Show when={lifetime.text()}>{(text) =>
-                      <text marginTop={view().assessment?.usage ? 0 : 1} fg={api.theme.current.textMuted} width="100%" flexShrink={0}>{text()}</text>
-                    }</Show>
                   </scrollbox>
                   <ReviewFooter api={api} view={view()} controller={controller} enabled={config?.autoApprove === true} />
                 </box>
@@ -304,4 +313,9 @@ const tui: TuiPlugin = async (api, options) => {
   })
 }
 
-export default { id: "opencode-reviewer", tui } satisfies TuiPluginModule
+/** A read-only evidence adapter seam for isolated runtime fixtures/embedding. */
+export function withFileAccess(io: FileIO): TuiPlugin {
+  return (api, options) => reviewTui(api, options, io)
+}
+
+export default { id: "opencode-reviewer", tui: (api, options) => reviewTui(api, options) } satisfies TuiPluginModule

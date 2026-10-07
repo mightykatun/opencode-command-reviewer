@@ -1,26 +1,39 @@
-import { realpath } from "node:fs/promises"
 import path from "node:path"
+import { fileAccess, type FileScope } from "./file-access.js"
 
 /** Count distinct target files, including unavailable candidates, once per review. */
 export class FileLimit {
   private files = new Map<string | symbol, boolean>()
   private paths = new Map<string, string>()
-  constructor(private maxFiles: number) {}
+  constructor(private maxFiles: number, private scope?: FileScope) {}
+  readonly limitations = new Set<string>()
 
   async consider(filename: string | null, signal: AbortSignal) {
     signal.throwIfAborted()
     let key: string | symbol = Symbol()
     if (filename !== null) {
-      key = this.paths.get(filename) ?? await realpath(filename).catch(async () =>
-        // A new file can still have a canonical existing parent (including aliases).
-        await realpath(path.dirname(filename)).then((parent) => `${parent}/${path.basename(filename)}`).catch(() =>
-        // Remove redundant separators/dot segments, but never collapse symlink/.. .
-        filename.replace(/\/+/g, "/").replace(/\/(?:\.\/)+/g, "/").replace(/\/\.$/, "")))
+      key = this.paths.get(filename) ?? await this.resolve(filename, signal)
       this.paths.set(filename, key)
     }
     signal.throwIfAborted()
     if (!this.files.has(key)) this.files.set(key, this.files.size < this.maxFiles)
     return { key, withinLimit: this.files.get(key)! }
+  }
+
+  private async resolve(filename: string, signal: AbortSignal) {
+    const scope = this.scope ??= fileAccess.scope(signal)
+    const result = await scope.canonical(filename)
+    if (result.path) return result.path
+    let reason = result.reason
+    // Only missing files justify a parent lookup. Stalls/errors do not start more I/O.
+    if (result.reason === "ENOENT") {
+      const parent = await scope.canonical(path.dirname(filename))
+      if (parent.path) return `${parent.path}/${path.basename(filename)}`
+      reason = parent.reason
+    }
+    this.limitations.add(`Canonical path unavailable for ${JSON.stringify(filename)} (${reason}); unresolved aliases count separately.`)
+    // Never collapse symlink-sensitive parent components.
+    return filename.replace(/\/+/g, "/").replace(/\/(?:\.\/)+/g, "/").replace(/\/\.$/, "")
   }
 }
 

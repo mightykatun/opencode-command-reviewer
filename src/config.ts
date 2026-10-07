@@ -9,6 +9,9 @@ export interface Config extends Limits {
   instructions?: string
   reviewBash: boolean
   reviewEdits: boolean
+  reviewMcp: boolean
+  reviewCustomTools: boolean
+  reviewExternalDirectories: boolean
   autoApprove: boolean
   autoApproveDelaySeconds: number
   formatRetries: number
@@ -16,7 +19,7 @@ export interface Config extends Limits {
 }
 
 export function parseConfig(options: Record<string, unknown> = {}): Config {
-  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "reviewBash", "reviewEdits", "autoApprove", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
+  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
   for (const key of Object.keys(options)) if (!keys.has(key)) throw new Error(`Unknown opencode-reviewer setting: ${key}`)
   const text = (name: string, optional = false): string | undefined => {
     const value = options[name]
@@ -54,6 +57,8 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     apiKey: text("apiKey", true),
     instructions,
     reviewBash: boolean("reviewBash"), reviewEdits: boolean("reviewEdits"),
+    reviewMcp: boolean("reviewMcp", false), reviewCustomTools: boolean("reviewCustomTools", false),
+    reviewExternalDirectories: boolean("reviewExternalDirectories", false),
     autoApprove: boolean("autoApprove", false),
     autoApproveDelaySeconds: number("autoApproveDelaySeconds", 15, 0, 3600),
     formatRetries: number("formatRetries", 1, 0, 100),

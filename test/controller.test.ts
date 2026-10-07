@@ -2,10 +2,17 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { setTimeout as sleep } from "node:timers/promises"
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
-import { Controller, displayText, visibleReview, type View } from "../src/controller.js"
+import { Controller as CoreController, displayText, visibleReview, type View } from "../src/controller.js"
 import { loadContext, type ContextReader } from "../src/context.js"
 import { withDeadline } from "../src/reviewer.js"
 import type { Assessment } from "../src/types.js"
+
+// Existing directory lifecycle cases opt into the newly independent category.
+class Controller extends CoreController {
+  constructor(...args: ConstructorParameters<typeof CoreController>) {
+    super(args[0], args[1], { reviewBash: true, reviewEdits: true, reviewExternalDirectories: true, ...args[2] }, args[3], args[4])
+  }
+}
 
 const request = (id: string, sessionID = "root", permission = "bash"): PermissionRequest => ({ id, sessionID, permission, patterns: [id], metadata: {}, always: [], tool: { callID: id, messageID: id } })
 const result: Assessment = { safe: true, desc: "Counts fruit." }
@@ -147,7 +154,7 @@ for (const removal of ["reply", "dispose"] as const) {
 }
 
 for (const failure of ["missing message", "reader error", "timeout"] as const) {
-  test(`pre-identification ${failure} stays hidden and blocks later reviews while native bash errors remain visible`, { timeout: 2000 }, async (t) => {
+  test(`pre-identification ${failure} stays hidden for every unverified origin and blocks later reviews`, { timeout: 2000 }, async (t) => {
     const reader = contextReader(async () => {
       if (failure === "missing message") return undefined
       if (failure === "reader error") throw new Error("Context unavailable")
@@ -187,10 +194,9 @@ for (const failure of ["missing message", "reader error", "timeout"] as const) {
     assert.equal(visibleReview(controller.views, "root", getSession), undefined)
     controller.replied("a-directory")
     const visible = visibleReview(controller.views, "root", getSession)
-    assert.equal(visible?.request.id, "b-bash")
-    assert.equal(visible?.status, "unavailable")
-    assert.equal(visible?.error, expected)
-    assert.equal(visible?.assessment, undefined)
+    assert.equal(visible, undefined)
+    assert.equal(controller.views[0]?.status, "unidentified")
+    assert.equal(controller.views[0]?.error, expected)
     controller.replied("b-bash")
     assert.equal(visibleReview(controller.views, "root", getSession)?.request.id, "c-later")
   })
@@ -217,7 +223,7 @@ test("context-identified directory review failures remain visible without a rati
 
 test("errors are visible without a rating; unrelated requests are never evaluated", async () => {
   let calls = 0
-  const controller = new Controller(async () => { calls++; throw new Error("Reviewer HTTP 503") }, () => {})
+  const controller = new Controller(async (_, __, identified) => { calls++; identified(); throw new Error("Reviewer HTTP 503") }, () => {})
   controller.asked(request("a", "root", "read"))
   controller.asked(request("b"))
   controller.asked(request("c", "root", "edit"))
@@ -230,12 +236,13 @@ test("errors are visible without a rating; unrelated requests are never evaluate
   controller.dispose()
 })
 
-test("display follows root/direct-child approval order and hides unrelated sessions", () => {
+test("display follows root/direct-child approval order and hides unrelated sessions", async () => {
   const controller = new Controller(async () => result, () => {})
   const sessions = new Map([ ["root", { id: "root" }], ["sub", { id: "sub", parentID: "root" }], ["other", { id: "other" }] ])
   const get = (id: string) => sessions.get(id)
   controller.asked(request("sub-request", "sub"))
   controller.asked(request("other-request", "other"))
+  await tick()
   assert.equal(visibleReview(controller.views, "root", get)?.request.id, "sub-request")
   assert.equal(visibleReview(controller.views, "sub", get), undefined)
   assert.equal(visibleReview(controller.views, undefined, get), undefined)
@@ -430,19 +437,19 @@ for (const removal of ["reply", "delete", "dispose"] as const) {
 }
 
 test("disabled review types never evaluate but still block later native permissions", async (t) => {
-  for (const reviewBash of [true, false]) for (const reviewEdits of [true, false]) {
+  for (const reviewBash of [true, false]) for (const reviewEdits of [true, false]) for (const reviewExternalDirectories of [true, false]) {
     const evaluated: string[] = []
     const controller = new Controller(async (req, _, identified) => {
       evaluated.push(req.id); identified(); return result
-    }, () => {}, { reviewBash, reviewEdits })
+    }, () => {}, { reviewBash, reviewEdits, reviewExternalDirectories })
     t.after(() => controller.dispose())
     const requests = [request("0-read", "root", "read"), request("1-directory", "root", "external_directory"), request("2-edit", "root", "edit"), request("3-bash")]
     controller.reconcile(requests, controller.revision)
     await tick()
-    assert.deepEqual(evaluated, [ ...(reviewBash ? ["1-directory"] : []), ...(reviewEdits ? ["2-edit"] : []), ...(reviewBash ? ["3-bash"] : []) ])
+    assert.deepEqual(evaluated, [ ...(reviewExternalDirectories ? ["1-directory"] : []), ...(reviewEdits ? ["2-edit"] : []), ...(reviewBash ? ["3-bash"] : []) ])
     assert.equal(visibleReview(controller.views, "root", getSession), undefined)
     controller.replied("0-read")
-    assert.equal(visibleReview(controller.views, "root", getSession)?.request.id, reviewBash ? "1-directory" : undefined)
+    assert.equal(visibleReview(controller.views, "root", getSession)?.request.id, reviewExternalDirectories ? "1-directory" : undefined)
     controller.replied("1-directory")
     assert.equal(visibleReview(controller.views, "root", getSession)?.request.id, reviewEdits ? "2-edit" : undefined)
     controller.replied("2-edit")
@@ -452,4 +459,28 @@ test("disabled review types never evaluate but still block later native permissi
     await tick()
     assert.equal(evaluated.length, count)
   }
+})
+
+test("new review categories are opt-in in the production controller defaults", async () => {
+  let calls = 0
+  const controller = new CoreController(async () => { calls++; return result }, () => {})
+  for (const permission of ["external_directory", "fixture_mcp", "custom-allowance", "read"]) controller.asked(request(permission, "root", permission))
+  await tick()
+  assert.equal(calls, 0)
+  assert.ok(controller.views.every((view) => view.status === "unrelated"))
+  controller.dispose()
+})
+
+test("native-like permission names remain hidden until origin and enablement are identified", async () => {
+  let finish!: (value: Assessment | null) => void
+  const controller = new CoreController(async () => new Promise((resolve) => { finish = resolve }), () => {})
+  controller.asked(request("custom-bash", "root", "bash"))
+  assert.equal(controller.views[0]?.status, "identifying")
+  assert.equal(visibleReview(controller.views, "root", getSession), undefined)
+  await tick()
+  finish(null) // Classification discovers a disabled custom-tool permission.
+  await tick()
+  assert.equal(controller.views[0]?.status, "unrelated")
+  assert.equal(visibleReview(controller.views, "root", getSession), undefined)
+  controller.dispose()
 })

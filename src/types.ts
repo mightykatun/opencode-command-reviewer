@@ -12,8 +12,10 @@ export interface FileEvidence {
   warning?: string
 }
 
+export type ReviewKind = "shell" | "edit" | "mcp" | "custom" | "external-directory"
+
 export interface Evidence {
-  kind?: "shell"
+  kind: "shell"
   command: string
   cwd: string | null
   userPrompt: string | null
@@ -71,7 +73,54 @@ export type EditContext = Omit<EditEvidence, "changes" | "partial" | "permission
   permission: NonNullable<Evidence["permission"]>
 }
 
-export type ReviewEvidence = Evidence | EditEvidence
+export type PermissionEvidence = NonNullable<Evidence["permission"]>
+export type InvocationLocation = EditEvidence["location"]
+export interface ToolDefinition { id: string; description: string; parameters: unknown }
+
+export interface ToolContext {
+  kind: "mcp" | "custom"
+  tool: string
+  input: Record<string, unknown>
+  origin: { source: "host MCP routing" | "host registry"; server: string | null }
+  definition?: ToolDefinition
+  permission: PermissionEvidence
+  location: InvocationLocation
+  userPrompt: string | null
+  session?: Evidence["session"]
+  limitations: string[]
+}
+
+export interface ToolEvidence extends Omit<ToolContext, "definition"> {
+  definition: { status: "included"; source: "public host tool catalog"; description: string; parameters: unknown }
+    | { status: "unavailable" | "omitted"; reason: string }
+  partial: boolean
+}
+
+export interface DirectoryContext {
+  kind: "external-directory"
+  tool: string
+  input: Record<string, unknown>
+  native: boolean
+  permission: PermissionEvidence
+  location: InvocationLocation
+  userPrompt: string | null
+  session?: Evidence["session"]
+  limitations: string[]
+}
+
+export interface PatchOperation {
+  operation: "add" | "update" | "delete" | "move"
+  path: string
+  movePath?: string
+}
+
+export interface DirectoryEvidence extends Omit<DirectoryContext, "input" | "permission" | "native"> {
+  operation: { input: Record<string, unknown>; inputStatus: string; patchOperations?: PatchOperation[] }
+  permission: Omit<PermissionEvidence, "metadata"> & { metadata?: Record<string, unknown>; metadataStatus: string }
+  partial: boolean
+}
+
+export type ReviewEvidence = Evidence | EditEvidence | ToolEvidence | DirectoryEvidence
 
 export interface SessionLocation {
   id: string
