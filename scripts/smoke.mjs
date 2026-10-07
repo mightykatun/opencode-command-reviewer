@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process"
 import path from "node:path"
 import { tmpdir } from "node:os"
 import { setTimeout as sleep } from "node:timers/promises"
+import { smokeRuntime } from "./smoke-runtime.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
 const scenario = process.argv[2] ?? "correction"
@@ -206,8 +207,8 @@ const server = createServer(async (req, res) => {
     res.end(String(error))
   }
 })
-const socket = `opencode-reviewer-${process.pid}`
-const tmux = (...args) => execFileSync("tmux", ["-L", socket, ...args], { encoding: "utf8" })
+const runtime = await smokeRuntime(temp)
+const tmux = runtime.tmux
 let screen = ""
 let tmuxStarted = false
 const failAfterListen = process.argv.includes("--fail-after-listen")
@@ -261,7 +262,7 @@ try {
   }
   await mkdir(path.join(root, ".runtime"), { recursive: true })
   tmuxStarted = true
-  tmux("new-session", "-d", "-s", "smoke", "-x", String(initialWidth), "-y", scenario === "cancel" ? "24" : "40", "-c", project,
+  await runtime.start("-d", "-s", "smoke", "-x", String(initialWidth), "-y", scenario === "cancel" ? "24" : "40", "-c", project,
     "env", ...Object.entries(env).map(([k, v]) => `${k}=${v}`),
     process.env.OPENCODE_BIN ?? "opencode", project,
     "--prompt", userPrompt)
@@ -306,14 +307,23 @@ try {
   const assertUsage = async () => {
     const input = correction ? 1000 : 500, output = correction ? 40 : 20
     if (scenario === "correction" || scenario === "auto-scroll") {
-      for (let i = 0; i < 20 && !capture().includes("cost: $"); i++) { mouse(65, 140, 20); await sleep(40) }
+      for (let i = 0; i < 30 && !capture().includes("lifetime:"); i++) { mouse(65, 140, 20); await sleep(40) }
     }
-    await until((s) => s.includes(`in: ${input} tokens`) && s.includes(`out: ${output} tokens`), 5000)
+    await until((s) => s.includes(`tokens in/out: ${input}/${output}`), 5000)
     const ansi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
-    assert.equal(styleAt(ansi, `in: ${input} tokens`).fg, styleAt(ansi, "fullscreen").fg, "usage footer must use the active theme's muted color")
+    assert.equal(styleAt(ansi, `tokens in/out: ${input}/${output}`).fg, styleAt(ansi, "fullscreen").fg, "usage footer must use the active theme's muted color")
     const sidebarText = screen.split("\n").map((line) => line.slice(118)).join("\n")
     if (knownPricing) assert.match(sidebarText, correction ? /cost: \$0\.0011/ : /cost: \$0\.0005/)
-    else assert.doesNotMatch(sidebarText, /cost:/, "unknown pricing must not invent a cost")
+    else assert.doesNotMatch(sidebarText, /cost:\s*\$/, "unknown pricing must not invent a cost")
+    await until((s) => s.includes(knownPricing ? "lifetime: $" : "lifetime: cost unavailable"), 5000)
+    const lifetimeAnsi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
+    assert.equal(styleAt(lifetimeAnsi, "lifetime:").fg, styleAt(lifetimeAnsi, "fullscreen").fg)
+    if (knownPricing) {
+      const rows = screen.split("\n").map((line) => line.slice(118).trim())
+      const first = rows.findIndex((line) => line === `tokens in/out: ${input}/${output}`)
+      assert.match(rows[first + 1] ?? "", /^cost: \$/)
+      assert.match(rows[first + 2] ?? "", /^lifetime: \$/)
+    }
     await writeFile(path.join(root, `.runtime/${scenario}-usage.ansi`), ansi)
   }
   if (auto) {
@@ -696,7 +706,7 @@ try {
     await writeFile(path.join(root, `.runtime/${scenario}-pending.txt`), screen)
     const styledScreen = tmux("capture-pane", "-p", "-e", "-t", "smoke")
     if (withUsage && scenario !== "correction") await assertUsage()
-    if (!withUsage) assert.doesNotMatch(screen.split("\n").map((line) => line.slice(initialWidth - 42)).join("\n"), /in: \d+ tokens/, "missing endpoint usage must leave no footer")
+    if (!withUsage) assert.doesNotMatch(screen.split("\n").map((line) => line.slice(initialWidth - 42)).join("\n"), /tokens in\/out: \d+\/\d+/, "missing endpoint usage must leave no footer")
     await writeFile(path.join(root, `.runtime/${scenario}-pending.ansi`), styledScreen)
     if (!disabledReview) assert.match(styledScreen.split("\n").find((line) => line.includes("Permission analysis")) ?? "", /\x1b\[1m/, "overlay heading should be bold")
     if (scenario === "correction" || scenario === "external") {
@@ -847,6 +857,30 @@ try {
       assert.ok(!hasPanel(screen), "reopening the sidebar after cancellation must not restore the review")
     }
     assert.match(capture(), /Context/, "native sidebar sections should remain after the temporary review is removed")
+    if (scenario === "edit") {
+      const showLifetime = async () => {
+        tmux("send-keys", "-t", "smoke", "C-p")
+        await until((s) => s.includes("Commands"), 10000)
+        tmux("send-keys", "-t", "smoke", "-l", "Reviewer: Lifetime usage")
+        await until((s) => (s.match(/Reviewer: Lifetime usage/g) ?? []).length >= 2, 10000)
+        tmux("send-keys", "-t", "smoke", "Enter")
+        await until((s) => s.includes("Reviewer lifetime usage") && s.includes("2 completed requests with usage"), 10000)
+        assert.match(screen, /lifetime: \$0\.0011/)
+        assert.match(screen, /tokens in\/out: 1000\/40/)
+        assert.match(screen, /Pricing available: 2\/2 requests/)
+        assert.doesNotMatch(screen, /Permission analysis/)
+      }
+      await showLifetime()
+      await writeFile(path.join(root, ".runtime/edit-lifetime-dialog.txt"), screen)
+      // Reuse the isolated HOME/state, but start a new host/plugin instance without a prompt.
+      tmux("kill-session", "-t", "smoke")
+      await runtime.start("-d", "-s", "smoke", "-x", "160", "-y", "40", "-c", project,
+        "env", ...Object.entries(env).map(([k, v]) => `${k}=${v}`), process.env.OPENCODE_BIN ?? "opencode", project)
+      await until((s) => s.includes("Ask anything"), 90000)
+      await showLifetime()
+      assert.equal(reviewerCalls, 2, "opening lifetime stats and restarting must not make reviewer requests")
+      await writeFile(path.join(root, ".runtime/edit-lifetime-restarted.txt"), screen)
+    }
     await writeFile(path.join(root, `.runtime/${scenario}-resolved.txt`), capture())
     await writeFile(path.join(root, `.runtime/${scenario}-requests.json`), JSON.stringify(calls, null, 2))
     console.log(`PASS ${scenario}: native approval, exact evidence, advisory behavior, panel cleanup${scenario === "cancel" ? ", >6s held response, observed HTTP cancellation, released late response and clean sidebar remount at 80x24" : scenario === "correction" ? ", long-analysis wheel/drag, live scrollbar theme and native fullscreen layering" : ""}. Isolated files: ${temp}`)
@@ -867,7 +901,7 @@ try {
   console.error(`Requests received: ${calls.length}`)
   throw error
 } finally {
-  if (tmuxStarted) { try { tmux("kill-server") } catch {} }
+  await runtime.dispose()
   releaseReview = undefined
   server.closeAllConnections()
   await new Promise((resolve) => server.close(resolve))

@@ -16,7 +16,7 @@ test("shell and edit prompts use their named files and share the separate fixed 
     assert.match(correction, /\{\{validationError\}\}/)
     assert.match(assessment, /one-time allowance \(Allow once\)/)
     assert.match(assessment, /Do not explain, warn about, or rate.*Allow always/)
-    assert.match(correction, /without commentary about Allow always/)
+    assert.match(correction, kind === "shell" ? /bash-only closing permission guidance.*without assessing hypothetical future grants/ : /without commentary about Allow always/)
     assert.ok(correctionPrompt("feedback $&", correction).includes("feedback $&"))
   }
   assert.equal(CONTRACT, (await readFile(new URL("../contracts/PERMISSION-REVIEW-CONTRACT.md", import.meta.url), "utf8")).trim())

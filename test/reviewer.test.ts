@@ -12,6 +12,7 @@ import { parseAssessment, review, withDeadline } from "../src/reviewer.js"
 import { BUILTIN_PROMPTS, CONTRACT, loadPrompts } from "../src/prompts.js"
 import { collectEditEvidence } from "../src/evidence.js"
 import type { Evidence } from "../src/types.js"
+import type { Usage } from "../src/usage.js"
 
 const evidence: Evidence = {
   command: "python fruits.py", cwd: "/external", userPrompt: "Count fruits",
@@ -475,4 +476,44 @@ test("missing usage in either correction response omits the report usage line", 
     })))
     assert.deepEqual(await review(evidence, config, signal()), { safe: true, desc: "Visible effects." })
   }
+})
+
+test("lifetime observer receives each completed attempt even when the final assessment fails", async (t) => {
+  const { config } = await endpoint(t, (_, res) => res.end(JSON.stringify({
+    usage: { prompt_tokens: 100, completion_tokens: 10 }, choices: [{ message: { content: "bad format" } }],
+  })))
+  const observed: Usage[] = []
+  await assert.rejects(review(evidence, config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, (usage) => observed.push(usage)), /format invalid/)
+  assert.deepEqual(observed, [{ input: 100, output: 10 }, { input: 100, output: 10 }])
+})
+
+test("completed invalid envelopes retain reported usage; accounting failures cannot break reviews", async (t) => {
+  const observed: Usage[] = []
+  const invalid = await endpoint(t, (_, res) => res.end(JSON.stringify({ usage: { prompt_tokens: 100, completion_tokens: 10 } })))
+  await assert.rejects(review(evidence, invalid.config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, (usage) => observed.push(usage)), /one completion/)
+  assert.equal(observed.length, 1)
+  const valid = await endpoint(t, (_, res) => res.end(JSON.stringify({
+    usage: { prompt_tokens: 100, completion_tokens: 10 }, choices: [{ message: { content: '{"safe":true,"desc":"Bounded effects."}' } }],
+  })))
+  const result = await review(evidence, valid.config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, (usage) => {
+    usage.input = 999
+    throw new Error("storage failure")
+  })
+  assert.deepEqual(result, { safe: true, desc: "Bounded effects.", usage: { input: 100, output: 10 } })
+  const unpriced = await review(evidence, valid.config, signal(), fetch, {}, BUILTIN_PROMPTS,
+    () => { throw new Error("catalog unavailable") }, (usage) => observed.push(usage))
+  assert.deepEqual(unpriced, result)
+  assert.deepEqual(observed.at(-1), { input: 100, output: 10 })
+})
+
+test("missing usage, HTTP errors, and cancellation produce no lifetime usage records", async (t) => {
+  let observations = 0
+  const observe = () => { observations++ }
+  const missing = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Bounded effects."}')))
+  await review(evidence, missing.config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, observe)
+  const error = await endpoint(t, (_, res) => { res.writeHead(503); res.end("Unavailable") })
+  await assert.rejects(review(evidence, error.config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, observe), /HTTP 503/)
+  const held = await endpoint(t, () => {})
+  await assert.rejects(withDeadline(signal(), 100, (s) => review(evidence, held.config, s, fetch, {}, BUILTIN_PROMPTS, undefined, observe)), /timed out/)
+  assert.equal(observations, 0)
 })

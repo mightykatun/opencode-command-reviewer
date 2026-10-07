@@ -1,6 +1,6 @@
 {
   "name": "opencode-reviewer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Safety reviews and optional one-time auto-approval for OpenCode shell and edit permissions",
   "type": "module",
   "repository": {
@@ -35,6 +35,7 @@
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
+    "test:runtime-cleanup": "node --test test/smoke-runtime.test.mjs",
     "test:runtime": "node scripts/smoke.mjs correction && node scripts/smoke.mjs cancel && node scripts/smoke.mjs error && node scripts/smoke.mjs external && node scripts/smoke.mjs edit && node scripts/smoke.mjs write && node scripts/smoke.mjs patch && node scripts/smoke.mjs edit-cancel && node scripts/smoke.mjs edit-config-error && node scripts/smoke.mjs edit-disabled && node scripts/smoke.mjs bash-disabled && node scripts/smoke.mjs external-disabled && node scripts/smoke.mjs auto-shell && node scripts/smoke.mjs auto-cancel && node scripts/smoke.mjs auto-scroll && node scripts/smoke.mjs auto-edit && node scripts/smoke.mjs auto-external && node scripts/smoke.mjs auto-immediate && node scripts/smoke.mjs auto-zero && node scripts/smoke.mjs auto-unsafe && node scripts/smoke.mjs auto-error && node scripts/smoke.mjs auto-hide && node scripts/smoke.mjs auto-dialog && node scripts/smoke.mjs auto-fullscreen && node scripts/smoke.mjs auto-narrow && node scripts/smoke.mjs auto-manual && node scripts/smoke.mjs auto-initially-hidden",
     "check:package": "node scripts/check-package.mjs",
     "check": "npm run typecheck && npm test && npm run build"

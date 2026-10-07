@@ -1,5 +1,9 @@
 # Maintainer guide
 
+## Writing style
+
+- NEVER use em dashes.
+
 ## Scope and integration
 
 - Target OpenCode **1.18.34**, local Linux terminal TUI. Other clients, remote
@@ -25,6 +29,7 @@ Requires Node.js 22+ and npm. Run commands from the repository root:
 npm ci --ignore-scripts
 npm run check          # typecheck -> node:test via tsx -> build
 npm run test:runtime   # requires an up-to-date dist/tui.js; does NOT build
+npm run test:runtime-cleanup # fast tmux interruption/isolation checks, no model or build
 npm run check:package  # builds twice, compares hashes, checks exact package contents
 ```
 
@@ -46,6 +51,11 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   the edit scenario approves a harmless temporary text replacement. Auto-mode
   fixtures likewise authorize only their isolated harmless commands/edits.
   These tests verify integration mechanics, not a live model's judgment accuracy.
+- Runtime fixtures use a private tmux socket inside each isolated temp directory.
+  A detached IPC supervisor owns session startup and cleans up on owner exit,
+  including SIGINT, SIGTERM and SIGKILL. Always create/restart sessions through
+  the supervisor so a late startup cannot race cleanup. Never kill shared/default
+  tmux servers or discover cleanup targets by broad process-name matching.
 - Documentation-only changes need reference/format review, not runtime/model tests.
 - `npm pack` rebuilds via `prepack`. `.github/workflows/release.yml` runs on published
   GitHub releases (including prereleases), validates `v<package.json version>` and
@@ -174,6 +184,14 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Cost uses the public host model catalog with exact endpoint/model matching,
   cache rates and context tiers; unknown pricing shows tokens only. Render in
   theme textMuted after the report inside its scrollbox. No native usage writes.
+- Lifetime accounting observes completed endpoint responses with valid usage before
+  assessment validation, including correction attempts. Exclude canceled/missing-usage
+  requests; preserve unpriced counts rather than treating them as free. Keep accounting
+  failures separate from review outcomes. Store only numeric totals/timestamps in
+  per-instance atomic snapshots under the public host state directory, never in the
+  checkout or native session store. Flush queued writes on disposal after aborting
+  controller work. The palette command uses the public `palette` namespace; refresh
+  its totals on open, and do not replace a dismissed dialog after asynchronous reads.
 - Use non-streaming Chat Completions with textual JSON evidence; no tool calling or
   provider-specific JSON mode. Instruction overrides cannot replace the fixed
   evidence/output contract: exactly `{"safe": boolean, "desc": "nonempty text"}`.
@@ -186,6 +204,7 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - All static model guidance lives in `prompts/`, fixed contracts in `contracts/`.
   Review only the current one-time allowance, not hypothetical Allow always
   grants. Preserve exact metadata, but ignore proposed remembered patterns for
-  the rating. Shared `EXTRA-CAREFUL-REVIEW-PROMPT.md` is overridable with normal
+  the rating. Bash-only closing guidance may remind users to prefer Allow once;
+  it must not certify future grants. Shared `EXTRA-CAREFUL-REVIEW-PROMPT.md` is overridable with normal
   fallback/validation, included only in auto mode, and never announces automation.
   Add no automation metadata or plugin notices to either model's conversation.

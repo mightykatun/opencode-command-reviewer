@@ -10,6 +10,7 @@ import { BUILTIN_PROMPTS, loadPrompts } from "./prompts.js"
 import { approvalTransport } from "./approval.js"
 import { reviewSyntaxStyles, scannerFrame, SCANNER_FRAME_COUNT, SCANNER_INTERVAL_MS } from "./appearance.js"
 import { modelPricing, usageText } from "./usage.js"
+import { lifetimeTracker } from "./lifetime-view.js"
 
 function ReviewLoading(props: { api: TuiPluginApi }) {
   const [frame, setFrame] = createSignal(0)
@@ -128,6 +129,7 @@ const tui: TuiPlugin = async (api, options) => {
     config = parsed
   } catch (error) { configError = error instanceof Error ? error.message : "Invalid configuration" }
   api.lifecycle.signal.throwIfAborted()
+  const lifetime = lifetimeTracker(api)
   const [views, setViews] = createSignal<View[]>([])
   const [sidebar, setSidebar] = createSignal<{ sessionID: string; token: symbol }>()
   const reader = contextReader(api)
@@ -142,7 +144,7 @@ const tui: TuiPlugin = async (api, options) => {
       if (!config) throw new Error(configError)
       const evidence = context.kind === "edit" ? await collectEditEvidence(context, config, signal) : await collectEvidence(context, config, signal)
       return review(evidence, config, signal, undefined, undefined, prompts,
-        (model) => modelPricing(api.state.provider, config!.baseURL, model))
+        (model) => modelPricing(api.state.provider, config!.baseURL, model), lifetime.record)
     })
   }, setViews, reviewOptions, { ...approvalTransport(api.client, api.state.path.directory), visibleID: () => visibleApproval() })
 
@@ -170,11 +172,12 @@ const tui: TuiPlugin = async (api, options) => {
   const interval = setInterval(() => void refresh(), 2000)
   api.event.on("session.idle", () => void refresh())
   api.event.on("session.error", () => void refresh())
-  api.lifecycle.onDispose(() => {
+  api.lifecycle.onDispose(async () => {
     stopped = true
     clearInterval(interval)
     setSidebar(undefined)
     controller.dispose()
+    await lifetime.flush()
   })
 
   api.slots.register({
@@ -275,6 +278,9 @@ const tui: TuiPlugin = async (api, options) => {
                         }</Show>
                       </>}
                     </Show>
+                    <Show when={lifetime.text()}>{(text) =>
+                      <text marginTop={view().assessment?.usage ? 0 : 1} fg={api.theme.current.textMuted} width="100%" flexShrink={0}>{text()}</text>
+                    }</Show>
                   </scrollbox>
                   <ReviewFooter api={api} view={view()} controller={controller} enabled={config?.autoApprove === true} />
                 </box>

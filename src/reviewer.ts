@@ -68,6 +68,7 @@ export async function review(
   environment: NodeJS.ProcessEnv = process.env,
   prompts: PromptSet = BUILTIN_PROMPTS,
   pricing?: PricingLookup,
+  onUsage?: (usage: Usage) => void,
 ): Promise<ReviewResult> {
   const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)
   if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset or empty`)
@@ -101,6 +102,13 @@ export async function review(
       if (error instanceof SyntaxError) throw new Error("Reviewer returned invalid API JSON")
       throw error
     }
+    signal.throwIfAborted()
+    let currentUsage: Usage | undefined
+    try { currentUsage = responseUsage(envelope, config.model, pricing) }
+    catch { currentUsage = responseUsage(envelope, config.model) }
+    // A completed HTTP response can be billable even if its assessment is invalid.
+    // Accounting is observational: it must never change review/permission outcomes.
+    if (currentUsage) { try { onUsage?.({ ...currentUsage }) } catch { /* The observer owns persistence diagnostics. */ } }
     const choices = (envelope as { choices?: unknown })?.choices
     if (!Array.isArray(choices) || choices.length !== 1) throw new Error("Reviewer API must return one completion")
     const choice = choices[0]
@@ -115,7 +123,6 @@ export async function review(
       throw new Error("Reviewer API did not return a text assessment")
     }
     signal.throwIfAborted()
-    const currentUsage = responseUsage(envelope, config.model, pricing)
     usage = attempt === 0 ? currentUsage : sumUsage(usage, currentUsage)
     try { return { ...parseAssessment(message.content), ...(usage ? { usage } : {}) } }
     catch (error) {

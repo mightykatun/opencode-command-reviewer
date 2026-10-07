@@ -51,5 +51,5 @@ export function sumUsage(previous: Usage | undefined, next: Usage | undefined): 
 }
 
 export function usageText(usage: Usage): string {
-  return `in: ${usage.input} tokens | out: ${usage.output} tokens${usage.cost === undefined ? "" : ` | cost: $${usage.cost.toFixed(4)}`}`
+  return `tokens in/out: ${usage.input}/${usage.output}${usage.cost === undefined ? "" : `\ncost: $${usage.cost.toFixed(4)}`}`
 }

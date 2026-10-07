@@ -13,19 +13,35 @@ mkdir -p opencode-reviewer
 tar -xzf /path/to/downloaded-asset.tgz -C opencode-reviewer --strip-components=1
 ```
 
-**2. Add the plugin** to `~/.config/opencode/tui.json` or `.opencode/tui.json`, preserving existing entries. Replace the path, API base URL, and model:
+**2. Add the plugin** to `~/.config/opencode/tui.json` or `.opencode/tui.json`, preserving existing entries. This example includes every option. Replace the placeholder paths, endpoint, model and authentication values; remove optional settings you do not use:
 
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": [["/absolute/path/to/opencode-reviewer/dist/tui.js", {
-    "baseURL": "https://api.example.com/v1",
-    "model": "your-model"
-  }]]
+  "plugin": [
+    [
+      "/absolute/path/to/opencode-reviewer/dist/tui.js",
+      {
+        "baseURL": "https://api.example.com/v1",
+        "model": "your-model",
+        "apiKey": "your-api-key",
+        "apiKeyEnv": "OPENCODE_REVIEWER_API_KEY",
+        "instructions": "/absolute/path/to/reviewer-prompts",
+        "reviewBash": true,
+        "reviewEdits": true,
+        "autoApprove": false,
+        "autoApproveDelaySeconds": 15,
+        "formatRetries": 1,
+        "timeoutMs": 30000,
+        "maxFiles": 6,
+        "maxEvidenceBytes": 131072
+      }
+    ]
+  ]
 }
 ```
 
-Use a local or hosted **OpenAI-compatible Chat Completions endpoint**. The plugin appends `/chat/completions`. For authentication, add `"apiKeyEnv": "OPENCODE_REVIEWER_API_KEY"` and set that environment variable before launch.
+Use a local or hosted **OpenAI-compatible Chat Completions endpoint**. The plugin appends `/chat/completions`. `apiKey` takes precedence over `apiKeyEnv`; remove `apiKey` to use the environment variable, and set it before launch. Remove both for an unauthenticated endpoint. Remove `instructions` to use built-in prompts, or point it at an existing custom prompt directory.
 
 **Restart OpenCode.** The release bundle needs no dependency installation. The plugin reviews requests that OpenCode asks about; configure permission rules in `opencode.json`, for example `"permission": { "bash": "ask", "edit": "ask" }`.
 
@@ -61,7 +77,19 @@ Shell evidence includes literal Python/shell sources and supported `cat`/`head` 
 
 The sidebar shows **Safe** (green), **Unsafe** (red), or **Analysis unavailable** (orange), using the active theme. Explanations support Markdown and mouse-wheel/scrollbar scrolling. Only the assessment description is shown, not separate provider reasoning fields.
 
-A dimmed footer shows `in: N tokens | out: N tokens | cost: $X.XXXX` when endpoint usage and matching pricing are available. Totals include format-correction requests. Cost is an estimate from OpenCode's configured model catalog, matched by endpoint and model, including cache and context-tier rates. Unknown pricing shows token counts only; missing/invalid usage in any attempt omits the footer. These are reviewer-request statistics.
+A dimmed footer shows three separate lines when usage and pricing are available:
+
+```text
+tokens in/out: 1000/100
+cost: $0.0045
+lifetime: $0.1234
+```
+
+Report totals include format-correction requests. Cost is an estimate from OpenCode's configured model catalog, matched by endpoint and model, including cache and context-tier rates. Unknown pricing shows token counts only; missing/invalid usage in any attempt omits that report's stats. These are reviewer-request statistics.
+
+**Lifetime usage** is saved automatically across projects and restarts. The last dimmed line shows recorded lifetime cost; open **Reviewer: Lifetime usage** from the command palette (`Ctrl+P`) for cumulative tokens, request count, and pricing coverage, even with no review open. It counts each completed endpoint response with valid usage, including format retries and responses whose assessment is invalid. Canceled requests and responses without usage are excluded. Unknown pricing is never treated as free; partially priced totals are labeled. Earlier versions' usage cannot be recovered.
+
+Totals live in `opencode-reviewer/usage-v1/` under OpenCode's state directory (normally `~/.local/state/opencode/`). Concurrent instances save separate atomic snapshots containing only counters, estimated cost and the first-recorded timestamp. Totals refresh on locally recorded usage and when opening the stats command. Persistence failures leave reviews usable and show **lifetime: usage unavailable**; stored data is never silently reset. There is no `oc-stats` or native session-accounting integration.
 
 The panel follows the first pending permission in the root session or its direct children. Directory access and command execution may require separate reviews. If the sidebar is hidden, use OpenCode's **Show sidebar** command (default: `Ctrl+X`, then `B`).
 
@@ -74,10 +102,10 @@ Enable it with `"autoApprove": true`; optionally change `"autoApproveDelaySecond
 - Each completed **Safe** assessment gets a full countdown once its explanation is visible. **Unsafe** and **Analysis unavailable** stay manual. A Safe result with incomplete evidence still qualifies.
 - The fixed footer shows **Allowed in Xs** and **Cancel**. Click the countdown to allow once immediately; Cancel leaves that request manual.
 - After starting, hiding or covering the panel, switching sessions, or narrowing the terminal enough to hide it cancels that request's automation for the running plugin. Returning does not restart it; scrolling does not cancel it.
-- Native controls remain available. **Click Cancel before deliberating in native Allow always or rejection forms**—opening those forms alone does not cancel the timer. Once **Allowing…** begins, approval cannot be undone.
+- Native controls remain available. **Click Cancel before deliberating in native Allow always or rejection forms**. Opening those forms alone does not cancel the timer. Once **Allowing…** begins, approval cannot be undone.
 - The plugin rechecks the pending request and sends only **Allow once**. OpenCode performs the operation. Failed/uncertain submissions remain manual if still pending; writes are never automatically retried.
 
-Auto mode adds extra-careful reviewer guidance without announcing automation or adding plugin notices to the generating agent's conversation. Built-in prompts assess **Allow once**, not hypothetical Allow always grants.
+Auto mode adds extra-careful reviewer guidance without announcing automation or adding plugin notices to the generating agent's conversation. Built-in prompts assess **Allow once**, not hypothetical Allow always grants. Bash execution reports end with brief guidance to prefer Allow once because only the current request was reviewed; edit and directory-access reports omit that closing line.
 
 ## Custom prompts
 
@@ -105,6 +133,7 @@ From the repository root, with **Node.js 22+** and npm:
 npm ci --ignore-scripts
 npm run check          # Typecheck, tests, build
 npm run test:runtime   # Linux; Git, Python 3, tmux, OpenCode on PATH
+npm run test:runtime-cleanup # Fast tmux interruption/parallel-isolation checks; no model
 npm run check:package  # Reproducible build and exact package contents
 ```
 
