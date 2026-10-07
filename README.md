@@ -14,7 +14,7 @@ Minimal configuration:
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    ["opencode-reviewer@0.4.0", {
+    ["opencode-reviewer@0.4.1", {
       "baseURL": "https://api.example.com/v1",
       "model": "your-model",
       "apiKeyEnv": "OPENCODE_REVIEWER_API_KEY"
@@ -32,7 +32,7 @@ The following expanded example shows **every configuration option**, with all fi
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
     [
-      "opencode-reviewer@0.4.0",
+      "opencode-reviewer@0.4.1",
       {
         "baseURL": "https://api.example.com/v1",
         "model": "your-model",
@@ -63,7 +63,7 @@ This example explicitly enables all five review categories; the three new catego
 
 ### Updates and migration to npm
 
-To update, replace `opencode-reviewer@0.4.0` with the desired published version and restart OpenCode. Exact versions keep upgrades intentional; see [npm versions](https://www.npmjs.com/package/opencode-reviewer?activeTab=versions) and [release notes](https://github.com/mightykatun/opencode-reviewer/releases).
+To update, replace `opencode-reviewer@0.4.1` with the desired published version and restart OpenCode. Exact versions keep upgrades intentional; see [npm versions](https://www.npmjs.com/package/opencode-reviewer?activeTab=versions) and [release notes](https://github.com/mightykatun/opencode-reviewer/releases).
 
 If you previously registered an extracted bundle, a `file://` URL, or a manually installed `dist/tui.js`, replace that plugin entry with the npm package specifier and preserve its options. Do not keep both entries. Usage history and saved conversation modes remain under OpenCode's state directory, independent of how the plugin is installed. Published npm packages begin with v0.4.0; older releases were distributed as GitHub assets.
 

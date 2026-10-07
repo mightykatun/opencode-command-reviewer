@@ -1,4 +1,4 @@
-# Unreleased
+# v0.4.1: automatic tag-driven releases
 
 - Release automation now starts on a pushed `v*` tag, matching Speedometer's flow.
   It verifies the tagged version, builds the package, creates the GitHub Release
