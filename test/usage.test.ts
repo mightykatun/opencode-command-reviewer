@@ -1,5 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { setTimeout as sleep } from "node:timers/promises"
 import type { Model } from "@opencode-ai/sdk/v2"
 import { modelPricing, responseUsage, sumUsage, usageAttempt, usageText, type Pricing, type Usage } from "../src/usage.js"
 
@@ -45,6 +46,35 @@ test("unknown or malformed pricing/cache metadata retains token counts without a
   let lookedUp = ""
   responseUsage(response(), "alias", (model) => { lookedUp = model; return undefined })
   assert.equal(lookedUp, "fixture")
+})
+
+test("malformed cache containers discard estimates from the latest cumulative snapshot", () => {
+  for (const details of [null, [], [0], false, 0, 1, "", "unavailable"]) {
+    const observed: Usage[] = []
+    const attempt = usageAttempt("https://generic.test/v1", "fixture", () => prices, (usage) => observed.push(usage))
+    attempt.observe(response())
+    assert.equal(attempt.current()?.cost, 0.0045)
+    attempt.observe({ usage: { ...response().usage, prompt_tokens_details: details } })
+    assert.deepEqual(attempt.finalize(), { input: 1000, output: 100 })
+    assert.deepEqual(observed, [{ input: 1000, output: 100 }])
+  }
+  for (const details of [undefined, {}]) {
+    assert.equal(responseUsage({ usage: { ...response().usage, prompt_tokens_details: details } }, "fixture", () => prices)?.cost, 0.0045)
+  }
+})
+
+test("rejected asynchronous usage observers are consumed without delaying finalization", async () => {
+  let calls = 0
+  const attempt = usageAttempt(openRouter, "fixture", undefined, async () => {
+    calls++
+    await sleep(0)
+    throw new Error("observer storage failure")
+  })
+  attempt.observe({ usage: { cost: 0.01 } })
+  assert.deepEqual(attempt.finalize(), { cost: 0.01 })
+  assert.deepEqual(attempt.finalize(), { cost: 0.01 })
+  await sleep(10) // node:test fails this test if the observer rejection is unhandled.
+  assert.equal(calls, 1)
 })
 
 test("catalog pricing matches endpoint and model exactly, honors overrides and rejects ambiguous prices", () => {

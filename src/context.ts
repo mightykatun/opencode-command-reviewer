@@ -31,6 +31,7 @@ export async function loadInvocation(request: PermissionRequest, reader: Context
   }
   const invocation = message.info.path
   return { message, info: message.info, tool: part.tool, input: part.state.input,
+    linkage: { sessionID: request.sessionID, messageID: request.tool.messageID, callID: request.tool.callID },
     location: {
       instanceDirectory: typeof invocation?.cwd === "string" && path.isAbsolute(invocation.cwd) ? invocation.cwd : null,
       instanceWorktree: typeof invocation?.root === "string" && path.isAbsolute(invocation.root) ? invocation.root : null,
@@ -78,27 +79,35 @@ export function latestUserPrompt(messages: readonly { info: Message; parts: Part
   return findUserPrompt(messages, sessionID)?.text ?? null
 }
 
-export async function loadContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal, scope: FileScope = fileAccess.scope(signal)): Promise<CommandContext | null> {
+async function nativeInvocation(request: PermissionRequest, reader: ContextReader, signal: AbortSignal, kind: "shell" | "edit") {
+  try { return await loadInvocation(request, reader, signal) }
+  catch (error) {
+    signal.throwIfAborted()
+    throw new Error(`Pending native ${kind} message unavailable or arguments mismatched`, { cause: error })
+  }
+}
+
+function invocationFor(request: PermissionRequest, verified: Invocation): Invocation {
+  if (verified.linkage.sessionID !== request.sessionID || verified.linkage.messageID !== request.tool?.messageID
+    || verified.linkage.callID !== request.tool?.callID) throw new Error("Verified invocation linkage mismatched")
+  return verified
+}
+
+export async function loadContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal, scope: FileScope = fileAccess.scope(signal), verified?: Invocation): Promise<CommandContext | null> {
+  signal.throwIfAborted()
   if (request.permission !== "bash" && request.permission !== "external_directory") return null
   if (!request.tool) {
     if (request.permission === "external_directory") return null
     throw new Error("Native shell tool context unavailable")
   }
-  const message = await reader.message(request.sessionID, request.tool.messageID, signal)
-  if (!message || message.info.sessionID !== request.sessionID || message.info.id !== request.tool.messageID) {
-    throw new Error("Pending native shell message unavailable")
-  }
-  const part = message?.parts.find((p) => p.type === "tool" && p.callID === request.tool!.callID)
-  if (part?.type === "tool" && part.tool !== "bash" && request.permission === "external_directory") return null
-  if (!part || part.type !== "tool" || part.sessionID !== request.sessionID || part.messageID !== request.tool.messageID || part.tool !== "bash" || part.state.status !== "running") {
-    throw new Error("Pending native shell arguments unavailable")
-  }
-  const { command, workdir } = part.state.input
+  const invocation = verified ? invocationFor(request, verified) : await nativeInvocation(request, reader, signal, "shell")
+  if (invocation.tool !== "bash" && request.permission === "external_directory") return null
+  if (invocation.tool !== "bash") throw new Error("Pending native shell arguments unavailable")
+  const { command, workdir } = invocation.input
+  if (typeof command === "string" && command.length > 16 * 1024 * 1024) throw new Error("Shell command exceeds the 16 MiB preprocessing limit")
   if (typeof command !== "string" || !command.trim()) throw new Error("Shell command unavailable")
   const limitations: string[] = []
-  const invocation = message.info.role === "assistant" ? message.info.path : undefined
-  const instanceDirectory = typeof invocation?.cwd === "string" && path.isAbsolute(invocation.cwd) ? invocation.cwd : null
-  const instanceWorktree = typeof invocation?.root === "string" && path.isAbsolute(invocation.root) ? invocation.root : null
+  const { instanceDirectory, instanceWorktree } = invocation.location
   const invalidWorkdir = workdir !== undefined && typeof workdir !== "string"
   const requestedWorkdir = typeof workdir === "string" && workdir ? workdir : null
   // ShellTool resolves relative workdir against its execution instance, not the
@@ -136,27 +145,20 @@ export function permissionContext(request: PermissionRequest, clone = true): Non
   }
 }
 
-export async function loadEditContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal): Promise<EditContext> {
+export async function loadEditContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal, verified?: Invocation): Promise<EditContext> {
   signal.throwIfAborted()
   if (request.permission !== "edit" || !request.tool) throw new Error("Native edit tool context unavailable")
-  const message = await reader.message(request.sessionID, request.tool.messageID, signal)
-  if (!message || message.info.sessionID !== request.sessionID || message.info.id !== request.tool.messageID) {
-    throw new Error("Pending native edit message unavailable")
-  }
-  const part = message.parts.find((p) => p.type === "tool" && p.callID === request.tool!.callID)
-  if (!part || part.type !== "tool" || part.sessionID !== request.sessionID || part.messageID !== request.tool.messageID
-    || part.state.status !== "running" || (part.tool !== "edit" && part.tool !== "write" && part.tool !== "apply_patch")) {
+  const invocation = verified ? invocationFor(request, verified) : await nativeInvocation(request, reader, signal, "edit")
+  if (invocation.tool !== "edit" && invocation.tool !== "write" && invocation.tool !== "apply_patch") {
     throw new Error("Pending native edit arguments unavailable or unsupported tool")
   }
-  const invocation = message.info.role === "assistant" ? message.info.path : undefined
-  const location = {
-    instanceDirectory: typeof invocation?.cwd === "string" && path.isAbsolute(invocation.cwd) ? invocation.cwd : null,
-    instanceWorktree: typeof invocation?.root === "string" && path.isAbsolute(invocation.root) ? invocation.root : null,
-  }
+  const location = invocation.location
   const conversation = await loadConversationContext(request, reader, signal)
   if (!location.instanceDirectory) conversation.limitations.push("Edit invocation directory unavailable; session origin is not substituted.")
   if (!location.instanceWorktree) conversation.limitations.push("Edit invocation worktree unavailable.")
-  return { ...conversation, kind: "edit", tool: part.tool, location, permission: permissionContext(request) }
+  // Borrow host metadata until the collector projects its known fields. Never
+  // clone/traverse unrelated metadata before bounded normalization.
+  return { ...conversation, kind: "edit", tool: invocation.tool, location, permission: permissionContext(request, false) }
 }
 
 export async function loadConversationContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal) {

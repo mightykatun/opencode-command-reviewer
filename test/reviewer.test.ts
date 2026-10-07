@@ -209,6 +209,25 @@ test("malformed assessment in an assistant stop envelope still gets format corre
   assert.match(requests[1]!.body.messages[3].content, /Format validation failed: Invalid JSON/)
 })
 
+test("choice-level errors reject even Safe content without correction and retain received usage", async () => {
+  for (const error of [{ message: "PRIVATE PROVIDER ERROR" }, "PRIVATE", false, 0, ""]) {
+    for (const content of ['{"safe":true,"desc":"Must not be accepted."}', "bad assessment format"]) {
+      const config = parseConfig({ baseURL: "https://openrouter.ai/api/v1", model: "fixture", formatRetries: 2 })
+      const observed: Usage[] = []
+      let calls = 0
+      const fetcher: typeof fetch = async () => {
+        calls++
+        return new Response(JSON.stringify({ usage: { cost: 0.01, prompt_tokens: 10, completion_tokens: 2 },
+          choices: [{ index: 0, finish_reason: "stop", error, message: { role: "assistant", content } }] }))
+      }
+      await assert.rejects(review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined,
+        (usage) => observed.push(usage)), { message: "Reviewer API did not return a text assessment" })
+      assert.equal(calls, 1)
+      assert.deepEqual(observed, [{ input: 10, output: 2, cost: 0.01 }])
+    }
+  }
+})
+
 test("formatted descriptions preserve Markdown and decoded JSON newlines", () => {
   const desc = "**Effects**\n\n- Writes `result.txt`.\n- *Risk:* replaces its existing contents.\n\n```sh\nprintf hello\n```"
   assert.deepEqual(parseAssessment(JSON.stringify({ safe: false, desc })), { safe: false, desc })
@@ -836,6 +855,22 @@ test("stream progress observer mutations and exceptions cannot change assessment
     })
   assert.deepEqual(result, { safe: false, desc: "Visible.", usage: { cost: 0.01 } })
   assert.ok(progressCalls >= 2)
+})
+
+test("asynchronous progress and usage rejections cannot escape review", async () => {
+  for (const stream of [false, true]) {
+    const content = '{"safe":false,"desc":"Visible."}'
+    const response = stream ? streamText(event(chunk(content, "stop")) + event({ choices: [], usage: { cost: 0.01 } }) + done)
+      : new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { cost: 0.01 } }))
+    let usageCalls = 0, progressCalls = 0
+    const result = await review(evidence, { ...streamConfig(), stream }, signal(), async () => response, {}, BUILTIN_PROMPTS, undefined,
+      async () => { usageCalls++; await sleep(0); throw new Error("accounting observer") },
+      async () => { progressCalls++; await sleep(0); throw new Error("progress observer") })
+    assert.deepEqual(result, { safe: false, desc: "Visible.", usage: { cost: 0.01 } })
+    await sleep(10) // Let late observer rejection surface to node:test if not owned.
+    assert.equal(usageCalls, 1)
+    assert.ok(progressCalls >= (stream ? 2 : 1))
+  }
 })
 
 test("aborting pending reads ignores fetcher signal cooperation and hanging cancel promises", { timeout: 3000 }, async () => {

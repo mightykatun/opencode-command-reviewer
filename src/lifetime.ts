@@ -79,6 +79,7 @@ export class LifetimeUsage {
   async totals(signal?: AbortSignal): Promise<LifetimeTotals> {
     signal?.throwIfAborted()
     await this.flush()
+    signal?.throwIfAborted()
     let total = empty()
     // Never copy legacy totals into local snapshots: concurrent/restarted instances would duplicate history.
     const directories = new Set([this.directory, ...(this.legacyDirectory ? [this.legacyDirectory] : [])].map((directory) => path.resolve(directory)))
@@ -93,17 +94,22 @@ export class LifetimeUsage {
       if (error.code === "ENOENT") return []
       throw error
     })
+    signal?.throwIfAborted()
     let total = empty()
     for (const name of names.filter((name) => snapshotName.test(name))) {
       signal?.throwIfAborted()
       const file = await open(path.join(directory, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
       try {
+        signal?.throwIfAborted()
         const stat = await file.stat()
+        signal?.throwIfAborted()
         if (!stat.isFile() || stat.size > 1024) throw new Error("Invalid lifetime usage snapshot")
         const bytes = Buffer.alloc(1025)
         let size = 0
         while (size < bytes.length) {
+          signal?.throwIfAborted()
           const read = await file.read(bytes, size, bytes.length - size, size)
+          signal?.throwIfAborted()
           if (!read.bytesRead) break
           size += read.bytesRead
         }
@@ -114,6 +120,7 @@ export class LifetimeUsage {
           tokenRequests: value.version === 1 ? value.requests : value.tokenRequests,
           priced: value.priced, cost: value.cost, since: value.since }))
       } finally { await file.close() }
+      signal?.throwIfAborted()
     }
     signal?.throwIfAborted()
     return total

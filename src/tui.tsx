@@ -9,6 +9,7 @@ import { FileAccess, type FileIO } from "./file-access.js"
 import { review, withDeadline } from "./reviewer.js"
 import { BUILTIN_PROMPTS, loadPrompts } from "./prompts.js"
 import { approvalTransport } from "./approval.js"
+import { PendingRefresh } from "./pending-refresh.js"
 import { reviewSyntaxStyles, scannerFrame, SCANNER_FRAME_COUNT, SCANNER_INTERVAL_MS } from "./appearance.js"
 import { modelPricing, usageText } from "./usage.js"
 import { lifetimeTracker } from "./lifetime-view.js"
@@ -210,29 +211,16 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
 
   // Startup recovery and bounded reconciliation cover attachment to an existing
   // request and cancellation paths that do not emit permission.replied.
-  let syncing = false
-  let stopped = false
-  let refreshAgain = false
-  const refresh = async () => {
-    if (stopped) return
-    if (syncing) { refreshAgain = true; return }
-    syncing = true
-    const revision = controller.revision
-    try {
-      await withDeadline(api.lifecycle.signal, 5000, async (signal) => {
-        const result = await measured(hostTrace, "pending-refresh", () => api.client.permission.list({ directory: api.state.path.directory }, { signal }))
-        if (result.data) controller.reconcile(result.data, revision)
-      })
-    } catch { /* The next refresh retries the read; permission controls stay native. */ }
-    finally { syncing = false; if (refreshAgain) { refreshAgain = false; void refresh() } }
-  }
+  const pendingRefresh = new PendingRefresh(controller,
+    (signal) => measured(hostTrace, "pending-refresh", () => approval.list(signal)), api.lifecycle.signal)
+  const refresh = () => pendingRefresh.refresh()
   const unregisterMode = sessionModeCommands(api, modes, (root) => { controller.modeChanged(root); void refresh() })
   void refresh()
   const interval = setInterval(() => void refresh(), 2000)
   api.event.on("session.idle", () => void refresh())
   api.event.on("session.error", () => void refresh())
   api.lifecycle.onDispose(async () => {
-    stopped = true
+    pendingRefresh.dispose()
     clearInterval(interval)
     setSidebar(undefined)
     unregisterMode()

@@ -15,39 +15,85 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-opencode-reviewer
   cancel-in-progress: false
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   RELEASE_REF: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
-  TRIGGER_REF: ${{ github.ref }}
-  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+  RELEASE_WORKFLOW_COMMIT: ${{ github.workflow_sha }}
+  RELEASE_RUN_ID: ${{ github.run_id }}
 
 jobs:
-  package:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write
-      id-token: write
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+      version: ${{ steps.version.outputs.version }}
+      validation_attempt: ${{ steps.version.outputs.validation_attempt }}
+      integrity: ${{ steps.artifact.outputs.integrity }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ env.RELEASE_REF }}
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - name: Check out active validation policy
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-policy
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/release-version.mjs
+            /scripts/test-helpers.mjs
+            /scripts/helper-tests.json
+            /scripts/release-artifact.mjs
+            /scripts/publish-release.mjs
+            /scripts/npm-publication.mjs
+            /scripts/github-release.mjs
+            /scripts/smoke-runtime.mjs
+            /scripts/smoke-reviewer.mjs
+            /scripts/smoke-stages.mjs
+            /scripts/smoke-permissions.mjs
+            /scripts/smoke.mjs
+            /test/ci-workflow.test.mjs
+            /test/publish-release.test.mjs
+            /test/release-version.test.mjs
+            /test/npm-publication.test.mjs
+            /test/release-artifact.test.mjs
+            /test/release-artifact-smoke.test.mjs
+            /test/npm-cli-smoke.test.mjs
+            /test/release-workflow.test.mjs
+            /test/release-fixture.mjs
+            /test/smoke-measurements.test.mjs
+            /test/smoke-stages.test.mjs
+            /package.json
+            /package-lock.json
+            /README.md
+            /AGENTS.md
+            /.github/workflows/ci.yml
+            /.github/workflows/release.yml
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
 
-      - name: Use an OIDC-capable npm CLI
+      - name: Use the verified publication npm version for CLI regressions
         run: npm install --global npm@12.2.0 --ignore-scripts
 
-      - name: Check release version
+      - name: Check release version and tag commit
         id: version
+        env:
+          TRIGGER_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         shell: bash
         run: |
           set -euo pipefail
@@ -55,43 +101,96 @@ jobs:
             test "$TRIGGER_REF" = "refs/heads/$DEFAULT_BRANCH"
           fi
           git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
-          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
-          node scripts/release-version.mjs
+          export RELEASE_COMMIT="$(git rev-parse HEAD)"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_COMMIT"
+          node release-policy/scripts/release-version.mjs
 
       - run: npm ci --ignore-scripts
       - run: npm run typecheck && npm test
-      - run: node --test test/smoke-measurements.test.mjs test/publish-release.test.mjs test/release-version.test.mjs test/npm-publication.test.mjs
+      - run: node release-policy/scripts/test-helpers.mjs
       - run: npm run check:package
+      - run: node --test release-policy/test/release-artifact-smoke.test.mjs
+      - run: node --test release-policy/test/npm-cli-smoke.test.mjs
 
-      - name: Pack verified build
+      - name: Pack and validate release artifact
+        id: artifact
+        env:
+          RELEASE_VERIFIED_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.version.outputs.commit }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_VALIDATION_ATTEMPT: ${{ steps.version.outputs.validation_attempt }}
+        run: node release-policy/scripts/release-artifact.mjs prepare "$RUNNER_TEMP/release-package"
+
+      - name: Upload immutable release artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-package/
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_VERIFIED_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_VALIDATION_ATTEMPT: ${{ needs.validate.outputs.validation_attempt }}
+      RELEASE_INTEGRITY: ${{ needs.validate.outputs.integrity }}
+    steps:
+      - name: Check out immutable publication policy only
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-policy
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/release-version.mjs
+            /scripts/release-artifact.mjs
+            /scripts/publish-release.mjs
+            /scripts/npm-publication.mjs
+            /scripts/github-release.mjs
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Create private job-local npm cache
+        shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/release-package"
-          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release-package"
+          set -euo pipefail
+          cache="$(mktemp -d "$RUNNER_TEMP/npm-release-cache.XXXXXXXX")"
+          chmod 700 "$cache"
+          printf 'NPM_CONFIG_CACHE=%s\n' "$cache" >> "$GITHUB_ENV"
+
+      - name: Use an OIDC-capable npm CLI
+        run: npm install --global npm@12.2.0 --ignore-scripts
+
+      - name: Download validated archive by immutable artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.validate.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-package
+
+      - name: Verify artifact identity and actual archive contents
+        run: node release-policy/scripts/release-artifact.mjs verify "$RUNNER_TEMP/release-package"
 
       - name: Publish package and verify npm availability
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
-        run: node scripts/publish-release.mjs "$RUNNER_TEMP"/release-package/*.tgz
+        run: node release-policy/scripts/publish-release.mjs "$RUNNER_TEMP/release-package"
 
-      - name: Create GitHub release and attach package
+      - name: Create GitHub release and attach the verified archive
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          flags=(--verify-tag --generate-notes --title "opencode-reviewer $RELEASE_TAG")
-          if test "$RELEASE_PRERELEASE" = "true"; then
-            flags+=(--prerelease --latest=false)
-            latest=false
-          else
-            flags+=(--latest)
-            latest=true
-          fi
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/release-package/*.tgz --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$RELEASE_TAG" --draft=false --prerelease="$RELEASE_PRERELEASE" --latest="$latest" --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$RELEASE_TAG" "$RUNNER_TEMP"/release-package/*.tgz "${flags[@]}" --repo "$GITHUB_REPOSITORY"
-          fi
+        run: node release-policy/scripts/github-release.mjs "$RUNNER_TEMP/release-package"

@@ -23,11 +23,15 @@
 
 ## Development and verification
 
-Requires Node.js 22+ and npm. Run commands from the repository root:
+Development uses Node.js 24.15.0+ within 24.x (recommended), or 22.22.2+ within
+22.x, and npm. These floors satisfy the pinned SDK's transitive `ini` requirement;
+the distributed plugin's Node runtime engine remains separate. Run commands from
+the repository root:
 
 ```sh
 npm ci --ignore-scripts
-npm run check          # typecheck -> node:test via tsx -> build
+npm run check          # typecheck -> node:test via tsx -> pure helpers -> build
+npm run test:helpers   # pure .mjs checks; no build, tmux or OpenCode
 npm run test:runtime   # requires an up-to-date dist/tui.js; does NOT build
 npm run test:runtime-cleanup # fast tmux interruption/isolation checks, no model or build
 npm run check:package  # builds twice, compares hashes, checks exact package contents
@@ -39,8 +43,11 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   `test/reviewer.test.ts` and `test/streaming-controller.test.ts`. Mode/command races,
   accounting and observer isolation are covered in `test/session-mode.test.ts`,
   `test/controller.test.ts`, `test/usage.test.ts`, `test/lifetime.test.ts` and
-  `test/diagnostics.test.ts`. Run fixture-measurement tests separately with
-  `node --test test/smoke-measurements.test.mjs`; `npm run check` selects `.test.ts`.
+  `test/diagnostics.test.ts`. `scripts/helper-tests.json` is the shared pure `.mjs`
+  inventory used by `npm run test:helpers`, `npm run check` and active release-policy
+  validation. Keep tmux cleanup and built-package smoke tests separate. Read-only
+  pull-request CI tests the supported Node floors, package reproducibility and
+  isolated tmux cleanup; its checkout/setup actions use remotely verified SHAs.
 - Runtime/UI or host-integration changes warrant real-TUI fixtures after a build.
   Run one with `node scripts/smoke.mjs external`; other scenarios are `correction`,
   `cancel`, `error`, `edit`, `write`, `patch`, `edit-cancel`, and `edit-config-error`.
@@ -56,6 +63,13 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   `custom-bash`, `external-read`, `external-search`, `external-edit`, and `external-patch`.
   `external-patch` verifies a deletion summary before directory-only approval with
   native edit permission already allowed.
+  Native and reviewed stages share `scripts/smoke-stages.mjs`. For `external-edit`,
+  `--disabled` disables directory review while the independently enabled edit
+  reviewer remains active. Combine `--disabled --auto --held` to manually allow
+  the directory, release the held edit assessment and observe its own countdown.
+  `--held` belongs only to the first enabled review, never a disabled native stage.
+  `--plan` prints the stage plan without a host, bundle, model or tmux session;
+  it is also supported by `scripts/smoke.mjs`.
   Flags include `--auto`, `--disabled`, `--cancel`, `--unsafe`, `--error`,
   `--correction`, `--held`, `--no-usage`, `--missing-usage`, `--unpriced`,
   `--storage-error`, `--native-bash-enabled`, `--resource-whitespace`, `--stream`,
@@ -94,24 +108,57 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   latency/cache performance. Loopback socket reuse is not a measured DNS/TLS setup
   speedup. Injected file stalls do not establish live NFS/SSHFS behavior.
 - Runtime fixtures use a private tmux socket inside each isolated temp directory.
+  Tmux starts with `-f /dev/null` and fixture-local HOME/XDG state, a controlled
+  shell/locale, explicit truecolor support and an environment that excludes inherited tmux identities,
+  shell startup hooks and credentials. Tmux's own private pane variables remain.
   A detached IPC supervisor owns session startup and cleans up on owner exit,
   including SIGINT, SIGTERM and SIGKILL. Always create/restart sessions through
   the supervisor so a late startup cannot race cleanup. Never kill shared/default
   tmux servers or discover cleanup targets by broad process-name matching.
+  The interruption regression uses a real tmux `wait-for` barrier after the pane
+  program has started but before launch acknowledgement. It kills the owner,
+  releases startup, verifies complete cleanup and keeps an independent survivor
+  server and pane alive. It does not infer startup coverage from a delay alone.
+  Run `npm audit --json` and `npm why glob` when assessing deprecation notices.
+  The current audit reports no vulnerabilities; deprecated `glob@9.3.5` is a dev
+  dependency of the pinned OpenTUI Babel resolver and uses `minimatch@8.0.7`.
+  Retain that compatible tree while the audit is clear; do not force a major glob
+  override or change the supported host SDK/OpenTUI pins solely for deprecation.
 - Documentation-only changes need reference/format review, not runtime/model tests.
 - `npm pack` rebuilds via `prepack`. `.github/workflows/release.yml` runs on pushed
   `v*` tags or manual dispatch with an existing `tag`. Manual dispatch must use the
-  default branch. Checkout and validation verify the exact tag commit, semantic
-  version and matching package/lockfile versions. CI runs typecheck/tests and
-  `check:package` (two builds), publishes to npm, and verifies version metadata,
-  the expected dist-tag and downloaded archive integrity before creating a GitHub
-  release with generated notes and the same archive. Registry reads use unique
-  query parameters to bypass cached 404s; npm upload acceptance is not publication
-  completion. Verification polls for at most ten minutes and never retries a POST.
+  default branch. Checkout and validation verify the exact tag commit, canonical
+  npm-compatible version and matching package/lockfile versions. Build metadata
+  (`+...`), normalization-changing versions and npm SemVer bounds violations are
+  rejected before packing or publication. Package manifests must have no top-level
+  `tag`; `publishConfig` contains exactly public `access` and the npm `registry`.
+  Package-wide concurrency serializes
+  releases. The `contents: read` validation job installs dependencies, runs checks
+  and `check:package` (two builds plus actual archive inspection), and uploads one
+  archive plus a strict manifest. The separate OIDC/write publish job downloads the
+  immutable artifact ID and checks its tag, commit, workflow commit, run, validation
+  attempt, byte count, SHA-512 and exactly five regular package files. Publication
+  helpers come from a sparse checkout of `github.workflow_sha`, never the artifact
+  or a historical tag. The publish job installs only npm 12.2.0 globally and does
+  not install project dependencies, build, test or execute package code. Policy
+  helpers inspect the validated regular-file USTAR archive without extracting it.
+  npm's supported CLI may internally unpack those validated regular files to read
+  the manifest, including during dry-run. This is an explicit exception to the
+  original no-extraction policy: its cache is isolated in a fresh mode-0700
+  directory under the publish job's runner temp directory. The archive remains
+  the artifact of record and the same verified bytes are published and attached.
+  Registry reads use unique
+  query parameters to bypass cached 404s and reject redirects. Header/body transport
+  failures retry reads under the original deadline; complete malformed JSON or
+  mismatched archives fail. Verification polls for at most ten minutes. Uploads
+  never retry, including inside npm (`--fetch-retries=0`).
   An unverified publication fails with a clear processing/availability error.
-  Reruns reuse the release and refresh its asset. Stable versions use GitHub latest and npm `latest`;
-  semantic prerelease versions use GitHub prerelease and npm `next`, without replacing
-  GitHub latest. Existing npm versions must match archive integrity on rerun.
+  Reruns reuse the release and refresh its asset. Stable versions advance GitHub
+  latest and npm `latest` only by SemVer precedence; prereleases advance only npm
+  `next` and remain GitHub prereleases. New historical versions use npm `archive`. Existing
+  versions verify their immutable archive independently of current channel ownership
+  and never retag. Failed-publish-only reruns may reuse the successful validation
+  artifact, bound to that validation attempt and the same workflow run and digest.
   Publishing uses GitHub OIDC with `id-token: write` and npm 12.2.0, with optional
   `NPM_TOKEN` secret fallback. Configure npm trusted publishing for GitHub owner
   `mightykatun`, repository `opencode-reviewer`, workflow `release.yml`, no environment,
@@ -119,8 +166,14 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   bootstrap before npm permits trust setup; never put credentials in the repository.
   Use `npm version X.Y.Z --no-git-tag-version` to update both manifests; release tags
   must include the workflow. CI packs with `--ignore-scripts` after verification.
-  Manually publishing a GitHub release is no longer a trigger. Run publishing and
-  version validation tests with `node --test test/publish-release.test.mjs test/release-version.test.mjs test/npm-publication.test.mjs`.
+  Manually publishing a GitHub release is no longer a trigger. Run release checks
+  with `node --test test/publish-release.test.mjs test/release-version.test.mjs test/npm-publication.test.mjs test/release-artifact.test.mjs test/release-workflow.test.mjs`.
+  After building, `node --test test/release-artifact-smoke.test.mjs` verifies real
+  packing and the artifact handoff without publishing. With npm 12.2.0 installed,
+  `node --test test/npm-cli-smoke.test.mjs` separately checks actual CLI dry-run,
+  private-cache extraction, npm's bundled tag/version semantics and USTAR parsing.
+  It performs no registry publication or OIDC exchange. All workflow actions are
+  pinned to remotely verified commit SHAs.
 - User installation is the npm package specifier in `tui.json` (e.g.
   `opencode-reviewer@latest`), resolved by OpenCode. Keep README to one full config
   example, installation and essential behavior. Omit migration instructions and
@@ -198,7 +251,9 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   never resurrect its view or report a failure after resolution. On uncertain
   outcome keep any remaining request manual, preserve its rating, and reconcile.
 - Preserve two-second read-only reconciliation for startup/missing reply events and
-  its revision guard against stale snapshots. Resolution, deletion and disposal
+  its revision guard against stale snapshots. `pending-refresh.ts` reconciles only
+  after bounded reads succeed, with lifecycle/generation checks outside the deadline
+  callback. Resolution, deletion and disposal
   abort work; late results must not resurrect panels.
 - The overlay shows a **Permission analysis** heading, then `✓ Safe`/`✗ Unsafe`
   using the active theme's success/error colors; `! Analysis unavailable` uses
@@ -248,9 +303,13 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   requests and direct children. Review-kind switches and other roots stay independent.
   Resolve ancestry through public metadata under a five-second bound, up to 16 parent
   edges (17 session records), rejecting cycles/missing metadata. Bound the ancestry
-  cache to 4,096 entries. Load saved mode with a separate five-second bound before
-  enrichment/model work. Unknown ancestry or unreadable mode suspends work rather
-  than assuming enabled. A missing record defaults to enabled.
+  cache to 4,096 entries and retain distances so warmed suffixes do not bypass the
+  16-edge limit. Load saved mode with a separate five-second bound before
+  enrichment/model work. Reads are single-flight per root and capped at two actual
+  transactions per instance, retaining capacity through late settlement/cleanup.
+  Unknown ancestry or unreadable mode suspends work rather than assuming enabled.
+  Revision-current reconciliation retries unavailable state without repeatedly
+  loading a known disabled setting. A missing record defaults to enabled.
 - Store version 1 records under `opencode-reviewer/session-mode-v1/` in the public
   host state directory. Filename is SHA-256 of the host-directory/root-ID pair;
   contents are only `{ version: 1, enabled: boolean }`, capped at 1 KiB on read.
@@ -316,6 +375,14 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   bodies set partial coverage; they do not erase the operation being authorized.
 
 - Discovery is bounded literal Python/shell tokenization, not shell evaluation.
+  `shell-discovery.ts` owns cursor-based handlers and one shared nested-discovery
+  work allowance: 16 MiB UTF-8, 65,536 tokens, 16,384 references/expansions,
+  262,144 parser steps, 256 notices and 500 ms. Preserve completed references with
+  an explicit limitation on optional discovery exhaustion. Unsupported unquoted
+  whitespace cannot split literal filenames. Only bare or exact conventional
+  `/bin`/`/usr/bin` program spellings infer standard utility/interpreter operands;
+  other explicit executable paths qualify their own source. In-process shell-state
+  uncertainty invalidates cwd rather than selecting a decoy from the invocation path.
   Supported literal `cat`/`head` operands are captured as full bounded snapshots,
   not as emulated command output. Unknown options/expansions stay unresolved.
   Never execute substitutions/helpers, expand `~`, use PATH to find bare scripts,
@@ -333,6 +400,11 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   permission gets a fresh budget. Repeated edit entries retain their separate
   diffs. `maxEvidenceBytes` defaults to 131072 and caps included UTF-8
   diff bytes. Omit whole diffs with reasons, retain scope, and flag partial coverage.
+  Normalize known data fields without cloning unrestricted host metadata. Native
+  headers/scope have a separate 16 MiB and 16,384-entry bound; diff measurement
+  work is shared. Optional omitted-diff counts share 16 MiB/65,536 lines/250 ms,
+  falling back only to valid host counts. Capture admitted shell files before later
+  candidate canonicalization can exhaust their capture allowance.
   Never guess operations/paths from aggregate labels or synthesize a safety rating.
 - Omitted files carry JSON-quoted `[!]` warnings; omitted edits carry numeric
   `[Δ]` line counts only from validated unified-diff hunks or valid host counts.
@@ -391,7 +463,10 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Finalize exactly once in `finally`; repeated cumulative frames replace values,
   not add requests. Preserve the established response model for usage-only frames.
   For generic pricing, a newer unpriceable token snapshot must remove any older
-  estimate, including unchanged counts with invalid cache metadata. OpenRouter cost
+  estimate, including unchanged counts with invalid cache metadata. Explicit null,
+  primitive and array cache-detail containers invalidate estimates; omission may use
+  zero cache counts. Consume rejected asynchronous accounting/progress observers
+  without awaiting them. OpenRouter cost
   is independent of token validity. No valid received component means no entry.
 - Sum report components across all format attempts independently: tokens or cost
   appear only if that component covers the entire chain. Cost-only and token-only
@@ -408,7 +483,9 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - Accounting and persistence failures cannot change review outcomes. Abort and
   await actual review workers/finalizers before flushing queued lifetime writes on
   disposal. Failed storage reports unavailable without silently resetting history.
-  Refresh totals on local usage and palette open; never replace a dismissed dialog
+  Refresh totals on local usage and palette open. `lifetime-refresh.ts` coalesces
+  work to one actual scan plus one follow-up, retaining ownership through timeout
+  and cleanup; write failures invalidate older read results. Never replace a dismissed dialog
   after async reads. Explain received-only accounting, unknown unreported charges,
   mixed reported/estimated cost and unrecoverable earlier unrecorded usage.
 

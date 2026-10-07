@@ -93,7 +93,17 @@ export function smokeMetrics(server, { pollIntervalMs, hostVersion, origin = "sh
   }
 }
 
-const tmux = (socket, args) => execFileSync("tmux", ["-S", socket, ...args], {
+/** Start both the supervisor and tmux with fixture-local state and no inherited startup hooks. */
+export function smokeEnvironment(directory, parent = process.env) {
+  if (!path.isAbsolute(directory)) throw new Error("Fixture directory must be absolute")
+  // The fixture asserts exact theme RGB values; tmux supports truecolor even without an attached client.
+  return { PATH: parent.PATH ?? "/usr/bin:/bin", HOME: directory, SHELL: "/bin/sh", TERM: "xterm-256color", COLORTERM: "truecolor",
+    LANG: "C.UTF-8", LC_ALL: "C.UTF-8", TZ: "UTC", XDG_CONFIG_HOME: path.join(directory, "config"),
+    XDG_DATA_HOME: path.join(directory, "data"), XDG_STATE_HOME: path.join(directory, "state"), XDG_CACHE_HOME: path.join(directory, "cache") }
+}
+
+const tmux = (socket, args) => execFileSync("tmux", ["-S", socket, "-f", "/dev/null", ...args], {
+  env: smokeEnvironment(path.dirname(socket)),
   encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000, killSignal: "SIGKILL",
 })
 const stop = (socket) => { try { tmux(socket, ["kill-server"]) } catch { /* Already stopped or not started. */ } }
@@ -121,7 +131,7 @@ export async function smokeRuntime(directory) {
   if (!path.isAbsolute(directory)) throw new Error("Fixture directory must be absolute")
   const socket = path.join(directory, "tmux.sock")
   const guard = fork(new URL(import.meta.url), ["--guard", socket], {
-    detached: true, stdio: ["ignore", "ignore", "inherit", "ipc"], execArgv: [],
+    detached: true, stdio: ["ignore", "ignore", "inherit", "ipc"], execArgv: [], env: smokeEnvironment(directory),
   })
   let closed = false, sequence = 0
   const requests = new Map()

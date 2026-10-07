@@ -1,37 +1,55 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { readFile } from "node:fs/promises"
 import { pathToFileURL } from "node:url"
-import { isPrerelease } from "./release-version.mjs"
-import { archiveIntegrity, freshRegistryURL, verifyPublication } from "./npm-publication.mjs"
+import { setTimeout } from "node:timers/promises"
+import { expectedArtifact, loadReleaseArtifact } from "./release-artifact.mjs"
+import { publicationTag, validatePublicationPackage } from "./release-version.mjs"
+import { archiveIntegrity, Pending, registryReader, verifyPublication } from "./npm-publication.mjs"
 
 // Publish the same verified bytes attached to GitHub. Existing versions are immutable:
 // reruns (or the authenticated first-publication bootstrap) must match exactly.
 export async function publishRelease(tarball, pkg, bytes, {
-  fetcher = fetch, run = execFileSync, prerelease = process.env.RELEASE_PRERELEASE === "true",
+  fetcher = fetch, run = execFileSync, now = () => performance.now(), sleep = setTimeout,
+  readTimeoutMs = 30000, intervalMs = 1000,
 } = {}) {
+  validatePublicationPackage(pkg)
   const integrity = archiveIntegrity(bytes)
   const url = `https://registry.npmjs.org/${encodeURIComponent(pkg.name)}/${encodeURIComponent(pkg.version)}`
-  const response = await fetcher(freshRegistryURL(url), { headers: { "cache-control": "no-cache" }, signal: AbortSignal.timeout(30000) })
-  if (response.ok) {
-    const existing = await response.json()
-    assert.equal(existing.dist?.integrity, integrity, "Published version differs from this archive; publish a new version")
-    console.log(`${pkg.name}@${pkg.version} already published with identical archive integrity`)
-    return "existing"
+  const end = now() + readTimeoutMs
+  const get = registryReader({ fetcher, now, end, requestTimeoutMs: 30000 })
+  let tag, reason = "registry state unavailable"
+  while (now() < end) {
+    try {
+      const existing = await get.json(url, { missing: true })
+      if (existing !== undefined) {
+        assert.equal(existing.dist?.integrity, integrity, "Published version differs from this archive; publish a new version")
+        console.log(`${pkg.name}@${pkg.version} already published with identical archive integrity`)
+        return { status: "existing" }
+      }
+      // The workflow holds a package-wide lock while reading and advancing channels.
+      // Historical uploads get a non-primary tag; no separate dist-tag write needs a token.
+      const tags = await get.json(`https://registry.npmjs.org/-/package/${encodeURIComponent(pkg.name)}/dist-tags`, { missing: true })
+      const candidate = publicationTag(pkg.version, tags === undefined ? {} : tags)
+      if (now() >= end) throw new Pending("registry deadline elapsed")
+      tag = candidate
+      break
+    } catch (error) {
+      if (!(error instanceof Pending)) throw error
+      reason = error.message
+    }
+    const remaining = end - now()
+    if (remaining > 0) await sleep(Math.min(intervalMs, remaining))
   }
-  assert.equal(response.status, 404, `Registry lookup failed: HTTP ${response.status}`)
-  const tag = prerelease || isPrerelease(pkg.version) ? "next" : "latest"
+  assert.ok(tag !== undefined, `Registry lookup could not be verified within ${readTimeoutMs / 1000}s: ${reason}; no upload was attempted`)
   run("npm", ["publish", tarball, "--ignore-scripts", "--access", "public",
-    "--provenance", "--tag", tag, "--registry", "https://registry.npmjs.org/"], { stdio: "inherit" })
-  return "submitted"
+    "--provenance", "--tag", tag, "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"], { stdio: "inherit" })
+  return { status: "submitted", tag }
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  const tarball = process.argv[2]
-  assert.ok(tarball && process.argv.length === 3, "Expected one verified package archive")
-  const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
-  const bytes = await readFile(tarball)
-  await publishRelease(tarball, pkg, bytes)
-  const tag = process.env.RELEASE_PRERELEASE === "true" || isPrerelease(pkg.version) ? "next" : "latest"
-  await verifyPublication(pkg, bytes, tag)
+  const directory = process.argv[2]
+  assert.ok(directory && process.argv.length === 3, "Expected one verified artifact directory")
+  const { tarball, pkg, bytes } = await loadReleaseArtifact(directory, expectedArtifact())
+  const result = await publishRelease(tarball, pkg, bytes)
+  await verifyPublication(pkg, bytes, result.tag === "archive" ? undefined : result.tag)
 }

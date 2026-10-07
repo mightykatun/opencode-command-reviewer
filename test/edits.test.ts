@@ -96,3 +96,77 @@ test("edit evidence cancellation and untrusted diff text preserve the proposal l
   await assert.rejects(collectEditEvidence(input, limits, abort.signal), { name: "AbortError" })
   assert.equal((await collectEditEvidence(input, limits, signal())).changes[0]?.diff, instruction)
 })
+
+test("native normalization projects known fields without traversing unrelated getters or cyclic metadata", async () => {
+  let touched = 0
+  const extra: Record<string, unknown> = {}; extra.cycle = extra
+  for (const tool of ["edit", "write", "apply_patch"] as const) {
+    const file = { filePath: "/project/file", type: "update", patch: diff,
+      get unrelated() { touched++; throw new Error("must not probe") },
+      get additions() { touched++; throw new Error("included diffs do not need optional counts") }, extra }
+    const metadata = tool === "apply_patch" ? { files: [file], get diff() { touched++; throw new Error("aggregate is unrelated") }, extra }
+      : { filepath: "/project/file", diff, get files() { touched++; throw new Error("patch files are unrelated") }, extra }
+    const result = await collectEditEvidence(context(tool, metadata), limits, signal())
+    assert.equal(result.changes[0]?.diff, diff)
+    assert.equal(result.partial, false)
+    assert.doesNotMatch(JSON.stringify(result), /unrelated|cycle/)
+  }
+  assert.equal(touched, 0)
+  const metadata = { filepath: "/project/file", get diff() { touched++; return diff } }
+  await assert.rejects(collectEditEvidence(context("edit", metadata), limits, signal()), /accessor/)
+  assert.equal(touched, 0)
+})
+
+test("repeated rejected multibyte diffs cannot rescan an unrestricted aggregate measurement workload", async () => {
+  const body = "é".repeat(8 * 1024 * 1024)
+  const files = [
+    { filePath: "/p/one", type: "update", patch: body },
+    { filePath: "/p/two", type: "update", patch: body },
+    { filePath: "/p/three", type: "update", patch: diff, additions: 5, deletions: 2 },
+  ]
+  const result = await collectEditEvidence(context("apply_patch", { files }), { ...limits, maxEvidenceBytes: 8 * 1024 * 1024 }, signal())
+  assert.ok(result.changes.every(change => change.diff === undefined))
+  assert.match(result.changes[2]?.reason ?? "", /shared diff UTF-8 measurement work limit/)
+  assert.match(result.changes[2]?.delta ?? "", /\+5 −2 lines/)
+})
+
+test("native normalization bounds mandatory enumeration and header bytes without truncating scope", async () => {
+  const files = new Array(16385)
+  let touched = false
+  Object.defineProperty(files, "0", { get() { touched = true; return {} } })
+  await assert.rejects(collectEditEvidence(context("apply_patch", { files }), limits, signal()), /16,384-entry/)
+  assert.equal(touched, false)
+  const input = context("edit", { filepath: "x".repeat(16 * 1024 * 1024 + 1), diff })
+  await assert.rejects(collectEditEvidence(input, limits, signal()), /16 MiB normalization/)
+  const scope = context("edit", { filepath: "/project/file", diff })
+  scope.permission.patterns = new Array(16385)
+  await assert.rejects(collectEditEvidence(scope, limits, signal()), /16,384-entry/)
+})
+
+test("oversized omitted diffs use host counts and do not starve a later fitting complete diff", async () => {
+  const huge = " ".repeat(16 * 1024 * 1024 + 1)
+  const files = [
+    { filePath: "/p/huge", type: "update", patch: huge, additions: 9, deletions: 4 },
+    { filePath: "/p/later", type: "update", patch: diff },
+  ]
+  const result = await collectEditEvidence(context("apply_patch", { files }), { ...limits, maxEvidenceBytes: Buffer.byteLength(diff) }, signal())
+  assert.match(result.changes[0]?.delta ?? "", /\+9 −4 lines/)
+  assert.equal(result.changes[0]?.diff, undefined)
+  assert.equal(result.changes[1]?.diff, diff)
+  assert.match(result.limitations.join(" "), /shared .*counting allowance/)
+})
+
+test("omitted diff line-count work is shared across changes and falls back only to valid host counts", async () => {
+  const first = `${"header\n".repeat(65533)}@@ -1 +1 @@\n-old\n+new\n`
+  const files = [
+    { filePath: "/p/first", type: "update", patch: first },
+    { filePath: "/p/second", type: "update", patch: diff, additions: 7, deletions: 3 },
+    { filePath: "/p/third", type: "update", patch: diff, additions: -1, deletions: "3" },
+  ]
+  const result = await collectEditEvidence(context("apply_patch", { files }), { ...limits, maxEvidenceBytes: 1 }, signal())
+  assert.match(result.changes[0]?.delta ?? "", /\+1 −1 lines/)
+  assert.match(result.changes[1]?.delta ?? "", /\+7 −3 lines/)
+  assert.equal(result.changes[2]?.delta, undefined)
+  assert.ok(result.changes.every(change => change.diff === undefined))
+  assert.match(result.limitations.join(" "), /65,536-line/)
+})

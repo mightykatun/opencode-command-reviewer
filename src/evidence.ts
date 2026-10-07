@@ -1,286 +1,12 @@
 import path from "node:path"
 import { constants } from "node:fs"
-import { parse } from "shell-quote"
 import type { EditChange, EditContext, EditEvidence, Evidence, FileEvidence, Limits } from "./types.js"
-import { FileLimit, diffDelta, omittedFile } from "./files.js"
+import { FileLimit, DiffBudget, diffDelta, omittedFile } from "./files.js"
 import { fileAccess, fileFailure, type FileScope } from "./file-access.js"
+import { discover, type Reference } from "./shell-discovery.js"
+import { reviewStage } from "./deadline.js"
 
-const VARIABLE = "\u0000UNRESOLVED_VARIABLE\u0000"
-const python = /^python(?:[23](?:\.\d+)*)?$/
-const shell = /^(?:ba|da|k|z)?sh$/
-const assignment = /^[A-Za-z_][A-Za-z_0-9]*=/
-interface Reference { filename: string; cwd: string | null; executable: boolean }
-
-function balancedQuotes(command: string): boolean {
-  let quote = ""
-  for (let i = 0; i < command.length; i++) {
-    const char = command[i]
-    if (char === "\\" && quote !== "'") {
-      if (++i === command.length) return false
-    } else if (quote && char === quote) quote = ""
-    else if (!quote && (char === "'" || char === '"')) quote = char
-  }
-  return !quote
-}
-
-function unsupportedShellSyntax(command: string): string | undefined {
-  let quote = ""
-  let inWord = false
-  for (let i = 0; i < command.length; i++) {
-    const char = command[i]
-    if (char === "\\" && quote !== "'") { i++; inWord = true }
-    else if (quote) { if (char === quote) quote = "" }
-    else if (char === "'" || char === '"') { quote = char; inWord = true }
-    else if (char === "#") {
-      if (!inWord) return
-      return "Unquoted # within a shell word is outside reliable tokenization; script targets were not resolved."
-    } else if (char === "[" || char === "{" || char === "}") {
-      return "Unquoted bracket glob or brace syntax is outside literal discovery; script targets were not resolved."
-    } else inWord = !/[\s;&|()<>]/.test(char!)
-  }
-}
-
-/** Literal discovery only. shell-quote is a tokenizer, not a shell evaluator. */
-export function discover(command: string, cwd: string | null, depth = 0): {
-  references: Reference[]; limitations: string[]
-} {
-  const references: Reference[] = []
-  const limitations: string[] = []
-  const note = (text: string) => { if (!limitations.includes(text)) limitations.push(text) }
-  if (depth > 4 || command.includes("\u0000") || /[\r\n`]/.test(command)) {
-    note("Script discovery unavailable for multiline commands, backticks, NULs, or deeply nested shell strings; inspect command text directly.")
-    return { references, limitations }
-  }
-  if (!balancedQuotes(command)) {
-    note("Shell quoting could not be resolved reliably; script contents were not collected.")
-    return { references, limitations }
-  }
-  const unsupported = unsupportedShellSyntax(command)
-  if (unsupported) {
-    note(unsupported)
-    return { references, limitations }
-  }
-  let tokens: ReturnType<typeof parse>
-  try { tokens = parse(command, () => VARIABLE) } catch {
-    note("Shell tokenization failed; script targets could not be resolved.")
-    return { references, limitations }
-  }
-  // No claim to understand control flow, substitutions, heredocs or redirections.
-  if (tokens.some((t) => typeof t !== "string" && "op" in t && !["&&", "||", ";", "|", "glob"].includes(t.op))) {
-    note("Shell grouping, substitution, background execution or redirection prevents reliable script discovery; inspect command text directly.")
-    return { references, limitations }
-  }
-  let currentCwd = cwd
-  let words: string[] = []
-  let uncertainWord = false
-  let preceded = false
-  let previousOperator: string | undefined
-  let conditionalCwd = false
-  let explicitCdpath = false
-  const observeAssignment = (word: string) => {
-    if (!word.startsWith("CDPATH=")) return
-    explicitCdpath = true
-    note("Explicit CDPATH assignment is not evaluated; directory-search targets may be unresolved.")
-  }
-  const literal = (s: string) => !s.includes(VARIABLE) && !s.startsWith("~")
-  const qualifySnapshot = () => {
-    if (preceded) note("Files are current filesystem snapshots; preceding command statements may change them before execution.")
-  }
-  const add = (filename: string, executable = false) => {
-    if (!literal(filename) || uncertainWord) {
-      note(`Script filename unresolved: ${filename.replaceAll(VARIABLE, "<variable>")}`)
-      return
-    }
-    references.push({ filename, cwd: currentCwd, executable })
-    qualifySnapshot()
-  }
-  const visit = (next?: string) => {
-    const args = words
-    words = []
-    let builtins = true
-    while (args[0] && assignment.test(args[0])) observeAssignment(args.shift()!)
-    let wrappers = 0
-    while (["env", "/usr/bin/env", "command", "exec"].includes(args[0] ?? "")) {
-      if (wrappers++ >= 8) { note("Wrapper nesting exceeds literal discovery's eight-wrapper limit; source was not resolved."); return }
-      const wrapper = args.shift()!
-      if (wrapper === "env" || wrapper === "/usr/bin/env") {
-        builtins = false
-        while (args[0]?.startsWith("-")) {
-          const option = args.shift()!
-          if (option === "--") break
-          if (option === "-i" || option === "--ignore-environment") continue
-          if (option === "-u" || option === "--unset") {
-            if (!args[0] || !literal(args[0]) || uncertainWord) {
-              note("Missing or unresolved env option argument; invoked source was not resolved.")
-              return
-            }
-            args.shift()
-            continue
-          }
-          note("Unsupported env option; invoked script source could not be resolved.")
-          return
-        }
-        // `--` ends env options, not its NAME=value operands.
-        while (args[0] && assignment.test(args[0])) observeAssignment(args.shift()!)
-      } else {
-        if (!builtins) {
-          note(`Unsupported wrapper composition: ${wrapper} after an external launcher is not assumed to be a shell builtin.`)
-          return
-        }
-        if (wrapper === "exec") builtins = false
-        if (args[0] === "--") args.shift()
-        else if (args[0]?.startsWith("-")) {
-          note(`Unsupported ${wrapper} option; invoked script source was not resolved.`)
-          return
-        }
-      }
-      if (!args[0]) { note(`No command operand after ${wrapper}; invoked script source was not resolved.`); return }
-    }
-    const executable = args.shift()
-    if (!executable) return
-    if (executable.startsWith("-")) { note("Wrapper options prevent script discovery."); return }
-    const base = path.basename(executable)
-    if (builtins && ["export", "readonly", "declare", "typeset"].includes(executable)) args.forEach(observeAssignment)
-    if (builtins && ["pushd", "popd"].includes(executable)) {
-      currentCwd = null
-      note("Directory-stack operations are outside literal discovery; the working directory is unresolved.")
-      return
-    }
-    if (builtins && executable === "cd") {
-      if (args[0] === "--") args.shift()
-      const target = args[0]
-      const searchesCdpath = target && !path.isAbsolute(target) && !/^\.\.?(?:\/|$)/.test(target)
-      if (previousOperator === "|" || next === "|") {
-        currentCwd = null
-        note("Pipeline directory changes do not establish a reliable cwd for later script targets.")
-      } else if (args.length === 1 && target && !target.startsWith("-") && literal(target) && !uncertainWord
-        && !(explicitCdpath && searchesCdpath) && next === "&&" && currentCwd) {
-        currentCwd = path.resolve(currentCwd, target)
-        conditionalCwd = true
-      } else {
-        currentCwd = null
-        note("Working directory after cd is unresolved; relative script targets will not be guessed.")
-      }
-      return
-    }
-    if (["if", "then", "else", "fi", "for", "while", "until", "do", "done", "case", "function", "{"].includes(base)) {
-      note("Shell control flow is outside literal discovery; script coverage is incomplete.")
-      currentCwd = null
-      return
-    }
-    if (!literal(executable)) {
-      note("Executable name contains unresolved expansion; script coverage is incomplete.")
-      return
-    }
-    if (base === "cat" || base === "head") {
-      const operands: string[] = []
-      let options = true
-      for (let i = 0; i < args.length; i++) {
-        const arg = args[i]!
-        if (options && arg === "--") { options = false; continue }
-        if (options && arg.startsWith("-") && arg !== "-") {
-          if (base === "cat" && (/^-[AbEenstTuv]+$/.test(arg) || ["--show-all", "--number-nonblank", "--show-ends", "--number", "--squeeze-blank", "--show-tabs", "--show-nonprinting"].includes(arg))) continue
-          if (base === "head") {
-            if (/^-[qvz]+$/.test(arg) || ["--quiet", "--silent", "--verbose", "--zero-terminated"].includes(arg)) continue
-            if (["-n", "-c", "--lines", "--bytes"].includes(arg) && /^-?\d+[kKMGTPEZY]?(?:B|iB)?$/.test(args[i + 1] ?? "")) { i++; continue }
-            if (/^(?:-[nc]?|--(?:lines|bytes)=)-?\d+[kKMGTPEZY]?(?:B|iB)?$/.test(arg)) continue
-          }
-          note(`Unsupported ${base} option; file operands were not resolved.`)
-          return
-        }
-        if (arg === "-") note(`${base} reads stdin; no file was resolved for that operand.`)
-        else operands.push(arg)
-      }
-      operands.forEach((operand) => add(operand))
-      return
-    }
-    if (python.test(base) || shell.test(base)) {
-      const isPython = python.test(base)
-      for (let i = 0; i < args.length; i++) {
-        const arg = args[i]!
-        if (arg === "--") {
-          const operand = args[i + 1]
-          if (!operand || (isPython && operand === "-")) note("Interpreter reads stdin; no separate script file was resolved.")
-          else if (!isPython && operand === "-") note("Shell '-' operand after -- is outside supported script discovery.")
-          else add(operand)
-          return
-        }
-        if (!isPython && arg === "-") { note("Shell '-' invocation is outside supported script discovery."); return }
-        if (arg === "-" || (!isPython && /^-[abefhiklmnptuvxBCEHPTs]*s[abefhiklmnptuvxBCEHPTs]*$/.test(arg))) {
-          note("Interpreter reads stdin; no separate script file was resolved.")
-          return
-        }
-        if ((isPython && arg === "-c") || (!isPython && /^-[abefhiklmnptuvxBCEHPT]*c$/.test(arg))) {
-          if (!args[i + 1] || !literal(args[i + 1]!) || uncertainWord) note("Inline interpreter code contains unresolved expansion or is missing; its runtime contents are unavailable.")
-          if (!isPython && args[i + 1] && literal(args[i + 1]!) && !uncertainWord) {
-            const nested = discover(args[i + 1]!, explicitCdpath ? null : currentCwd, depth + 1)
-            references.push(...nested.references)
-            nested.limitations.forEach(note)
-            if (nested.references.length) qualifySnapshot()
-          }
-          return
-        }
-        if (isPython && (arg === "-m" || arg.startsWith("-m") || arg.startsWith("-c"))) {
-          if (!arg.startsWith("-c")) note("Python module execution: module source is not resolved by direct-script discovery.")
-          return
-        }
-        if ((isPython && (arg === "-W" || arg === "-X")) || (!isPython && (arg === "-o" || arg === "+o"))) {
-          if (!args[i + 1] || !literal(args[i + 1]!) || uncertainWord) {
-            note(`Interpreter option ${arg} has a missing or unresolved argument; script source was not resolved.`)
-            return
-          }
-          i++
-          continue
-        }
-        if (arg.startsWith("-") || (!isPython && arg.startsWith("+"))) {
-          const known = isPython ? /^-[bBdEIOPqRsSuv]+$/.test(arg) || /^-(W|X).+/.test(arg)
-            : /^[-+][abefhiklmnptuvxBCEHPT]+$/.test(arg) || ["--noprofile", "--norc"].includes(arg)
-          if (known) continue
-          note(`Interpreter option ${arg} is outside supported script discovery.`)
-          return
-        }
-        add(arg)
-        return
-      }
-      return
-    }
-    if (builtins && (executable === "source" || executable === ".")) {
-      if (args[0] === "--") args.shift()
-      if (args[0]?.startsWith("-")) note("Unsupported sourcing option; source target was not resolved.")
-      else if (args[0] && !args[0].includes("/")) note("Bare source operand uses PATH lookup; its file was not resolved.")
-      else if (args[0]) add(args[0])
-      currentCwd = null
-      note("Sourced code may change the shell environment or working directory.")
-      return
-    }
-    if (executable.includes("/")) add(executable, true)
-    else if (/\.(py|sh|bash|zsh)$/.test(executable)) note(`Executable ${executable} uses PATH lookup; its file was not resolved.`)
-    else if (["sudo", "su", "ssh", "docker", "podman", "eval", "xargs", "find", "npm", "npx", "make", "uv", "poetry"].includes(base)) {
-      note(`Indirect execution through ${base}: invoked source is not automatically discovered.`)
-    }
-  }
-  for (const token of tokens) {
-    if (typeof token === "string") words.push(token)
-    else if ("comment" in token) break
-    else if ("op" in token && token.op === "glob" && "pattern" in token) { words.push(String(token.pattern)); uncertainWord = true }
-    else if ("op" in token && typeof token.op === "string") {
-      visit(token.op)
-      previousOperator = token.op
-      uncertainWord = false
-      preceded = true
-      if (token.op === "||") {
-        currentCwd = null
-        note("Conditional fallback makes the working directory uncertain for later statements.")
-      } else if (token.op === ";" && conditionalCwd) {
-        currentCwd = null
-        conditionalCwd = false
-        note("Earlier cd may fail or be skipped before this statement; the working directory is unresolved at the branch join.")
-      }
-    }
-  }
-  visit()
-  return { references, limitations }
-}
+export { discover } from "./shell-discovery.js"
 
 async function capture(reference: Reference, budget: number, signal: AbortSignal, scope: FileScope): Promise<FileEvidence> {
   const result: FileEvidence = { filename: reference.filename, status: "unavailable" }
@@ -348,9 +74,10 @@ export async function collectEvidence(
   scope: FileScope = fileAccess.scope(signal),
 ): Promise<Evidence> {
   signal.throwIfAborted()
+  if (input.command.length > limits.maxEvidenceBytes) throw new Error("Command exceeds configured evidence budget")
   const commandBytes = Buffer.byteLength(input.command)
   if (commandBytes > limits.maxEvidenceBytes) throw new Error("Command exceeds configured evidence budget")
-  const discovery = discover(input.command, input.cwd)
+  const discovery = discover(input.command, input.cwd, 0, signal)
   const evidence: Evidence = { ...input, kind: "shell", files: [], limitations: [
     ...(input.limitations ?? []),
     "Only literal Python/shell source and supported cat/head file operands are collected. Files are full review-time snapshots, not command output. Imports, dependencies, other runtimes and calls inside source files are not recursively inspected.",
@@ -359,29 +86,46 @@ export async function collectEvidence(
   if (!input.userPrompt) evidence.limitations.push("User prompt unavailable.")
   let remaining = limits.maxEvidenceBytes - commandBytes
   const limit = new FileLimit(limits.maxFiles, scope)
-  const selected = new Map<string | symbol, { reference: Reference; filename: string | null; withinLimit: boolean; aliases: string[] }>()
+  const declared = new Map<string | symbol, Reference>()
+  // Exact declared aliases can relax qualification before the first capture,
+  // without performing any filesystem work on later candidates.
   for (const reference of discovery.references) {
+    signal.throwIfAborted()
+    const filename = path.isAbsolute(reference.filename) ? reference.filename : reference.cwd ? `${reference.cwd}/${reference.filename}` : null
+    const key = filename ?? Symbol()
+    const previous = declared.get(key)
+    if (previous) previous.executable &&= reference.executable
+    else declared.set(key, { ...reference })
+  }
+  const selected = new Map<string | symbol, { reference: Reference; filename: string | null; withinLimit: boolean; aliases: Set<string>; file: FileEvidence }>()
+  for (const reference of declared.values()) {
     signal.throwIfAborted()
     const filename = path.isAbsolute(reference.filename) ? reference.filename : reference.cwd ? `${reference.cwd}/${reference.filename}` : null
     const { key, withinLimit } = await limit.consider(filename, signal)
     const previous = selected.get(key)
     if (previous) {
+      const promote = previous.reference.executable && !reference.executable
       previous.reference.executable &&= reference.executable
-      if (filename && filename !== previous.filename && !previous.aliases.includes(filename)) previous.aliases.push(filename)
-    } else selected.set(key, { reference: { ...reference }, filename, withinLimit, aliases: [] })
-  }
-  for (const { reference, filename, withinLimit, aliases } of selected.values()) {
-    signal.throwIfAborted()
-    if (!withinLimit) {
-      evidence.files.push({ filename: reference.filename, ...(filename ? { path: filename } : {}), ...(aliases.length ? { aliases } : {}), status: "file-count limit reached", warning: omittedFile(filename ?? reference.filename) })
+      if (filename && filename !== previous.filename) previous.aliases.add(filename)
+      // A different canonical alias used as an interpreter/reader operand can
+      // qualify an earlier direct executable. Never retry failed/timed-out I/O.
+      if (promote && previous.withinLimit && previous.file.status === "direct executable is not identifiable as Python/shell source; contents not provided") {
+        const file = await capture(previous.reference, remaining, signal, scope)
+        Object.assign(previous.file, file)
+        if (file.contents !== undefined) { delete previous.file.warning; remaining -= Buffer.byteLength(file.contents) }
+      }
       continue
     }
-    const file = await capture(reference, remaining, signal, scope)
-    if (aliases.length) file.aliases = aliases
+    // Capture each newly admitted candidate before a later path probe can spend
+    // the shared filesystem allowance or occupy its outstanding transaction slots.
+    const file = withinLimit ? await capture(reference, remaining, signal, scope)
+      : { filename: reference.filename, ...(filename ? { path: filename } : {}), status: "file-count limit reached" }
     if (file.contents === undefined) file.warning = omittedFile(file.path ?? file.filename)
+    selected.set(key, { reference, filename, withinLimit, aliases: new Set(), file })
     evidence.files.push(file)
     remaining -= Buffer.byteLength(file.contents ?? "")
   }
+  for (const { file, aliases } of selected.values()) if (aliases.size) file.aliases = [...aliases]
   signal.throwIfAborted()
   evidence.limitations.push(...limit.limitations)
   return evidence
@@ -389,45 +133,96 @@ export async function collectEvidence(
 
 /** Use host-computed diffs, never apply edits or duplicate unbounded tool input. */
 export async function collectEditEvidence(input: EditContext, limits: Limits, signal: AbortSignal, scope: FileScope = fileAccess.scope(signal)): Promise<EditEvidence> {
-  signal.throwIfAborted()
-  const { metadata, ...permissionScope } = input.permission
+  reviewStage(signal, "Evidence collection")
+  const metadata = input.permission.metadata
   const limitations = [...input.limitations,
     "Proposed diffs come from the pending host permission, not from applying edits. Full files, dependencies and post-approval formatter changes are not inspected; host diffs may normalize whitespace or omit BOMs.",
   ]
   const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  const field = (value: object, key: string): unknown => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor) return undefined
+    if (!Object.hasOwn(descriptor, "value")) throw new Error("Native edit metadata contains an accessor")
+    return descriptor.value
+  }
+  // Scope/header work is independently bounded, not charged to the configured
+  // allowance for diff bodies. Never silently truncate mandatory target scope.
+  let headerBytes = 16 * 1024 * 1024
+  const text = (value: unknown): string | undefined => {
+    if (typeof value !== "string") return
+    reviewStage(signal, "Evidence collection")
+    if (value.length > headerBytes) throw new Error("Native edit scope exceeds the 16 MiB normalization limit")
+    headerBytes -= Buffer.byteLength(value)
+    if (headerBytes < 0) throw new Error("Native edit scope exceeds the 16 MiB normalization limit")
+    return value
+  }
+  const patterns = (values: string[]) => {
+    if (values.length > 16384) throw new Error("Native edit scope exceeds the 16,384-entry normalization limit")
+    const result: string[] = []
+    for (let index = 0; index < values.length; index++) {
+      const value = text(field(values, String(index)))
+      if (value === undefined) throw new Error("Native edit scope contains an invalid pattern")
+      result.push(value)
+    }
+    return result
+  }
+  const scopeText = (value: string) => {
+    const result = text(value)
+    if (result === undefined) throw new Error("Native edit scope contains invalid identity text")
+    return result
+  }
+  const permissionScope = { id: scopeText(input.permission.id), type: scopeText(input.permission.type),
+    patterns: patterns(input.permission.patterns), always: patterns(input.permission.always),
+    tool: input.permission.tool ? { messageID: scopeText(input.permission.tool.messageID), callID: scopeText(input.permission.tool.callID) } : null }
   const patch = input.tool === "apply_patch"
-  const files = patch ? Array.isArray(metadata.files) ? metadata.files : []
-    : [{ filePath: metadata.filepath, patch: metadata.diff, type: input.tool, additions: metadata.additions, deletions: metadata.deletions }]
+  const hostFiles = patch ? field(record(metadata), "files") : undefined
+  const files = patch ? Array.isArray(hostFiles) ? hostFiles : [] : [metadata]
+  if (files.length > 16384) throw new Error("Native edit changes exceed the 16,384-entry normalization limit")
   if (!files.length) limitations.push("Per-file patch metadata unavailable; affected changes could not be enumerated.")
   let remaining = limits.maxEvidenceBytes
+  let measurementUnits = 16 * 1024 * 1024
   const changes: EditChange[] = []
   const limit = new FileLimit(limits.maxFiles, scope)
+  const countsBudget = new DiffBudget()
   for (let index = 0; index < files.length; index++) {
-    signal.throwIfAborted()
-    const file = record(files[index])
-    const operation = typeof file.type === "string" && ["add", "update", "delete", "move", "edit", "write"].includes(file.type) ? file.type as EditChange["operation"] : "unknown"
+    reviewStage(signal, "Evidence collection")
+    const file = record(patch ? field(files, String(index)) : metadata)
+    const type = patch ? field(file, "type") : input.tool
+    const operation = typeof type === "string" && ["add", "update", "delete", "move", "edit", "write"].includes(type) ? type as EditChange["operation"] : "unknown"
+    const filePath = text(field(file, patch ? "filePath" : "filepath"))
+    const movePath = patch ? text(field(file, "movePath")) : undefined
+    const diff = field(file, patch ? "patch" : "diff")
     const change: EditChange = {
-      path: typeof file.filePath === "string" && file.filePath.trim() ? file.filePath : null,
+      path: filePath?.trim() ? filePath : null,
       operation, status: "omitted",
-      ...(typeof file.movePath === "string" ? { movePath: file.movePath } : {}),
+      ...(movePath !== undefined ? { movePath } : {}),
     }
     const { withinLimit } = await limit.consider(change.path && path.isAbsolute(change.path) ? change.path : null, signal)
     if (!withinLimit) change.reason = "file-count limit reached"
     else if (!change.path || !path.isAbsolute(change.path)) change.reason = "absolute target path unavailable"
     else if (operation === "unknown" || (patch && (operation === "edit" || operation === "write"))) change.reason = "file operation unavailable or unsupported"
     else if (operation === "move" && (!change.movePath || !path.isAbsolute(change.movePath))) change.reason = "absolute move destination unavailable"
-    else if (typeof file.patch !== "string" || !file.patch.trim()) change.reason = "proposed diff unavailable"
-    else if (Buffer.byteLength(file.patch) > remaining) change.reason = "complete diff exceeds remaining evidence byte budget"
+    else if (typeof diff !== "string" || !diff.length) change.reason = "proposed diff unavailable"
+    else if (diff.length > remaining) change.reason = "complete diff exceeds remaining evidence byte budget"
+    else if (diff.length > measurementUnits) change.reason = "shared diff UTF-8 measurement work limit reached"
     else {
-      change.status = "included"
-      change.diff = file.patch
-      remaining -= Buffer.byteLength(file.patch)
+      // Repeated rejected multibyte bodies must not each rescan the full byte
+      // allowance. Included bodies already have a separate aggregate byte cap.
+      measurementUnits -= diff.length
+      const bytes = Buffer.byteLength(diff)
+      if (bytes > remaining) change.reason = "complete diff exceeds remaining evidence byte budget"
+      else if (!diff.trim()) change.reason = "proposed diff unavailable"
+      else { change.status = "included"; change.diff = diff; remaining -= bytes }
     }
     if (change.status === "omitted") {
       change.warning = omittedFile(change.path)
-      const counts = diffDelta(file.patch, signal)
-        ?? (Number.isSafeInteger(file.additions) && Number(file.additions) >= 0 && Number.isSafeInteger(file.deletions) && Number(file.deletions) >= 0
-          ? { added: Number(file.additions), removed: Number(file.deletions) } : undefined)
+      let counts = diffDelta(diff, signal, countsBudget)
+      if (!counts) {
+        const added = field(file, "additions"), removed = field(file, "deletions")
+        if (Number.isSafeInteger(added) && Number(added) >= 0 && Number.isSafeInteger(removed) && Number(removed) >= 0) {
+          counts = { added: Number(added), removed: Number(removed) }
+        }
+      }
       if (counts) change.delta = `[Δ] ${JSON.stringify(change.path)}: +${counts.added} −${counts.removed} lines`
     }
     changes.push(change)
@@ -436,7 +231,8 @@ export async function collectEditEvidence(input: EditContext, limits: Limits, si
   if (partial) limitations.push("Edit evidence is incomplete. Omitted changes are not assessed by the supplied diffs; do not assume the whole proposal is safe.")
   if (!input.userPrompt) limitations.push("User prompt unavailable.")
   limitations.push(...limit.limitations)
-  signal.throwIfAborted()
+  if (countsBudget.exhausted) limitations.push("Some omitted-diff line counts exceeded the shared 16 MiB/65,536-line/250 ms counting allowance; valid host counts were used when available.")
+  reviewStage(signal, "Evidence collection")
   return {
     kind: "edit", tool: input.tool, userPrompt: input.userPrompt, session: input.session,
     location: input.location, changes, partial, limitations,

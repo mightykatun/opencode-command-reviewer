@@ -7,6 +7,7 @@ import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { LifetimeUsage, lifetimeCost, lifetimeReport } from "../src/lifetime.js"
 import { usageAttempt } from "../src/usage.js"
+import { setImmediate as settle } from "node:timers/promises"
 
 const exec = promisify(execFile)
 const source = new URL("../src/lifetime.ts", import.meta.url).href
@@ -109,6 +110,27 @@ test("failed persistence can recover without losing increments; invalid usage an
   await assert.rejects(store.record({ input: 1, output: 0, cost: Infinity }))
   assert.deepEqual(await store.totals(), before)
   await assert.rejects(store.totals(AbortSignal.abort()), { name: "AbortError" })
+})
+
+test("a canceled totals read waiting for flush does not cancel or discard independent writes", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "review-canceled-totals-"))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const store = new LifetimeUsage(directory)
+  let finish!: () => void
+  const waiting = new Promise<void>((resolve) => { finish = resolve })
+  const originalFlush = store.flush.bind(store)
+  t.mock.method(store, "flush", () => waiting)
+  const abort = new AbortController()
+  const read = assert.rejects(store.totals(abort.signal), { name: "AbortError" })
+  await settle()
+  abort.abort()
+  await store.record({ cost: 0.1 })
+  await originalFlush()
+  finish()
+  await read
+  const saved = await new LifetimeUsage(directory).totals()
+  assert.equal(saved.requests, 1)
+  assert.equal(saved.cost, 0.1)
 })
 
 test("cost-only observations preserve independent token coverage and show one accumulated history cost", async (t) => {

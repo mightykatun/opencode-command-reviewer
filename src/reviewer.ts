@@ -179,7 +179,7 @@ export async function review(
     signal.throwIfAborted()
     const progress = (phase: ReviewProgress["phase"], preview?: Partial<Assessment>) => {
       if (signal.aborted) return
-      try { onProgress?.({ attempt, phase, ...(preview ? { preview: { ...preview } } : {}) }) }
+      try { void Promise.resolve(onProgress?.({ attempt, phase, ...(preview ? { preview: { ...preview } } : {}) })).catch(() => {}) }
       catch { /* Observational callbacks cannot change review outcomes. */ }
     }
     progress(attempt ? "retrying" : "evaluating")
@@ -225,8 +225,9 @@ export async function review(
         if (!Array.isArray(choices) || choices.length !== 1) throw new Error("Reviewer API must return one completion")
         const choice = choices[0], message = choice?.message
         // Minimal non-stream providers may omit metadata; explicit values must describe text completion.
-        if (!object(message) || typeof message.content !== "string" || !textMetadata(message)
+        if (!object(choice) || !object(message) || typeof message.content !== "string" || !textMetadata(message)
           || (object(envelope) && envelope.error != null)
+          || choice.error != null
           || (choice.index !== undefined && choice.index !== 0)
           || (choice.finish_reason !== undefined && choice.finish_reason !== "stop")) {
           throw new Error("Reviewer API did not return a text assessment")

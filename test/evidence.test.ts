@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, appendFile, utimes, open, symlink,
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { discover, collectEvidence } from "../src/evidence.js"
+import { withDeadline } from "../src/deadline.js"
 
 const limits = { maxFiles: 4, maxEvidenceBytes: 65536 }
 const signal = () => new AbortController().signal
@@ -212,6 +213,173 @@ test("quoted and escaped bracket, brace and hash filenames remain literal", asyn
   const commented = discover("python safe.py # file[12].py {a,b}.py safe#other.py", dir)
   assert.deepEqual(commented.references.map((r) => r.filename), ["safe.py"])
   assert.deepEqual(commented.limitations, [])
+})
+
+test("unsupported unquoted whitespace cannot split an operand or executable and capture a source decoy", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "checker-evidence-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  await writeFile(`${dir}/safe.py`, "# wrongly selected source decoy\n")
+  for (const whitespace of ["\u000b", "\u000c", "\u00a0", "\u1680", "\u2003", "\u2028", "\u2029", "\u202f", "\u205f", "\u3000", "\ufeff"]) {
+    await writeFile(`${dir}/safe.py${whitespace}other.py`, "# actual literal operand\n")
+    for (const command of [
+      `python safe.py${whitespace}other.py`,
+      `python${whitespace}safe.py`,
+      `python safe.py\\${whitespace}other.py`,
+      `bash -c 'python safe.py${whitespace}other.py'`,
+    ]) {
+      const discovered = discover(command, dir)
+      assert.deepEqual(discovered.references, [], JSON.stringify(command))
+      assert.match(discovered.limitations.join("\n"), /Unsupported unquoted shell whitespace/, JSON.stringify(command))
+      const result = await collectEvidence({ command, cwd: dir, userPrompt: null }, limits, signal())
+      assert.equal(result.command, command)
+      assert.deepEqual(result.files, [], JSON.stringify(command))
+    }
+  }
+  assert.equal(discover("python \t safe.py", dir).references[0]?.filename, "safe.py")
+  assert.deepEqual(discover("python safe.py # ignored\u00a0comment", dir).limitations, [])
+})
+
+test("quoted Unicode whitespace paths are preserved literally, including nested shell strings", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "checker-evidence-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  for (const whitespace of ["\u00a0", "\u1680", "\u2003", "\u2028", "\u2029", "\u202f", "\u205f", "\u3000", "\ufeff"]) {
+    const filename = `task${whitespace}file.py`
+    const contents = `# literal ${filename}\n`
+    await writeFile(`${dir}/${filename}`, contents)
+    for (const command of [
+      `python '${filename}'`, `python "${filename}"`, `python task"${whitespace}"file.py`,
+      `bash -c 'python "${filename}"'`,
+    ]) {
+      const discovered = discover(command, dir)
+      assert.deepEqual(discovered.references, [{ filename, cwd: dir, executable: false }], JSON.stringify(command))
+      assert.deepEqual(discovered.limitations, [], JSON.stringify(command))
+      const result = await collectEvidence({ command, cwd: dir, userPrompt: null }, limits, signal())
+      assert.equal(result.command, command)
+      assert.equal(result.files[0]?.contents, contents, JSON.stringify(command))
+    }
+  }
+})
+
+test("program identity recognizes only bare names and exact conventional executable paths", () => {
+  for (const command of [
+    "/bin/python task.py", "/usr/bin/python3.12 -I -- task.py", "/bin/bash +x task.py",
+    "/usr/bin/sh -- task.py", "/bin/cat -- task.py", "/usr/bin/head -10 task.py",
+    "/bin/env -i python task.py", "/usr/bin/env -- MODE=test /usr/bin/python3 task.py",
+    "command -- /usr/bin/head -n 1 task.py", "exec -- /bin/env /bin/bash task.py",
+    "/bin/bash -lc 'python task.py'",
+  ]) {
+    assert.deepEqual(discover(command, "/project").references, [{ filename: "task.py", cwd: "/project", executable: false }], command)
+  }
+  for (const executable of [
+    "./python", "../bin/python3", "/custom/bin/python3.12", "./bash", "/usr/local/bin/sh",
+    "./head", "/custom/cat", "/usr/bin/../bin/python", "/usr/bin//python", "/bin/./head", "//usr/bin/env",
+  ]) {
+    assert.deepEqual(discover(`${executable} task.py`, "/project").references, [{ filename: executable, cwd: "/project", executable: true }], executable)
+  }
+})
+
+test("explicit named executables capture their own source rather than operand decoys or builtin effects", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "checker-evidence-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  await writeFile(`${dir}/decoy.py`, "# must not be selected as invoked source\n")
+  await writeFile(`${dir}/later.py`, "# later source in the unchanged parent cwd\n")
+  for (const name of ["python", "python3.12", "bash", "sh", "cat", "head", "env", "builtin", "command", "exec", "cd", "source", "eval", "if"]) {
+    const contents = `#!/bin/sh\n# executable named ${name}\n`
+    await writeFile(`${dir}/${name}`, contents)
+    for (const executable of [`./${name}`, `${dir}/${name}`]) {
+      for (const prefix of ["", "command -- ", "env -- ", "builtin command -- "]) {
+        const command = `${prefix}${executable} decoy.py; python later.py`
+        assert.deepEqual(discover(command, dir).references, [
+          { filename: executable, cwd: dir, executable: true },
+          { filename: "later.py", cwd: dir, executable: false },
+        ], command)
+        const result = await collectEvidence({ command, cwd: dir, userPrompt: null }, limits, signal())
+        assert.deepEqual(result.files.map((file) => file.contents), [contents, "# later source in the unchanged parent cwd\n"], command)
+      }
+    }
+  }
+  assert.deepEqual(discover("./bash -c 'python decoy.py'", dir).references, [{ filename: "./bash", cwd: dir, executable: true }])
+  assert.deepEqual(discover("./env python decoy.py", dir).references, [{ filename: "./env", cwd: dir, executable: true }])
+})
+
+test("builtin wrapper compositions preserve cd inference and explicit sourcing semantics", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "checker-evidence-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  await mkdir(`${dir}/sub`)
+  await writeFile(`${dir}/main.py`, "# parent cwd decoy\n")
+  await writeFile(`${dir}/sub/main.py`, "# correct builtin-cd source\n")
+  await writeFile(`${dir}/helpers.sh`, "# explicit builtin source\n")
+  for (const prefix of ["builtin", "builtin --", "command -- builtin --", "builtin command --", "builtin builtin --"]) {
+    const command = `${prefix} cd sub && python main.py`
+    assert.deepEqual(discover(command, dir).references, [{ filename: "main.py", cwd: `${dir}/sub`, executable: false }], command)
+    const result = await collectEvidence({ command, cwd: dir, userPrompt: null }, limits, signal())
+    assert.equal(result.files[0]?.contents, "# correct builtin-cd source\n", command)
+  }
+  for (const command of ["builtin source -- ./helpers.sh && python main.py", "command builtin . ./helpers.sh && python main.py"]) {
+    const discovered = discover(command, dir)
+    assert.deepEqual(discovered.references.map((reference) => [reference.filename, reference.cwd]), [["./helpers.sh", dir], ["main.py", null]], command)
+    const result = await collectEvidence({ command, cwd: dir, userPrompt: null }, limits, signal())
+    assert.equal(result.files[0]?.contents, "# explicit builtin source\n", command)
+    assert.equal(result.files[1]?.contents, undefined, command)
+  }
+  for (const command of [
+    "true | builtin cd sub && python main.py", "builtin cd sub | python main.py",
+    "builtin cd - && python main.py", "builtin cd -P sub && python main.py",
+    "builtin export CDPATH=/elsewhere; builtin cd sub && python main.py",
+  ]) assert.equal(discover(command, dir).references[0]?.cwd, null, command)
+})
+
+test("builtin-only and external wrapper dispatch never fabricate interpreter or nested-shell source", () => {
+  for (const command of [
+    "builtin python decoy.py", "command builtin /bin/bash -c 'python decoy.py'",
+    "builtin head decoy.py", "builtin env python decoy.py", "env builtin cd sub",
+    "exec builtin python decoy.py", "builtin exec command python decoy.py",
+  ]) {
+    const result = discover(command, "/project")
+    assert.deepEqual(result.references, [], command)
+    assert.match(result.limitations.join("\n"), /Unsupported builtin operand|Unsupported wrapper composition/, command)
+  }
+  for (const command of [
+    "builtin command python task.py", "builtin exec env python task.py",
+    "builtin command -- exec -- /usr/bin/env python task.py",
+    "command builtin command env python task.py",
+  ]) {
+    const result = discover(command, "/project")
+    assert.deepEqual(result.references, [{ filename: "task.py", cwd: "/project", executable: false }], command)
+    assert.deepEqual(result.limitations, [], command)
+  }
+  assert.equal(discover("builtin true; python task.py", "/project").references[0]?.cwd, "/project")
+  const tooDeep = discover("builtin builtin builtin builtin builtin builtin builtin builtin builtin cd sub && python task.py", "/project")
+  assert.equal(tooDeep.references[0]?.cwd, null)
+  assert.match(tooDeep.limitations.join("\n"), /eight-wrapper limit/)
+})
+
+test("unmodeled in-process shell state and builtin eval invalidate cwd without selecting source decoys", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "checker-evidence-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  await writeFile(`${dir}/main.py`, "# stale cwd decoy\n")
+  for (const statement of [
+    "eval 'cd elsewhere'", "builtin eval 'cd elsewhere'", "command -- builtin -- eval 'cd elsewhere'",
+    "builtin command eval 'cd elsewhere'", "builtin read CDPATH", "set -o posix", "shopt -s cdable_vars",
+    "alias cd=pushd", "enable -n cd", "builtin -x cd elsewhere", "command -p cd elsewhere", "$ACTION elsewhere",
+    "declare -n location=CDPATH", "builtin declare -a CDPATH", 'export "$DECLARATION"',
+  ]) {
+    const command = `${statement}; python main.py`
+    const discovered = discover(command, dir)
+    assert.deepEqual(discovered.references, [{ filename: "main.py", cwd: null, executable: false }], command)
+    assert.match(discovered.limitations.join("\n"), /working directory is unresolved/, command)
+    const result = await collectEvidence({ command, cwd: dir, userPrompt: null }, limits, signal())
+    assert.equal(result.command, command)
+    assert.equal(result.files[0]?.contents, undefined, command)
+    assert.match(result.files[0]?.status ?? "", /working directory unresolved/, command)
+  }
+  for (const statement of ["env eval 'cd elsewhere'", "exec eval 'cd elsewhere'", "command -v cd", "command -V cd"]) {
+    assert.equal(discover(`${statement}; python main.py`, dir).references[0]?.cwd, dir, statement)
+  }
+  const absolute = discover(`builtin eval 'cd elsewhere'; python ${dir}/main.py`, dir)
+  assert.deepEqual(absolute.references, [{ filename: `${dir}/main.py`, cwd: null, executable: false }])
+  const nested = discover("bash -c 'builtin cd sub && python inner.py'; python main.py", dir)
+  assert.deepEqual(nested.references.map((reference) => reference.cwd), [`${dir}/sub`, dir])
 })
 
 test("cwd inference stays within successful cd chains and becomes uncertain at branch joins", () => {
@@ -615,4 +783,58 @@ test("does not execute discovery payloads and respects pre-aborted work", async 
   const controller = new AbortController()
   controller.abort()
   await assert.rejects(collectEvidence({ command: "python x.py", cwd: dir, userPrompt: null }, limits, controller.signal), { name: "AbortError" })
+})
+
+test("cursor discovery retains operands after long assignment prefixes and option lists", () => {
+  const assignments = Array.from({ length: 8000 }, (_, index) => `A${index}=value`).join(" ")
+  for (const command of [
+    `${assignments} command env -- MODE=test python -I -- task.py`,
+    `env -- ${assignments} /usr/bin/head ${"-q ".repeat(8000)}-- task.py`,
+  ]) {
+    const result = discover(command, "/project")
+    assert.deepEqual(result.references, [{ filename: "task.py", cwd: "/project", executable: false }])
+    assert.deepEqual(result.limitations, [])
+  }
+})
+
+test("discovery limits tokenizer input and shares token/reference work across nested shell strings", async () => {
+  const tooMany = discover(`cat ${"operand ".repeat(65536)}`, "/project")
+  assert.deepEqual(tooMany.references, [])
+  assert.match(tooMany.limitations.join(" "), /shared .*work limits/)
+  const many = Array.from({ length: 10000 }, (_, index) => `f${index}`).join(" ")
+  const nested = discover(`cat ${many}; bash -c 'cat ${many}'; cat final`, "/project")
+  assert.equal(nested.references.length, 16384, "nested strings must not each get a fresh reference budget")
+  assert.match(nested.limitations.join(" "), /remaining source targets were not resolved/)
+  const large = "x".repeat(16 * 1024 * 1024 + 1)
+  assert.deepEqual(discover(large, "/project").references, [])
+  const command = `cat ${"operand ".repeat(65536)}`
+  const result = await collectEvidence({ command, cwd: "/project", userPrompt: "Inspect" }, { maxFiles: 1, maxEvidenceBytes: 16 * 1024 * 1024 }, signal())
+  assert.equal(result.command, command)
+  assert.deepEqual(result.files, [])
+  assert.match(result.limitations.join(" "), /work limits/)
+})
+
+test("synchronous discovery propagates cancellation and checks monotonic overall expiry", async () => {
+  const reason = new Error("permission resolved")
+  assert.throws(() => discover("python task.py", "/project", 0, AbortSignal.abort(reason)), error => error === reason)
+  await assert.rejects(withDeadline(signal(), 10, async s => {
+    const until = performance.now() + 20
+    while (performance.now() < until) { /* Delay timer delivery before synchronous discovery. */ }
+    return discover("python task.py", "/project", 0, s)
+  }), /timed out/)
+})
+
+test("discovery bounds UTF-8 input, expansion growth, unique notices and its own synchronous time", (t) => {
+  const unicode = "é".repeat(8 * 1024 * 1024 + 1)
+  assert.match(discover(unicode, "/project").limitations.join(" "), /work limits/)
+  const expansions = `python "${"$SCRIPT/".repeat(16385)}task.py"`
+  assert.match(discover(expansions, "/project").limitations.join(" "), /16,384-expansion/)
+  const notices = discover(Array.from({ length: 300 }, (_, index) => `python "$SCRIPT/file${index}.py"`).join("; "), "/project")
+  assert.equal(notices.references.length, 0)
+  assert.equal(notices.limitations.length, 257, "256 unique notices plus one fixed exhaustion notice")
+  let clock = 0
+  t.mock.method(performance, "now", () => { clock += 600; return clock })
+  const timed = discover("python task.py", "/project")
+  assert.deepEqual(timed.references, [])
+  assert.match(timed.limitations.join(" "), /500 ms work limits/)
 })

@@ -9,10 +9,10 @@ import { pathToFileURL } from "node:url"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeMetrics, smokeRuntime } from "./smoke-runtime.mjs"
 import { reviewerAudit, assertReviewerReuse } from "./smoke-reviewer.mjs"
+import { reviewStagePlan } from "./smoke-stages.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
 const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
-const hostVersion = execFileSync(hostBinary, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
 const scenario = process.argv[2] ?? "correction"
 const measureReuse = process.argv.includes("--measure-reuse")
 if (measureReuse) assert.equal(scenario, "external", "reuse baseline uses the two-stage external fixture")
@@ -29,6 +29,15 @@ const correction = scenario === "correction" || scenario === "edit"
 const withUsage = ["correction", "edit", "write", "patch", "auto-shell", "auto-scroll"].includes(scenario)
 const knownPricing = withUsage && scenario !== "write"
 const configFailure = scenario === "edit-config-error"
+const plan = reviewStagePlan(isExternal ? [{ kind: "external-directory", permission: "external_directory" }, { kind: "shell", permission: "bash" }]
+  : [{ kind: isEdit ? "edit" : "shell", permission: isEdit ? "edit" : "bash" }], {
+  reviewBash: !["edit", "bash-disabled", "external-disabled", "edit-config-error"].includes(scenario),
+  reviewEdits: !["correction", "edit-disabled"].includes(scenario), reviewMcp: false, reviewCustomTools: false,
+  reviewExternalDirectories: scenario !== "external-disabled",
+}, { auto, held: heldReview, correction, unavailable: configFailure,
+  unsafe: scenario === "auto-unsafe", error: ["error", "auto-error"].includes(scenario), cancel: scenario === "auto-cancel" })
+if (process.argv.includes("--plan")) { console.log(JSON.stringify(plan, null, 2)); process.exit(0) }
+const hostVersion = execFileSync(hostBinary, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
 const fixtureModel = scenario === "patch" ? "gpt-fixture" : "fixture"
 const initialWidth = scenario === "cancel" || scenario === "auto-initially-hidden" ? 80 : 160
 const formattedDescription = "Counts two fruit names.\n\n- **Output:** prints the count.\n- **File:** writes to `executed-marker`.\n- *Literal:* `\x1b[2J\u202e`.\n\n### Details\n\n[Documentation](https://example.com/review)"
@@ -281,11 +290,9 @@ try {
     $schema: "https://opencode.ai/tui.json",
     theme: scenario === "correction" ? "tokyonight" : "opencode",
     plugin: [[pluginFile, { baseURL: `http://127.0.0.1:${reviewPort}/review`, model: "review-fixture", apiKey: "fixture-review-key",
-      reviewExternalDirectories: scenario !== "external-disabled",
+      ...plan.settings,
       ...(scenario === "edit" || configFailure ? { instructions: customPrompts } : {}),
       ...(scenario === "patch" ? { maxFiles: 2 } : {}),
-      ...(scenario === "edit" || scenario === "bash-disabled" || scenario === "external-disabled" ? { reviewBash: false } : {}),
-      ...(scenario === "correction" || scenario === "edit-disabled" ? { reviewEdits: false } : {}),
       ...(auto ? { autoApprove: true, autoApproveDelaySeconds: autoDelay } : {}),
     }]],
   }))
@@ -980,7 +987,7 @@ try {
     await writeFile(path.join(root, `.runtime/${scenario}-requests.json`), JSON.stringify(calls, null, 2))
     console.log(`PASS ${scenario}: native approval, exact evidence, advisory behavior, panel cleanup${scenario === "cancel" ? ", >6s held response, observed HTTP cancellation, released late response and clean sidebar remount at 80x24" : scenario === "correction" ? ", long-analysis wheel/drag, live scrollbar theme and native fullscreen layering" : ""}. Isolated files: ${temp}`)
   }
-  audit.verify(configFailure || disabledReview ? [] : isExternal ? ["external-directory", "shell"] : [isEdit ? "edit" : "shell"], correction ? 2 : 1)
+  audit.verify(plan.reviewKinds, plan.attemptsPerReview)
   assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)
   if (measureReuse) assertReviewerReuse(metrics.snapshot())
   outcome = "passed"

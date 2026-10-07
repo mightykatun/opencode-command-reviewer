@@ -29,15 +29,14 @@ export async function evaluateEvidence(request: PermissionRequest, reader: Conte
   onIdentified()
   if (!config) throw new Error(configError || "Invalid configuration")
   const scope = files.scope(signal)
-  const cachedReader: ContextReader = { ...reader, message: async () => invocation.message }
   if (classified.kind === "shell") {
-    const context = await loadContext(request, cachedReader, signal, scope)
+    const context = await loadContext(request, reader, signal, scope, invocation)
     if (!context) throw new Error("Native shell context unavailable")
     reviewStage(signal, "Evidence collection")
     return collectEvidence(context, config, signal, scope)
   }
   if (classified.kind === "edit") {
-    const context = await loadEditContext(request, cachedReader, signal)
+    const context = await loadEditContext(request, reader, signal, invocation)
     reviewStage(signal, "Evidence collection")
     return collectEditEvidence(context, config, signal, scope)
   }

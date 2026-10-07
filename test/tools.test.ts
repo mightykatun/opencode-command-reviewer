@@ -277,3 +277,54 @@ test("missing optional definitions remain partial, while registry failure cannot
   const invocation = await loadInvocation(request("custom"), f.reader, signal())
   assert.equal(classify(request("custom"), invocation, undefined, servers), undefined)
 })
+
+test("native dispatch hands off one verified snapshot while preserving prototype methods and receiver state", async () => {
+  for (const tool of ["bash", "edit", "write", "apply_patch"]) {
+    const f = fixture(tool, tool === "bash" ? { command: "pwd" } : { filePath: "/invocation/file" })
+    class Reader implements ContextReader {
+      reads = 0
+      host = f.reader
+      async message(sessionID: string, messageID: string, s: AbortSignal) {
+        assert.equal(++this.reads, 1, "native loaders must not reread the invocation")
+        return this.host.message(sessionID, messageID, s)
+      }
+      session(id: string, s: AbortSignal) { return this.host.session(id, s) }
+      messages(id: string, s: AbortSignal) { return this.host.messages(id, s) }
+      projects(s: AbortSignal) { return this.host.projects(s) }
+      toolIDs(s: AbortSignal) { return this.host.toolIDs!(s) }
+    }
+    const host = new Reader()
+    let touched = false
+    Object.defineProperty(host, "unrelated", { enumerable: true, get() { touched = true; throw new Error("reader must not be spread") } })
+    const patch = "@@ -1 +1 @@\n-old\n+new\n"
+    const metadata = tool === "apply_patch" ? { files: [{ filePath: "/invocation/file", type: "update", patch }] }
+      : tool === "bash" ? {} : { filepath: "/invocation/file", diff: patch }
+    const req = { ...request(tool === "bash" ? "bash" : "edit"), metadata }
+    const result = await evaluateEvidence(req, host, config, config, "", signal(), () => {}, new FileAccess())
+    assert.equal(result?.kind, tool === "bash" ? "shell" : "edit")
+    assert.equal(result?.userPrompt, "Actual root request")
+    assert.equal(result?.session?.root?.directory, "/origin")
+    assert.equal(host.reads, 1)
+    assert.equal(touched, false)
+  }
+})
+
+test("native edit dispatch reaches projection without cloning unbounded or unrelated host metadata", async () => {
+  for (const tool of ["edit", "write", "apply_patch"]) {
+    const f = fixture(tool, {})
+    let touched = false
+    const cycle: Record<string, unknown> = {}; cycle.self = cycle
+    const patch = "@@ -1 +1 @@\n-old\n+new\n"
+    const metadata = {
+      ...(tool === "apply_patch" ? { files: [{ filePath: "/invocation/file", type: "update", patch }] } : { filepath: "/invocation/file", diff: patch }),
+      cycle, oversized: "x".repeat(17 * 1024 * 1024),
+      get unrelated() { touched = true; throw new Error("do not traverse") },
+    }
+    const result = await f.evaluate({ ...request("edit"), metadata })
+    assert.ok(result?.kind === "edit")
+    assert.equal(result.changes[0]?.diff, patch)
+    assert.equal(touched, false)
+    assert.doesNotMatch(JSON.stringify(result), /oversized|cycle|unrelated/)
+    assert.equal(f.calls.filter(call => call === "message").length, 1)
+  }
+})

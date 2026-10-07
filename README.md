@@ -104,6 +104,9 @@ in the report; ratings are advice based on the supplied evidence.
 
 ## Development
 
-Requires Node.js 22+ and npm. Run `npm ci --ignore-scripts`, then `npm run check`.
+Use Node.js 24.15.0+ within 24.x, or 22.22.2+ within 22.x, and npm.
+Run `npm ci --ignore-scripts`, then `npm run check` for typechecking, source tests,
+pure-helper tests and the build. `npm run test:helpers` runs the helper checks
+without building or starting OpenCode. Pull-request CI checks both Node versions.
 See [AGENTS.md](https://github.com/mightykatun/opencode-reviewer/blob/main/AGENTS.md)
 for runtime tests and the tag-driven release process.

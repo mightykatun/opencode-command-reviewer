@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import type { AssistantMessage, Message, Part, PermissionRequest, Session } from "@opencode-ai/sdk/v2"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { latestUserPrompt, loadContext, loadEditContext, loadRootMessages, type ContextReader } from "../src/context.js"
+import { latestUserPrompt, loadContext, loadEditContext, loadInvocation, loadRootMessages, type ContextReader } from "../src/context.js"
 import { collectEvidence } from "../src/evidence.js"
 
 function user(id: string, text: string, created: number, flags = {}): { info: Message; parts: Part[] } {
@@ -256,7 +256,7 @@ test("native edit, write and patch contexts retain exact request identity and ro
     assert.equal(result.session?.root?.id, "root")
     assert.deepEqual(result.location, { instanceDirectory: "/execution", instanceWorktree: "/execution" })
     assert.deepEqual(result.permission, { id: request.id, type: "edit", patterns: ["example.txt"], always: ["*"], metadata, tool: request.tool })
-    assert.notEqual(result.permission.metadata, metadata)
+    assert.equal(result.permission.metadata, metadata, "metadata is borrowed until bounded collection")
     assert.ok(!("command" in result) && !("execution" in result) && !("input" in result))
   }
 })
@@ -288,4 +288,50 @@ test("edit context with missing invocation keeps origin separate and ancestry fa
   assert.equal(result.userPrompt, null)
   assert.match(result.limitations.join(" "), /not substituted/)
   assert.match(result.limitations.join(" "), /root-user-prompt context is unavailable/)
+})
+
+test("native loaders use the same strict invocation validation for duplicate calls, non-assistants and malformed arguments", async () => {
+  for (const name of ["bash", "edit"] as const) {
+    const req = { ...request, permission: name }
+    const part = { ...tool, tool: name }
+    for (const message of [
+      { info: assistant, parts: [part, part] },
+      { info: { ...assistant, role: "user" }, parts: [part] },
+      ...[null, [], "not-an-object"].map(input => ({ info: assistant, parts: [{ ...part, state: { status: "running", input, time: { start: 1 } } }] })),
+    ]) {
+      const host = reader({ message: async () => message as unknown as Awaited<ReturnType<ContextReader["message"]>> })
+      await assert.rejects(name === "bash" ? loadContext(req, host, new AbortController().signal)
+        : loadEditContext(req, host, new AbortController().signal), /unavailable|mismatched/)
+    }
+  }
+})
+
+test("verified native invocation handoff avoids a second read and rejects different linkage", async () => {
+  for (const name of ["bash", "edit"] as const) {
+    const req = { ...request, permission: name }
+    let reads = 0
+    const host = reader({ message: async () => {
+      assert.equal(++reads, 1)
+      return { info: assistant, parts: [{ ...tool, tool: name }] }
+    } })
+    const s = new AbortController().signal
+    const invocation = await loadInvocation(req, host, s)
+    const context = name === "bash" ? await loadContext(req, host, s, undefined, invocation)
+      : await loadEditContext(req, host, s, invocation)
+    assert.equal(context?.userPrompt, "Actual user intent")
+    assert.equal(reads, 1)
+    const other = { ...req, tool: { ...req.tool!, callID: "another-call" } }
+    await assert.rejects(name === "bash" ? loadContext(other, host, s, undefined, invocation)
+      : loadEditContext(other, host, s, invocation), /linkage mismatched/)
+    assert.equal(reads, 1)
+  }
+})
+
+test("oversized native commands fail before whitespace scanning or optional enrichment", async () => {
+  const part = { ...tool, state: { status: "running" as const, input: { command: " ".repeat(16 * 1024 * 1024 + 1) }, time: { start: 1 } } }
+  let enriched = false
+  const host = reader({ message: async () => ({ info: assistant, parts: [part] }),
+    session: async () => { enriched = true; return undefined } })
+  await assert.rejects(loadContext(request, host, new AbortController().signal), /16 MiB preprocessing limit/)
+  assert.equal(enriched, false)
 })

@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { setTimeout as sleep } from "node:timers/promises"
+import { setTimeout as sleep, setImmediate as settle } from "node:timers/promises"
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
 import { Controller as CoreController, displayText, visibleReview, type View } from "../src/controller.js"
 import { loadContext, type ContextReader } from "../src/context.js"
@@ -183,8 +183,7 @@ for (const failure of ["missing message", "reader error", "timeout"] as const) {
     controller.asked(request("b-bash"))
     controller.asked(request("c-later"))
     await failed
-    const expected = failure === "missing message" ? "Pending native shell message unavailable"
-      : failure === "reader error" ? "Context unavailable" : "Review timed out"
+    const expected = failure === "timeout" ? "Review timed out" : "Pending native shell message unavailable or arguments mismatched"
     assert.equal(controller.views[0]?.error, expected)
     assert.equal(controller.views[0]?.assessment, undefined)
     assert.equal(controller.views[2]?.status, "complete")
@@ -560,6 +559,223 @@ for (const failure of ["ancestry", "store"] as const) test(`${failure} failure c
   await controller.dispose()
 })
 
+for (const enabled of [true, false]) test(`unavailable saved mode recovers to ${enabled ? "enabled" : "disabled"} only through current reconciliation`, async () => {
+  let available = false, reads = 0, calls = 0
+  const modes = modeFixture({ read: async () => {
+    reads++
+    if (!available) throw new Error("unavailable record")
+    return enabled
+  } })
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  controller.asked(request("a"))
+  await tick()
+  assert.equal(controller.views[0]?.status, "suspended")
+  assert.equal(reads, 1)
+  assert.equal(calls, 0)
+  assert.equal(visibleReview([...controller.views, { request: request("z"), status: "complete", assessment: result }], "root", getSession), undefined)
+
+  const stale = controller.revision
+  controller.replied("unknown")
+  available = true
+  controller.reconcile([request("a")], stale)
+  await tick()
+  assert.equal(reads, 1, "a stale snapshot cannot retry loading")
+  assert.equal(calls, 0)
+  controller.reconcile([request("a")], controller.revision)
+  await tick()
+  assert.equal(reads, 2)
+  assert.equal(calls, enabled ? 1 : 0)
+  assert.equal(controller.views[0]?.status, enabled ? "complete" : "suspended")
+  assert.equal(modes.enabled("root"), enabled)
+  for (let i = 0; i < 3; i++) controller.reconcile([request("a")], controller.revision)
+  await tick()
+  assert.equal(reads, 2, "a loaded disabled choice is not an unavailable read")
+  assert.equal(calls, enabled ? 1 : 0)
+  await controller.dispose()
+})
+
+test("repeated unavailable mode reads remain hidden and a local disable stops recovery attempts", async () => {
+  let reads = 0, calls = 0
+  const modes = modeFixture({ read: async () => { reads++; throw new Error("unavailable record") } })
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  controller.asked(request("a"))
+  await tick()
+  for (let i = 0; i < 3; i++) {
+    controller.reconcile([request("a")], controller.revision)
+    await tick()
+    assert.equal(controller.views[0]?.status, "suspended")
+    assert.equal(visibleReview([...controller.views, { request: request("z"), status: "complete", assessment: result }], "root", getSession), undefined)
+  }
+  assert.equal(reads, 4)
+  assert.equal(calls, 0)
+  await modes.set("root", false)
+  controller.modeChanged("root")
+  controller.reconcile([request("a")], controller.revision)
+  await tick()
+  assert.equal(reads, 4)
+  assert.equal(calls, 0)
+  await controller.dispose()
+})
+
+test("expired saved-mode loading recovers and its late result cannot replace the recovered setting", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  let finish!: (value: boolean) => void
+  let expired!: AbortSignal
+  let reads = 0, calls = 0
+  const modes = new SessionModes({
+    read: (_, signal) => ++reads === 1 ? new Promise<boolean>((resolve) => { finish = resolve; expired = signal }) : Promise.resolve(true),
+    write: async () => {}, flush: async () => {},
+  }, async (id) => ({ id }))
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  controller.asked(request("a"))
+  await settle()
+  t.mock.timers.tick(5000)
+  await settle()
+  assert.ok(expired.aborted)
+  assert.equal(controller.views[0]?.status, "suspended")
+  controller.reconcile([request("a")], controller.revision)
+  await settle()
+  assert.equal(reads, 1, "expired reads keep ownership until actual settlement")
+  assert.equal(calls, 0)
+  finish(false)
+  await settle()
+  assert.equal(modes.enabled("root"), false, "expired values cannot populate the cache")
+  controller.reconcile([request("a")], controller.revision)
+  await settle()
+  assert.equal(reads, 2)
+  assert.equal(calls, 1)
+  assert.equal(controller.views[0]?.assessment, result)
+  assert.equal(modes.enabled("root"), true)
+  assert.equal(controller.views[0]?.assessment, result)
+  await controller.dispose()
+})
+
+for (const outcome of ["resolve", "reject"] as const) test(`many reconciliation deadlines cap stalled mode reads across roots and recover after late ${outcome} cleanup`, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const pending: { root: string; signal: AbortSignal; value: { resolve: (value: boolean) => void; reject: (error: Error) => void }; cleanup: () => void }[] = []
+  const readCalls = new Map<string, number>(), perRoot = new Map<string, number>()
+  const evaluated: string[] = []
+  let available = false, actual = 0, maximum = 0, maximumPerRoot = 0
+  const modes = new SessionModes({ read: async (root, signal) => {
+    readCalls.set(root, (readCalls.get(root) ?? 0) + 1)
+    actual++
+    maximum = Math.max(maximum, actual)
+    perRoot.set(root, (perRoot.get(root) ?? 0) + 1)
+    maximumPerRoot = Math.max(maximumPerRoot, perRoot.get(root)!)
+    const settled = () => { actual--; perRoot.set(root, perRoot.get(root)! - 1) }
+    if (available) { settled(); return true }
+    let resolve!: (value: boolean) => void, reject!: (error: Error) => void, cleanup!: () => void
+    const value = new Promise<boolean>((yes, no) => { resolve = yes; reject = no })
+    const closing = new Promise<void>((yes) => { cleanup = yes })
+    pending.push({ root, signal, value: { resolve, reject }, cleanup })
+    try { return await value }
+    finally { try { await closing } finally { settled() } }
+  }, write: async () => {}, flush: async () => {} }, async (id) => ({ id }))
+  const controller = new CoreController(async (req) => { evaluated.push(req.id); return result }, () => {}, undefined, undefined, undefined, modes)
+  t.after(async () => {
+    await controller.dispose()
+    for (const read of pending) { read.value.resolve(false); read.cleanup() }
+    await settle()
+    assert.equal(actual, 0)
+    assert.ok(maximum <= 2)
+    assert.ok(maximumPerRoot <= 1)
+  })
+  const requests = [request("a-first", "rootA"), request("a-second", "rootA"), request("b-first", "rootB"),
+    request("c-disabled", "rootC"), ...["D", "E", "F", "G", "H"].map((id) => request(`other-${id}`, `root${id}`))]
+  controller.reconcile(requests, controller.revision)
+  await settle()
+  assert.deepEqual(pending.map((read) => read.root), ["rootA", "rootB"])
+  for (let cycle = 0; cycle < 40; cycle++) {
+    controller.reconcile(requests, controller.revision)
+    await settle()
+    t.mock.timers.tick(5000)
+    await settle()
+    assert.equal(actual, 2)
+    assert.equal(pending.length, 2, "repeated current snapshots cannot accumulate unresolved filesystem reads")
+    assert.ok(controller.views.every((view) => view.status === "suspended"))
+    assert.equal(visibleReview(controller.views, "rootA", getSession), undefined)
+    assert.deepEqual(evaluated, [])
+  }
+  assert.ok(pending.every((read) => read.signal.aborted))
+  await modes.set("rootC", false)
+  controller.modeChanged("rootC")
+  for (let cycle = 0; cycle < 20; cycle++) {
+    controller.reconcile(requests, controller.revision)
+    await settle()
+    t.mock.timers.tick(5000)
+    await settle()
+    assert.equal(pending.length, 2)
+    assert.equal(actual, 2)
+  }
+  if (outcome === "resolve") pending[0]!.value.resolve(true)
+  else pending[0]!.value.reject(new Error("late store failure"))
+  await settle()
+  for (let cycle = 0; cycle < 5; cycle++) {
+    controller.reconcile(requests, controller.revision)
+    await settle()
+    t.mock.timers.tick(5000)
+    await settle()
+    assert.equal(pending.length, 2, "late I/O settlement still owns capacity through actual cleanup")
+    assert.equal(actual, 2)
+  }
+  pending[0]!.cleanup()
+  await settle()
+  assert.equal(actual, 1)
+  assert.equal(modes.enabled("rootA"), false)
+  controller.reconcile(requests, controller.revision)
+  await settle()
+  assert.equal(pending.length, 3)
+  assert.equal(pending[2]!.root, "rootA")
+  assert.equal(actual, 2)
+  available = true
+  pending[2]!.value.resolve(true)
+  pending[2]!.cleanup()
+  await settle()
+  assert.deepEqual(evaluated.toSorted(), ["a-first", "a-second"])
+  assert.equal(visibleReview(controller.views, "rootA", getSession)?.request.id, "a-first")
+  for (let cycle = 0; cycle < 12; cycle++) {
+    controller.reconcile(requests, controller.revision)
+    await settle()
+    assert.equal(actual, 1, "the other expired read remains the only unsettled transaction")
+  }
+  assert.equal(readCalls.get("rootC"), undefined, "a known disabled choice never reads, even at saturation")
+  assert.equal(controller.views.find((view) => view.request.id === "c-disabled")?.status, "suspended")
+  assert.equal(controller.views.find((view) => view.request.id === "b-first")?.status, "suspended")
+  pending[1]!.value.resolve(true)
+  pending[1]!.cleanup()
+  await settle()
+  assert.equal(modes.enabled("rootB"), false)
+  controller.reconcile(requests, controller.revision)
+  await settle()
+  assert.deepEqual(evaluated.toSorted(), requests.filter((req) => req.id !== "c-disabled").map((req) => req.id).toSorted())
+  assert.equal(readCalls.get("rootA"), 2)
+  assert.equal(readCalls.get("rootB"), 2)
+  assert.equal(actual, 0)
+  assert.equal(maximum, 2)
+  assert.equal(maximumPerRoot, 1)
+})
+
+test("unavailable ancestry retries on reconciliation without restarting a natively resolved request", async () => {
+  let available = false, calls = 0
+  const modes = modeFixture({ session: async (id) => available ? { id } : undefined })
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  controller.asked(request("a"))
+  controller.asked(request("b", "other"))
+  await tick()
+  const stale = controller.revision
+  controller.replied("a")
+  available = true
+  controller.reconcile([request("a"), request("b", "other")], stale)
+  await tick()
+  assert.deepEqual(controller.views.map((view) => view.request.id), ["b"])
+  assert.equal(calls, 0)
+  controller.reconcile([request("b", "other")], controller.revision)
+  await tick()
+  assert.equal(calls, 1)
+  assert.equal(controller.views[0]?.assessment, result)
+  await controller.dispose()
+})
+
 for (const outcome of ["result", "error"] as const) test(`disabled generation suppresses late identification and ${outcome} after fresh enable`, async () => {
   const modes = modeFixture()
   const pending: { identify: () => void; resolve: (value: Assessment) => void; reject: (error: Error) => void; signal: AbortSignal }[] = []
@@ -583,8 +799,14 @@ for (const outcome of ["result", "error"] as const) test(`disabled generation su
   await controller.dispose()
 })
 
-for (const stage of ["countdown", "checking", "failed", "allowing"] as const) test(`${stage} tombstone survives fresh review and prevents another approval`, async () => {
+for (const stage of ["countdown", "checking", "failed", "allowing"] as const) test(`${stage} tombstone survives mode unavailability and fresh review and prevents another approval`, async () => {
   const modes = modeFixture()
+  let unavailable = false
+  const gate = {
+    root: (id: string, signal: AbortSignal) => modes.root(id, signal),
+    load: (root: string, signal: AbortSignal) => unavailable ? Promise.reject(new Error("mode unavailable")) : modes.load(root, signal),
+    enabled: (root: string) => modes.enabled(root),
+  }
   let reads = 0, writes = 0
   let resolve!: (value: PermissionRequest[]) => void
   let finish!: () => void
@@ -597,7 +819,7 @@ for (const stage of ["countdown", "checking", "failed", "allowing"] as const) te
       return Promise.resolve([request("a")])
     },
     once: () => { writes++; return new Promise((yes) => { finish = yes }) },
-  }, undefined, modes)
+  }, undefined, gate)
   controller.asked(request("a"))
   await tick()
   controller.presented("a")
@@ -606,6 +828,11 @@ for (const stage of ["countdown", "checking", "failed", "allowing"] as const) te
   assert.equal(controller.views[0]?.autoApproval?.status, stage)
   await modes.set("root", false); controller.modeChanged("root")
   await modes.set("root", true); controller.modeChanged("root")
+  unavailable = true
+  controller.reconcile([request("a")], controller.revision)
+  await tick()
+  assert.equal(controller.views[0]?.status, "suspended")
+  unavailable = false
   controller.reconcile([request("a")], controller.revision)
   await tick()
   controller.presented("a")

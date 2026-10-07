@@ -4,6 +4,7 @@ import { mkdtemp, readdir, readFile, writeFile, rm, symlink, stat } from "node:f
 import path from "node:path"
 import { tmpdir } from "node:os"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
+import { setImmediate as settle } from "node:timers/promises"
 import { SessionModes, SessionModeStore, type ModeStore } from "../src/session-mode.js"
 import { sessionModeCommands } from "../src/session-mode-commands.js"
 
@@ -15,6 +16,34 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 const memory = (): ModeStore => ({ read: async () => true, write: async () => {}, flush: async () => {} })
+
+function readFixture(t: import("node:test").TestContext) {
+  const calls: { root: string; signal: AbortSignal; value: ReturnType<typeof deferred<boolean>>; cleanup: ReturnType<typeof deferred<void>> }[] = []
+  const perRoot = new Map<string, number>()
+  let actual = 0, maximum = 0, maximumPerRoot = 0
+  const modes = new SessionModes({ ...memory(), read: async (root, signal) => {
+    actual++
+    maximum = Math.max(maximum, actual)
+    perRoot.set(root, (perRoot.get(root) ?? 0) + 1)
+    maximumPerRoot = Math.max(maximumPerRoot, perRoot.get(root)!)
+    const call = { root, signal, value: deferred<boolean>(), cleanup: deferred<void>() }
+    calls.push(call)
+    try { return await call.value.promise }
+    finally {
+      try { await call.cleanup.promise }
+      finally { actual--; perRoot.set(root, perRoot.get(root)! - 1) }
+    }
+  } }, async (id) => ({ id }))
+  const finish = (index: number, value = true) => { calls[index]!.value.resolve(value); calls[index]!.cleanup.resolve() }
+  t.after(async () => {
+    for (const call of calls) { call.value.resolve(false); call.cleanup.resolve() }
+    await settle()
+    assert.equal(actual, 0)
+    assert.ok(maximum <= 2, "actual mode reads including cleanup obey the instance cap")
+    assert.ok(maximumPerRoot <= 1, "a root never has overlapping actual mode reads")
+  })
+  return { modes, calls, finish, counts: () => ({ actual, maximum, maximumPerRoot, reads: calls.length }) }
+}
 
 test("atomic mode records survive restart, serialize toggles and isolate host/root identities", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "reviewer-mode-"))
@@ -107,6 +136,56 @@ for (const failure of ["missing", "mismatch", "cycle", "depth", "empty parent"] 
   })
 }
 
+for (const warm of [undefined, 0, 1, 8, 16]) test(`${warm === undefined ? "cold" : `depth-${warm} warm`} ancestry accepts 16 edges and rejects 17 without caching rejected prefixes`, async () => {
+  const calls: string[] = []
+  const modes = new SessionModes(memory(), async (id) => {
+    calls.push(id)
+    const depth = Number(id.slice(1))
+    return { id, ...(depth ? { parentID: `s${depth - 1}` } : {}) }
+  })
+  if (warm !== undefined) assert.equal(await modes.root(`s${warm}`, signal()), "s0")
+  calls.length = 0
+  await assert.rejects(modes.root("s17", signal()), /Session ancestry limit reached/)
+  assert.ok(calls.length <= 17)
+  calls.length = 0
+  assert.equal(await modes.root("s16", signal()), "s0")
+  assert.ok(calls.length <= 17)
+  calls.length = 0
+  assert.equal(await modes.root("s16", signal()), "s0")
+  assert.deepEqual(calls, [], "accepted prefixes retain their full cached distances")
+  await assert.rejects(modes.root("s17", signal()), /Session ancestry limit reached/)
+  assert.deepEqual(calls, ["s17"], "an over-depth request must not seed a shortcut")
+})
+
+test("incrementally warming descendants cannot extend the ancestry depth limit", async () => {
+  let calls = 0
+  const modes = new SessionModes(memory(), async (id) => {
+    calls++
+    const depth = Number(id.slice(1))
+    return { id, ...(depth ? { parentID: `s${depth - 1}` } : {}) }
+  })
+  for (let depth = 0; depth <= 16; depth++) {
+    assert.equal(await modes.root(`s${depth}`, signal()), "s0")
+    assert.equal(calls, depth + 1, "each new child uses one read and the validated cached suffix")
+  }
+  for (let i = 0; i < 2; i++) await assert.rejects(modes.root("s17", signal()), /Session ancestry limit reached/)
+  assert.equal(calls, 19)
+})
+
+test("ancestry cache stays bounded and deletion invalidates distance-aware records", async () => {
+  let calls = 0
+  const modes = new SessionModes(memory(), async (id) => { calls++; return { id } })
+  for (let i = 0; i <= 4096; i++) await modes.root(`root${i}`, signal())
+  const before = calls
+  await modes.root("root4096", signal())
+  assert.equal(calls, before)
+  await modes.root("root0", signal())
+  assert.equal(calls, before + 1, "exceeding the cap clears older cache entries")
+  modes.deleted("root4096")
+  await modes.root("root4096", signal())
+  assert.equal(calls, before + 2)
+})
+
 test("late initial store read cannot overwrite a local disabled switch", async () => {
   const read = deferred<boolean>()
   const modes = new SessionModes({ ...memory(), read: () => read.promise }, async (id) => ({ id }))
@@ -135,6 +214,208 @@ test("noncooperative ancestry and mode reads expire within their five-second bud
   await Promise.resolve()
   t.mock.timers.tick(5000)
   await Promise.all([lookup, loading])
+  assert.equal(modes.enabled("root"), false)
+})
+
+test("concurrent same-root loads share one actual read through cleanup and cache a disabled result", async (t) => {
+  const f = readFixture(t)
+  const loads = Array.from({ length: 100 }, () => f.modes.load("root", signal()))
+  await settle()
+  assert.deepEqual(f.counts(), { actual: 1, maximum: 1, maximumPerRoot: 1, reads: 1 })
+  f.calls[0]!.value.resolve(false)
+  await settle()
+  const more = Array.from({ length: 100 }, () => f.modes.load("root", signal()))
+  await settle()
+  assert.equal(f.counts().reads, 1)
+  f.calls[0]!.cleanup.resolve()
+  await Promise.all([...loads, ...more])
+  assert.equal(f.modes.enabled("root"), false)
+  for (let i = 0; i < 100; i++) await f.modes.load("root", signal())
+  assert.equal(f.counts().reads, 1, "disabled is a loaded choice, not another unavailable read")
+})
+
+for (const outcome of ["resolve", "reject"] as const) test(`expired same-root loads retain one actual read across many deadlines and late ${outcome} cleanup`, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const f = readFixture(t)
+  const expired = assert.rejects(f.modes.load("root", signal()), /Session mode loading timed out/)
+  await settle()
+  t.mock.timers.tick(5000)
+  await expired
+  for (let cycle = 0; cycle < 40; cycle++) {
+    await Promise.all(Array.from({ length: 20 }, () => assert.rejects(f.modes.load("root", signal()), /Session mode loading timed out/)))
+    t.mock.timers.tick(5000)
+    await settle()
+    assert.deepEqual(f.counts(), { actual: 1, maximum: 1, maximumPerRoot: 1, reads: 1 })
+  }
+  assert.equal(f.calls[0]!.signal.aborted, true)
+  if (outcome === "resolve") f.calls[0]!.value.resolve(true)
+  else f.calls[0]!.value.reject(new Error("late store failure"))
+  await settle()
+  await assert.rejects(f.modes.load("root", signal()), /Session mode loading timed out/)
+  assert.equal(f.counts().actual, 1, "value settlement alone does not release cleanup ownership")
+  f.calls[0]!.cleanup.resolve()
+  await settle()
+  assert.equal(f.modes.enabled("root"), false, "late values cannot populate the mode cache")
+  const recovered = f.modes.load("root", signal())
+  await settle()
+  assert.equal(f.counts().reads, 2)
+  f.finish(1)
+  await recovered
+  assert.equal(f.modes.enabled("root"), true)
+})
+
+test("multiple roots are capped at two actual reads through timeout and cleanup, then recover without queueing", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const f = readFixture(t)
+  const first = assert.rejects(f.modes.load("a", signal()), /Session mode loading timed out/)
+  const second = assert.rejects(f.modes.load("b", signal()), /Session mode loading timed out/)
+  await settle()
+  for (let i = 0; i < 30; i++) await assert.rejects(f.modes.load(`other${i}`, signal()), /read capacity unavailable/)
+  t.mock.timers.tick(5000)
+  await Promise.all([first, second])
+  for (let cycle = 0; cycle < 30; cycle++) {
+    await assert.rejects(f.modes.load("a", signal()), /timed out/)
+    await assert.rejects(f.modes.load("b", signal()), /timed out/)
+    for (let i = 0; i < 20; i++) await assert.rejects(f.modes.load(`other${i}`, signal()), /read capacity unavailable/)
+    t.mock.timers.tick(5000)
+    await settle()
+    assert.deepEqual(f.counts(), { actual: 2, maximum: 2, maximumPerRoot: 1, reads: 2 })
+  }
+  f.calls[0]!.value.resolve(true)
+  await settle()
+  await assert.rejects(f.modes.load("c", signal()), /read capacity unavailable/)
+  f.calls[0]!.cleanup.resolve()
+  await settle()
+  assert.equal(f.modes.enabled("a"), false)
+  assert.equal(f.counts().reads, 2, "capacity release does not dispatch skipped work")
+  const third = f.modes.load("c", signal())
+  await settle()
+  assert.equal(f.counts().actual, 2)
+  await assert.rejects(f.modes.load("d", signal()), /read capacity unavailable/)
+  await f.modes.set("disabled", false)
+  await f.modes.load("disabled", signal())
+  assert.equal(f.modes.enabled("disabled"), false)
+  f.finish(2)
+  await third
+  f.calls[1]!.value.reject(new Error("late store failure"))
+  f.calls[1]!.cleanup.resolve()
+  await settle()
+  const recovered = f.modes.load("a", signal())
+  await settle()
+  f.finish(3)
+  await recovered
+  assert.equal(f.modes.enabled("a"), true)
+  assert.deepEqual(f.counts(), { actual: 0, maximum: 2, maximumPerRoot: 1, reads: 4 })
+})
+
+test("canceling a joining caller does not abort the owner's shared read", async (t) => {
+  const f = readFixture(t)
+  const owner = f.modes.load("root", signal())
+  await settle()
+  const joiner = new AbortController()
+  const joined = assert.rejects(f.modes.load("root", joiner.signal), { name: "AbortError" })
+  joiner.abort()
+  await joined
+  assert.equal(f.calls[0]!.signal.aborted, false)
+  assert.equal(f.counts().reads, 1)
+  f.finish(0)
+  await owner
+  assert.equal(f.modes.enabled("root"), true)
+})
+
+test("owner cancellation rejects shared waits but retains actual-read ownership until cleanup", async (t) => {
+  const f = readFixture(t)
+  const parent = new AbortController()
+  const owner = assert.rejects(f.modes.load("root", parent.signal), { name: "AbortError" })
+  await settle()
+  const joined = assert.rejects(f.modes.load("root", signal()), { name: "AbortError" })
+  parent.abort()
+  await Promise.all([owner, joined])
+  await assert.rejects(f.modes.load("root", signal()), { name: "AbortError" })
+  f.calls[0]!.value.resolve(true)
+  await settle()
+  assert.equal(f.counts().actual, 1)
+  f.calls[0]!.cleanup.resolve()
+  await settle()
+  assert.equal(f.modes.enabled("root"), false)
+  const next = f.modes.load("root", signal())
+  await settle()
+  f.finish(1)
+  await next
+  assert.equal(f.modes.enabled("root"), true)
+})
+
+test("cancellation before read dispatch leaves no reserved slot or filesystem work", async (t) => {
+  const f = readFixture(t)
+  const parent = new AbortController()
+  const canceled = assert.rejects(f.modes.load("root", parent.signal), { name: "AbortError" })
+  parent.abort()
+  await canceled
+  await settle()
+  assert.deepEqual(f.counts(), { actual: 0, maximum: 0, maximumPerRoot: 0, reads: 0 })
+  const next = f.modes.load("root", signal())
+  await settle()
+  f.finish(0)
+  await next
+  assert.equal(f.modes.enabled("root"), true)
+})
+
+for (const enabled of [true, false]) test(`local ${enabled ? "enabled" : "disabled"} mode survives pending read settlement without another read`, async (t) => {
+  const f = readFixture(t)
+  const loading = f.modes.load("root", signal())
+  await settle()
+  await f.modes.set("root", enabled)
+  await f.modes.load("root", signal())
+  assert.equal(f.counts().reads, 1)
+  f.finish(0, !enabled)
+  await loading
+  assert.equal(f.modes.enabled("root"), enabled)
+})
+
+for (const enabled of [true, false]) test(`local ${enabled ? "enabled" : "disabled"} mode survives late expired values while their slot stays occupied`, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const f = readFixture(t)
+  const expired = assert.rejects(f.modes.load("root", signal()), /timed out/)
+  await settle()
+  t.mock.timers.tick(5000)
+  await expired
+  await f.modes.set("root", enabled)
+  for (let i = 0; i < 100; i++) await f.modes.load("root", signal())
+  assert.equal(f.counts().reads, 1)
+  assert.equal(f.counts().actual, 1)
+  f.calls[0]!.value.resolve(!enabled)
+  await settle()
+  assert.equal(f.counts().actual, 1)
+  assert.equal(f.modes.enabled("root"), enabled)
+  f.calls[0]!.cleanup.resolve()
+  await settle()
+  assert.equal(f.modes.enabled("root"), enabled)
+})
+
+test("failed cleanup and synchronous store errors free read capacity for later recovery", async (t) => {
+  const f = readFixture(t)
+  const failed = assert.rejects(f.modes.load("root", signal()), /cleanup failed/)
+  await settle()
+  f.calls[0]!.value.resolve(true)
+  f.calls[0]!.cleanup.reject(new Error("cleanup failed"))
+  await failed
+  const next = f.modes.load("root", signal())
+  await settle()
+  f.finish(1)
+  await next
+  assert.equal(f.modes.enabled("root"), true)
+
+  let available = false, reads = 0
+  const modes = new SessionModes({ ...memory(), read: () => {
+    reads++
+    if (!available) throw new Error("store unavailable")
+    return Promise.resolve(false)
+  } }, async (id) => ({ id }))
+  for (let i = 0; i < 20; i++) await assert.rejects(modes.load(`root${i}`, signal()), /store unavailable/)
+  available = true
+  await modes.load("root", signal())
+  for (let i = 0; i < 20; i++) await modes.load("root", signal())
+  assert.equal(reads, 21)
   assert.equal(modes.enabled("root"), false)
 })
 

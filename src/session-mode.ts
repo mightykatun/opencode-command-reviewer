@@ -5,6 +5,12 @@ import path from "node:path"
 import { withDeadline } from "./deadline.js"
 
 type Session = { id: string; parentID?: string }
+const MAX_MODE_READS = 2
+interface ModeRead {
+  wait?: Promise<void>
+  settled: boolean
+  finished: boolean
+}
 export interface SessionModeGate {
   root(sessionID: string, signal: AbortSignal): Promise<string>
   load(root: string, signal: AbortSignal): Promise<void>
@@ -34,12 +40,14 @@ export class SessionModeStore implements ModeStore {
     try {
       signal.throwIfAborted()
       const stat = await file.stat()
+      signal.throwIfAborted()
       if (!stat.isFile() || stat.size > 1024) throw new Error("Invalid session mode record")
       const buffer = Buffer.alloc(1025)
       let size = 0
       while (size < buffer.length) {
         signal.throwIfAborted()
         const result = await file.read(buffer, size, buffer.length - size, size)
+        signal.throwIfAborted()
         if (!result.bytesRead) break
         size += result.bytesRead
       }
@@ -73,10 +81,16 @@ export class SessionModeStore implements ModeStore {
 
 /** Only metadata needed to establish ownership is read before this gate opens. */
 export class SessionModes implements SessionModeGate {
-  private roots = new Map<string, string>()
+  private roots = new Map<string, { root: string; edges: number }>()
   private values = new Map<string, boolean>()
   private changes = new Map<string, number>()
+  private reads = new Map<string, ModeRead>()
   constructor(private store: ModeStore, private session: (id: string, signal: AbortSignal) => Promise<Session | undefined>) {}
+  private remember(visited: ReadonlySet<string>, root: string, edges: number) {
+    if (this.roots.size + visited.size > 4096) this.roots.clear()
+    for (const child of visited) this.roots.set(child, { root, edges: edges-- })
+    return root
+  }
   root(sessionID: string, parent: AbortSignal): Promise<string> {
     return withDeadline(parent, 5000, async (signal) => {
       const visited = new Set<string>()
@@ -85,30 +99,56 @@ export class SessionModes implements SessionModeGate {
         signal.throwIfAborted()
         if (!id || visited.has(id)) throw new Error("Session ancestry unavailable")
         const cached = this.roots.get(id)
-        if (cached) return cached
+        if (cached) {
+          // A cached suffix saves metadata reads, not parent edges in the limit.
+          if (depth + cached.edges > 16) throw new Error("Session ancestry limit reached")
+          return this.remember(visited, cached.root, depth + cached.edges)
+        }
         visited.add(id)
         const value = await this.session(id, signal)
         signal.throwIfAborted()
         if (value?.id !== id || (value.parentID !== undefined && (typeof value.parentID !== "string" || !value.parentID))) {
           throw new Error("Session ancestry unavailable")
         }
-        if (!value.parentID) {
-          if (this.roots.size + visited.size > 4096) this.roots.clear()
-          for (const child of visited) this.roots.set(child, id)
-          return id
-        }
+        if (!value.parentID) return this.remember(visited, id, depth)
         id = value.parentID
       }
       throw new Error("Session ancestry limit reached")
     }, "Session mode ancestry")
   }
   async load(root: string, parent: AbortSignal) {
-    if (this.values.has(root)) return
-    const revision = this.changes.get(root)
-    const value = await withDeadline(parent, 5000, (signal) => this.store.read(root, signal), "Session mode loading")
     parent.throwIfAborted()
-    // A read started before a local switch must never overwrite that switch.
-    if (this.changes.get(root) === revision) this.values.set(root, value)
+    if (this.values.has(root)) return
+    const pending = this.reads.get(root)
+    if (pending) return withDeadline(parent, 5000, () => pending.wait!, "Session mode loading")
+    if (this.reads.size >= MAX_MODE_READS) throw new Error("Session mode read capacity unavailable")
+    const read: ModeRead = { settled: true, finished: false }
+    this.reads.set(root, read)
+    // Reserve before dispatch. Concurrent callers share this bounded wait, while
+    // expired reads continue owning the root and instance slot through cleanup.
+    return read.wait = this.loadMode(root, parent, read)
+  }
+  private async loadMode(root: string, parent: AbortSignal, read: ModeRead) {
+    const revision = this.changes.get(root)
+    try {
+      const value = await withDeadline(parent, 5000, (signal) => {
+        read.settled = false
+        const worker = Promise.resolve().then(() => { signal.throwIfAborted(); return this.store.read(root, signal) })
+        const settled = () => { read.settled = true; this.releaseRead(root, read) }
+        void worker.then(settled, settled)
+        return worker
+      }, "Session mode loading")
+      parent.throwIfAborted()
+      // Only a successfully bounded read can populate mode state. Actual late
+      // settlement releases capacity but never publishes values or overrides a switch.
+      if (this.changes.get(root) === revision) this.values.set(root, value)
+    } finally {
+      read.finished = true
+      this.releaseRead(root, read)
+    }
+  }
+  private releaseRead(root: string, read: ModeRead) {
+    if (read.finished && read.settled && this.reads.get(root) === read) this.reads.delete(root)
   }
   enabled(root: string) { return this.values.get(root) === true }
   set(root: string, enabled: boolean): Promise<void> {
@@ -117,7 +157,7 @@ export class SessionModes implements SessionModeGate {
     return this.store.write(root, enabled)
   }
   deleted(id: string) {
-    for (const [child, root] of this.roots) if (child === id || root === id) this.roots.delete(child)
+    for (const [child, value] of this.roots) if (child === id || value.root === id) this.roots.delete(child)
   }
   flush() { return this.store.flush() }
 }

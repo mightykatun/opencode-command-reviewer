@@ -1,6 +1,6 @@
-import { test } from "node:test"
+import { test, type TestContext } from "node:test"
 import assert from "node:assert/strict"
-import { setTimeout as sleep } from "node:timers/promises"
+import { setImmediate as nextTurn, setTimeout as sleep } from "node:timers/promises"
 import { mkdtemp, symlink, rm } from "node:fs/promises"
 import { execFileSync } from "node:child_process"
 import { tmpdir } from "node:os"
@@ -47,10 +47,18 @@ function fakeIO(stage?: string) {
   } as unknown as FileHandle
   const io: FileIO = {
     realpath: async (filename) => { calls.push("realpath"); return stage === "realpath" ? held.promise : filename },
-    open: async () => { calls.push("open"); return stage === "open" ? held.promise : handle },
+    open: async () => { calls.push("open"); reads = 0; return stage === "open" ? held.promise : handle },
   }
   const release = () => held.resolve(stage === "realpath" ? "/virtual/source" : stage === "open" ? handle : stage === "stat" ? stat : { bytesRead: 0 })
   return { io, calls, release }
+}
+
+/** Scheduling pauses spend no test budget; only explicit I/O/timer steps do. */
+function controlledTime(t: TestContext) {
+  let now = 0
+  t.mock.method(performance, "now", () => now)
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  return { advance(ms: number) { now += ms; t.mock.timers.tick(ms) } }
 }
 
 for (const stage of ["realpath", "open", "stat", "read", "close"]) {
@@ -91,16 +99,124 @@ test("probe saturation bounds abandoned work across reviews and recovers after s
   assert.equal(result.files[0]!.contents, "fixture\n")
 })
 
-test("shared budget limits long candidate lists and avoids repeated canonicalization", async () => {
+test("shared budget limits long candidate lists and avoids repeated canonicalization", async (t) => {
+  const clock = controlledTime(t)
+  const fixture = fakeIO()
   const calls: string[] = []
-  const access = new FileAccess({ ...fakeIO().io, realpath: async (name) => { calls.push(name); await sleep(20); return name } }, { ...timing, totalMs: 35, pathMs: 30 })
+  const access = new FileAccess({ ...fixture.io, realpath: async (name) => {
+    calls.push(name)
+    fixture.calls.push(`path:${name}`)
+    if (name === "/virtual/source") { clock.advance(20); return name }
+    if (name === "/virtual/alias") return "/virtual/source"
+    // This later probe consumes the exact 15 ms left after the healthy source.
+    clock.advance(15)
+    return name
+  } }, { ...timing, totalMs: 35, pathMs: 30 })
   const s = signal()
-  const result = await collectEvidence({ ...input, command: `cat source source ${Array.from({ length: 30 }, (_, i) => `file${i}`).join(" ")}` }, limits, s, access.scope(s))
-  assert.ok(calls.length <= 2, `expired optional budget must not launch further I/O: ${JSON.stringify(calls)}`)
-  assert.equal(calls.filter((name) => name === "/virtual/source").length, 1)
+  const command = `cat source alias source alias ${Array.from({ length: 30 }, (_, i) => `file${i}`).join(" ")}`
+  const result = await collectEvidence({ ...input, command }, { ...limits, maxEvidenceBytes: Buffer.byteLength(command) + 8 }, s, access.scope(s))
+  assert.deepEqual(calls, ["/virtual/source", "/virtual/alias", "/virtual/file0"], "expiry prevents every subsequent I/O launch, including parent probes")
+  assert.equal(fixture.calls.filter(call => call === "open").length, 1)
+  assert.ok(fixture.calls.indexOf("close") < fixture.calls.indexOf("path:/virtual/alias"), "capture and cleanup precede later canonicalization")
   assert.equal(result.files.length, 31)
-  assert.ok(result.files.every((file) => file.contents === undefined))
-  await settled(() => access.outstanding === 0)
+  assert.equal(result.files[0]?.contents, "fixture\n", "admitted source is captured before later probes spend the allowance")
+  assert.deepEqual(result.files[0]?.aliases, ["/virtual/alias"], "canonical aliases consume neither a second file nor a second byte allowance")
+  assert.match(result.files[1]?.status ?? "", /timed out/)
+  assert.ok(result.files.slice(2, limits.maxFiles).every(file => /budget exhausted/.test(file.status)))
+  assert.ok(result.files.slice(limits.maxFiles).every(file => /file-count limit/.test(file.status)))
+  assert.ok(result.files.slice(1).every((file) => file.contents === undefined))
+  await nextTurn()
+  assert.equal(access.outstanding, 0)
+})
+
+test("later slow or count-rejected paths cannot starve a healthy admitted capture", async (t) => {
+  const clock = controlledTime(t)
+  for (const maxFiles of [1, 6]) {
+    const fixture = fakeIO()
+    const late = deferred<string>()
+    const slowStarted = deferred<void>(), rejectedStarted = deferred<void>()
+    const probed: string[] = []
+    const io = { ...fixture.io, realpath: async (name: string) => {
+      probed.push(name)
+      if (name === "/virtual/source") return name
+      if (name === "/virtual/slow") slowStarted.resolve()
+      if (name === "/virtual/rejected") rejectedStarted.resolve()
+      return late.promise
+    } }
+    const access = new FileAccess(io, timing)
+    const s = signal()
+    const pending = collectEvidence({ ...input, command: "cat source slow rejected source" }, { ...limits, maxFiles }, s, access.scope(s))
+    try {
+      await slowStarted.promise
+      assert.ok(fixture.calls.includes("close"), "first capture and cleanup precede the first later path probe")
+      assert.equal(access.outstanding, 1)
+      clock.advance(timing.pathMs)
+      await rejectedStarted.promise
+      assert.equal(access.outstanding, 2, "the first timed-out transaction retains its slot until actual settlement")
+      clock.advance(timing.pathMs)
+      const result = await pending
+      assert.equal(result.files[0]?.contents, "fixture\n")
+      assert.equal(fixture.calls.filter(call => call === "open").length, 1)
+      assert.deepEqual(probed, ["/virtual/source", "/virtual/slow", "/virtual/rejected"])
+      assert.equal(result.files.length, 3)
+      assert.ok(result.files.slice(1).every(file => (maxFiles === 1 ? /file-count limit/ : /timed out/).test(file.status)))
+      assert.ok(result.files.slice(1).every(file => file.contents === undefined))
+      assert.equal(access.outstanding, 2)
+      const published = JSON.stringify(result)
+      late.resolve("/virtual/late")
+      await nextTurn()
+      assert.equal(access.outstanding, 0)
+      assert.equal(JSON.stringify(result), published)
+    } finally {
+      late.resolve("/virtual/late")
+      await pending.catch(() => {})
+      await nextTurn()
+      assert.equal(access.outstanding, 0)
+    }
+  }
+})
+
+test("alias qualification promotion never retries a failed capture transaction", async (t) => {
+  const clock = controlledTime(t)
+  const fixture = fakeIO("open")
+  const opened = deferred<void>()
+  const access = new FileAccess({ ...fixture.io, realpath: async () => "/virtual/source",
+    open: (...args) => { const pending = fixture.io.open(...args); opened.resolve(); return pending } }, timing)
+  const s = signal()
+  const pending = collectEvidence({ ...input, command: "./source; python alias; cat alias" }, limits, s, access.scope(s))
+  try {
+    await opened.promise
+    clock.advance(timing.captureMs)
+    const result = await pending
+    assert.equal(result.files.length, 1)
+    assert.equal(result.files[0]?.contents, undefined)
+    assert.match(result.files[0]?.status ?? "", /timed out/)
+    assert.deepEqual(result.files[0]?.aliases, ["/virtual/alias"])
+    assert.equal(fixture.calls.filter(call => call === "open").length, 1)
+    assert.equal(access.outstanding, 1)
+  } finally {
+    fixture.release()
+    await pending.catch(() => {})
+    await nextTurn()
+    assert.equal(access.outstanding, 0)
+    assert.equal(fixture.calls.filter(call => call === "close").length, 1)
+  }
+})
+
+test("exact aliases prequalify once while canonical alias promotion captures at most twice and charges bytes once", async (t) => {
+  controlledTime(t)
+  for (const operand of ["./source", "alias"]) {
+    const fixture = fakeIO()
+    const access = new FileAccess({ ...fixture.io, realpath: async () => "/virtual/source" }, timing)
+    const command = `./source; python ${operand}; cat ${operand}`
+    const s = signal()
+    const result = await collectEvidence({ ...input, command }, { ...limits, maxFiles: 1, maxEvidenceBytes: Buffer.byteLength(command) + 8 }, s, access.scope(s))
+    assert.equal(result.files.length, 1)
+    assert.equal(result.files[0]?.contents, "fixture\n")
+    assert.equal(result.files[0]?.warning, undefined)
+    assert.equal(fixture.calls.filter(call => call === "open").length, operand === "./source" ? 1 : 2)
+    assert.equal(access.outstanding, 0)
+  }
 })
 
 test("complete edit diffs survive stalled canonicalization with conservative alias accounting", async () => {

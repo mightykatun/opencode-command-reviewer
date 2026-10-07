@@ -1,0 +1,63 @@
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import { readFile, readdir } from "node:fs/promises"
+import inventory from "../scripts/helper-tests.json" with { type: "json" }
+
+const read = async (file) => readFile(new URL(`../${file}`, import.meta.url), "utf8")
+
+test("PR CI is read-only, pinned, and checks the supported development Node floors", async () => {
+  const workflow = await read(".github/workflows/ci.yml")
+  assert.match(workflow, /\n  pull_request:\n/)
+  assert.match(workflow, /\npermissions:\n  contents: read\n/)
+  assert.doesNotMatch(workflow, /pull_request_target|contents: write|id-token:|secrets\.|GH_TOKEN|NODE_AUTH_TOKEN|npm publish|npm run test:runtime(?!-cleanup)/)
+  assert.match(workflow, /persist-credentials: false/)
+  assert.match(workflow, /node: \["22\.22\.2", "24\.15\.0"\]/)
+  assert.match(workflow, /node-version: \$\{\{ matrix\.node \}\}/)
+  const pins = { checkout: "34e114876b0b11c390a56381ad16ebd13914f8d5", "setup-node": "49933ea5288caeca8642d1e84afbd3f7d6820020" }
+  const actions = [...workflow.matchAll(/uses: actions\/([\w-]+)@(\S+)/g)]
+  assert.equal(actions.length, 2)
+  for (const [, name, sha] of actions) assert.equal(sha, pins[name])
+  const commands = [...workflow.matchAll(/^      - run: (.+)$/gm)].map((match) => match[1])
+  assert.deepEqual(commands, ["npm ci --ignore-scripts", "npm run check", "npm run check:package",
+    "node --test test/release-artifact-smoke.test.mjs", "npm install --global npm@12.2.0 --ignore-scripts", "node --test test/npm-cli-smoke.test.mjs",
+    "sudo apt-get update && sudo apt-get install --yes tmux", "npm run test:runtime-cleanup"])
+})
+
+test("normal checks aggregate every pure helper while keeping host and built-package checks separate", async () => {
+  const pkg = JSON.parse(await read("package.json")), lock = JSON.parse(await read("package-lock.json"))
+  assert.equal(pkg.scripts["test:helpers"], "node scripts/test-helpers.mjs")
+  assert.equal(pkg.scripts.check, "npm run typecheck && npm test && npm run test:helpers && npm run build")
+  assert.equal(pkg.scripts["test:runtime-cleanup"], "node --test test/smoke-runtime.test.mjs")
+  assert.equal(pkg.devEngines.runtime.version, "^22.22.2 || ^24.15.0")
+  assert.equal(pkg.devEngines.runtime.onFail, "error")
+  assert.equal(pkg.engines.node, ">=22", "development floors are independent of distributed runtime metadata")
+  assert.equal(lock.packages[""].engines.node, pkg.engines.node)
+  assert.equal(pkg.devDependencies["@opencode-ai/plugin"], "1.18.35")
+  for (const name of ["@opentui/core", "@opentui/keymap", "@opentui/solid"]) assert.equal(pkg.devDependencies[name], "0.4.5")
+  const separate = new Set(["smoke-runtime.test.mjs", "release-artifact-smoke.test.mjs", "npm-cli-smoke.test.mjs"])
+  const pure = (await readdir(new URL("./", import.meta.url))).filter((file) => file.endsWith(".test.mjs") && !separate.has(file))
+    .map((file) => `test/${file}`).sort()
+  assert.deepEqual([...inventory].sort(), pure, "the shared inventory must cover every current pure helper")
+  for (const file of ["README.md", "AGENTS.md"]) {
+    const docs = await read(file)
+    assert.match(docs, /24\.15\.0\+/)
+    assert.match(docs, /22\.22\.2\+/)
+    assert.match(docs, /npm run test:helpers/)
+  }
+})
+
+test("active release validation runs the same helper inventory with a complete sparse dependency closure", async () => {
+  const workflow = await read(".github/workflows/release.yml")
+  const validate = workflow.split("\n  validate:\n")[1].split("\n  publish:\n")[0]
+  assert.match(validate, /node release-policy\/scripts\/test-helpers\.mjs/)
+  assert.doesNotMatch(validate, /node --test test\/smoke-measurements\.test\.mjs/)
+  const policy = validate.split("      - name: Check out active validation policy\n")[1].split("\n      - ")[0]
+  for (const file of [...inventory, "scripts/test-helpers.mjs", "scripts/helper-tests.json", "scripts/smoke-runtime.mjs",
+    "scripts/smoke-reviewer.mjs", "scripts/smoke-stages.mjs", "scripts/smoke-permissions.mjs", "scripts/smoke.mjs",
+    "test/release-fixture.mjs", "test/npm-cli-smoke.test.mjs", "package.json", "package-lock.json", "README.md", "AGENTS.md", ".github/workflows/ci.yml"]) {
+    assert.ok(policy.includes(`/${file}\n`), `active policy checkout must include ${file}`)
+  }
+  assert.match(policy, /ref: \$\{\{ github\.workflow_sha \}\}/)
+  const publish = workflow.split("\n  publish:\n")[1]
+  assert.doesNotMatch(publish, /test-helpers|helper-tests\.json|npm run check|npm run test/)
+})

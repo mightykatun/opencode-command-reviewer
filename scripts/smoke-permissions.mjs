@@ -8,14 +8,17 @@ import path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeMetrics, smokeRuntime } from "./smoke-runtime.mjs"
 import { reviewerAudit, sendReviewStream } from "./smoke-reviewer.mjs"
+import { permissionStagePlan, runPermissionStages } from "./smoke-stages.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
-const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
-const hostVersion = execFileSync(hostBinary, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
 const scenario = process.argv[2] ?? "mcp"
-assert.ok(["mcp", "mcp-resource", "custom", "custom-bash", "external-read", "external-search", "external-edit", "external-patch"].includes(scenario))
 const flag = (name) => process.argv.includes(`--${name}`)
 const auto = flag("auto"), disabled = flag("disabled"), correction = flag("correction")
+const plan = permissionStagePlan(scenario, { auto, disabled, correction, held: flag("held"), cancel: flag("cancel"),
+  unsafe: flag("unsafe"), error: flag("error"), nativeBashEnabled: flag("native-bash-enabled") })
+if (flag("plan")) { console.log(JSON.stringify(plan, null, 2)); process.exit(0) }
+const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
+const hostVersion = execFileSync(hostBinary, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
 const stream = flag("stream")
 const mcp = scenario.startsWith("mcp"), custom = scenario.startsWith("custom"), directory = scenario.startsWith("external-")
 const patch = scenario === "external-patch"
@@ -167,8 +170,7 @@ try {
     models: { review: { name: "Review", limit: { context: 32000, output: 1000 }, cost: { input: 1, output: 2, cache_read: 0, cache_write: 0 } } } }
   const tui = path.join(temp, "tui.json")
   await writeFile(tui, JSON.stringify({ theme: "opencode", plugin: [[plugin, { baseURL: `http://127.0.0.1:${port}/review`, model: "review",
-    reviewBash: flag("native-bash-enabled"), reviewEdits: true, reviewMcp: mcp && !disabled, reviewCustomTools: custom && !disabled,
-    reviewExternalDirectories: directory && !disabled, autoApprove: auto, autoApproveDelaySeconds: 2, stream }]] }))
+    ...plan.settings, autoApprove: auto, autoApproveDelaySeconds: 2, stream }]] }))
   const env = { HOME: temp, XDG_CONFIG_HOME: path.join(temp, "config"), XDG_DATA_HOME: path.join(temp, "data"), XDG_STATE_HOME: path.join(temp, "state"), XDG_CACHE_HOME: path.join(temp, "cache"),
     OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_CONFIG: "", OPENCODE_CONFIG_DIR: path.join(temp, "config"), OPENCODE_TUI_CONFIG: tui,
     OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_EXTERNAL_SKILLS: "1", OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1" }
@@ -176,114 +178,119 @@ try {
   await runtime.start("-d", "-s", "smoke", "-x", "160", "-y", "40", "-c", project, "env", ...Object.entries(env).map(([key, value]) => `${key}=${value}`), hostBinary, project, "--prompt", prompt)
   metrics.mark("tmux-start-acknowledged")
   started = true
-  await until((s) => s.includes("Permission required") && (disabled || reviews().length > 0))
-  metrics.mark("native-permission-visible", reviews().length)
-  assert.equal(executions, 0)
-  if (custom) {
-    assert.match(await readFile(path.join(project, "before-permission"), "utf8"), /entered/)
-    await assert.rejects(readFile(path.join(project, "executions")))
-  }
-  if (directory) assert.equal(await readFile(target, "utf8"), "before fixture\n")
-  if (flag("held")) {
-    await until((s) => !!release && s.includes("Permission analysis") && /[■⬝]{8}|\[⋯\]/.test(s))
-    if (flag("stats")) assert.doesNotMatch(screen, /tokens in\/out:|lifetime:/, "loading must not show historical lifetime by itself")
-    await save("loading")
-    metrics.mark("held-review-released", reviews().length)
-    release()
-  }
   const expected = flag("error") ? "Analysis unavailable" : flag("unsafe") ? "✗ Unsafe" : "✓ Safe"
-  if (disabled) {
-    await sleep(2500)
-    assert.equal(reviews().length, 0)
-    assert.doesNotMatch(capture(), /Permission analysis/)
-  } else {
-    await until((s) => s.includes(expected) && (!stream || flag("error") || terminalAttempts.length === reviews().length))
-    metrics.mark("review-visible", reviews().length)
-    const evidence = JSON.parse(reviews()[0].body.messages[1].content)
-    assert.equal(evidence.kind, mcp ? "mcp" : custom ? "custom" : "external-directory")
-    assert.equal(evidence.tool, tool)
-    assert.equal(evidence.userPrompt, prompt)
-    assert.equal(evidence.location.instanceDirectory, project)
-    assert.equal(evidence.permission.tool.callID, "call_fixture")
-    if (!directory) assert.deepEqual(evidence.input, input)
-    else assert.deepEqual(evidence.permission.patterns, [`${outside}/*`])
-    if (patch) {
-      assert.deepEqual(evidence.operation.patchOperations, [{ operation: "delete", path: target }])
-      assert.deepEqual(evidence.operation.input, {})
-      assert.equal(evidence.partial, true)
-      assert.doesNotMatch(JSON.stringify(evidence), /before fixture|patchText/)
+  const callsFor = (stage) => reviews().filter((entry) => JSON.parse(entry.body.messages[1].content).kind === stage.kind)
+  const unchanged = async () => {
+    assert.equal(executions, 0)
+    if (custom) {
+      assert.match(await readFile(path.join(project, "before-permission"), "utf8"), /entered/)
+      await assert.rejects(readFile(path.join(project, "executions")))
     }
-    if (mcp) {
-      assert.equal(evidence.origin.server, mcpName)
-      assert.equal(evidence.definition.status, "unavailable")
-      assert.equal(rpc.filter((entry) => ["tools/call", "resources/read"].includes(entry.method)).length, 0)
-      if (scenario === "mcp-resource") {
-        assert.deepEqual(evidence.permission.metadata, { server: mcpName, uri: resourceURI })
-        assert.deepEqual(evidence.permission.patterns, [`mcp:${mcpName}:${resourceURI}`])
-        assert.deepEqual(evidence.permission.always, [`mcp:${mcpName}:*`])
-      }
-    }
-    if (custom) assert.equal(evidence.definition.status, "included")
-    assert.doesNotMatch(JSON.stringify(evidence), /autoApprove|countdown/)
-    if (correction && !flag("error")) {
-      assert.equal(reviews().length, 2)
-      assert.match(reviews()[1].body.messages[3].content, /Format validation failed/)
-    }
+    if (directory) assert.equal(await readFile(target, "utf8"), "before fixture\n")
   }
-  if (flag("stats") && !disabled) {
-    const missing = flag("no-usage") || flag("error") || flag("missing-usage")
-    if (missing) {
-      assert.doesNotMatch(capture(), /tokens in\/out:|lifetime:/, "invalid/missing request usage must hide the entire stats block")
-    } else {
-      const attempts = correction ? 2 : 1
-      await until((s) => s.includes(`tokens in/out: ${100 * attempts}/${20 * attempts}`) && s.includes("lifetime:"), 5000)
-      const rows = screen.split("\n").map((line) => line.slice(118).trim())
-      const first = rows.findIndex((line) => line.startsWith("tokens in/out:"))
-      assert.ok(first >= 0)
-      if (flag("unpriced")) {
-        assert.match(rows[first + 1], /^lifetime:/)
-        assert.doesNotMatch(rows.join("\n"), /^cost:/m)
-        assert.match(rows.join("\n"), /partial pricing/)
-      } else {
-        assert.match(rows[first + 1], /^cost: \$/)
-        assert.match(rows[first + 2], flag("storage-error") ? /^lifetime: usage unavailable$/ : /^lifetime: \$/)
+  await runPermissionStages(plan, {
+    pending: async (stage, index) => {
+      await until((s) => s.includes("Permission required") && (!stage.reviewed || callsFor(stage).length > 0))
+      if (index > 0 && lastCountdown) assert.ok(Date.now() - lastCountdown >= 1750, "each preceding directory countdown must finish before the edit review")
+      metrics.mark("native-permission-visible", reviews().length)
+      await unchanged()
+    },
+    held: async () => {
+      await until((s) => !!release && s.includes("Permission analysis") && /[■⬝]{8}|\[⋯\]/.test(s))
+      if (flag("stats")) assert.doesNotMatch(screen, /tokens in\/out:|lifetime:/, "loading must not show historical lifetime by itself")
+      await save("loading")
+      metrics.mark("held-review-released", reviews().length)
+      release()
+      release = undefined
+    },
+    hidden: async () => {
+      const before = reviews().length
+      await sleep(2500)
+      assert.equal(reviews().length, before, "a disabled native stage must not start a review")
+      assert.doesNotMatch(capture(), /Permission analysis/)
+    },
+    assessment: async (stage) => {
+      await until((s) => s.includes(expected) && callsFor(stage).length === stage.attempts && (!stream || flag("error") || terminalAttempts.length === reviews().length))
+      metrics.mark("review-visible", reviews().length)
+      const stageCalls = callsFor(stage)
+      const evidence = JSON.parse(stageCalls[0].body.messages[1].content)
+      assert.equal(evidence.kind, stage.kind)
+      assert.equal(evidence.tool, tool)
+      assert.equal(evidence.userPrompt, prompt)
+      assert.equal(evidence.location.instanceDirectory, project)
+      assert.equal(evidence.permission.tool.callID, "call_fixture")
+      assert.equal(evidence.permission.type, stage.permission)
+      if (stage.kind === "edit") {
+        assert.equal(evidence.changes[0].path, target)
+        assert.match(evidence.changes[0].diff, /-before fixture\n\+after fixture/)
+      } else if (!directory) assert.deepEqual(evidence.input, input)
+      else assert.deepEqual(evidence.permission.patterns, [`${outside}/*`])
+      if (patch) {
+        assert.deepEqual(evidence.operation.patchOperations, [{ operation: "delete", path: target }])
+        assert.deepEqual(evidence.operation.input, {})
+        assert.equal(evidence.partial, true)
+        assert.doesNotMatch(JSON.stringify(evidence), /before fixture|patchText/)
       }
-    }
-  }
-  await save("pending")
-  if (auto && !disabled && !flag("unsafe") && !flag("error")) {
-    await until((s) => s.includes("Allowed in 2s"))
-    assert.equal(terminalAttempts.length, reviews().length, "all format attempts must finish before countdown")
-    metrics.mark("countdown-visible", reviews().length)
-    lastCountdown = Date.now()
-    if (flag("cancel")) {
+      if (mcp) {
+        assert.equal(evidence.origin.server, mcpName)
+        assert.equal(evidence.definition.status, "unavailable")
+        assert.equal(rpc.filter((entry) => ["tools/call", "resources/read"].includes(entry.method)).length, 0)
+        if (scenario === "mcp-resource") {
+          assert.deepEqual(evidence.permission.metadata, { server: mcpName, uri: resourceURI })
+          assert.deepEqual(evidence.permission.patterns, [`mcp:${mcpName}:${resourceURI}`])
+          assert.deepEqual(evidence.permission.always, [`mcp:${mcpName}:*`])
+        }
+      }
+      if (custom) assert.equal(evidence.definition.status, "included")
+      assert.doesNotMatch(JSON.stringify(evidence), /autoApprove|countdown/)
+      if (correction && !flag("error")) {
+        assert.equal(stageCalls.length, 2)
+        assert.match(stageCalls[1].body.messages[3].content, /Format validation failed/)
+      }
+      if (flag("stats")) {
+        const missing = flag("no-usage") || flag("error") || flag("missing-usage")
+        if (missing) {
+          assert.doesNotMatch(capture(), /tokens in\/out:|lifetime:/, "invalid/missing request usage must hide the entire stats block")
+        } else {
+          const attempts = stage.attempts
+          await until((s) => s.includes(`tokens in/out: ${100 * attempts}/${20 * attempts}`) && s.includes("lifetime:"), 5000)
+          const rows = screen.split("\n").map((line) => line.slice(118).trim())
+          const first = rows.findIndex((line) => line.startsWith("tokens in/out:"))
+          assert.ok(first >= 0)
+          if (flag("unpriced")) {
+            assert.match(rows[first + 1], /^lifetime:/)
+            assert.doesNotMatch(rows.join("\n"), /^cost:/m)
+            assert.match(rows.join("\n"), /partial pricing/)
+          } else {
+            assert.match(rows[first + 1], /^cost: \$/)
+            assert.match(rows[first + 2], flag("storage-error") ? /^lifetime: usage unavailable$/ : /^lifetime: \$/)
+          }
+        }
+      }
+    },
+    capture: async (_, index) => save(index === 0 ? "pending" : "edit-pending"),
+    countdown: async () => {
+      await until((s) => s.includes("Allowed in 2s"))
+      assert.equal(terminalAttempts.length, reviews().length, "all format attempts must finish before countdown")
+      metrics.mark("countdown-visible", reviews().length)
+      lastCountdown = Date.now()
+      await unchanged()
+    },
+    cancel: async () => {
       const lines = screen.split("\n"), row = lines.findIndex((line) => line.includes("Allowed in")), x = lines[row].indexOf("Cancel") + 2
       for (const suffix of ["M", "m"]) tmux("send-keys", "-t", "smoke", "-l", `\x1b[<0;${x};${row + 1}${suffix}`)
       await until((s) => s.includes("Auto-approval canceled"), 3000)
       await sleep(2500)
       assert.match(capture(), /Permission required/)
-      assert.equal(executions, 0)
+      await unchanged()
+    },
+    manual: async (stage) => {
+      if (stage.reviewed && stage.action === "manual") await sleep(2500)
+      assert.match(capture(), /Permission required/)
+      assert.doesNotMatch(capture(), /Allowed in/)
       tmux("send-keys", "-t", "smoke", "Enter")
-    } else if (scenario === "external-edit") {
-      await until((s) => reviews().some((entry) => JSON.parse(entry.body.messages[1].content).kind === "edit") && s.includes("Allowed in 2s") && s.includes("✓ Safe"), 10000)
-      assert.equal(terminalAttempts.length, reviews().length, "native edit needs its own terminal assessment")
-      assert.ok(Date.now() - lastCountdown >= 1750, "directory stage needs its own visible countdown")
-      assert.equal(await readFile(target, "utf8"), "before fixture\n")
-      lastCountdown = Date.now()
-    }
-  } else {
-    await sleep(2500)
-    assert.match(capture(), /Permission required/)
-    assert.doesNotMatch(capture(), /Allowed in/)
-    tmux("send-keys", "-t", "smoke", "Enter")
-  }
-  if (scenario === "external-edit") {
-    if (!auto || flag("cancel") || flag("unsafe") || flag("error")) {
-      await until((s) => s.includes("Permission required") && reviews().some((entry) => JSON.parse(entry.body.messages[1].content).kind === "edit"))
-      await until((s) => s.includes(expected))
-      tmux("send-keys", "-t", "smoke", "Enter")
-    }
-  }
+    },
+  })
   await until(() => completed, 15000)
   if (lastCountdown && !flag("cancel")) assert.ok(Date.now() - lastCountdown >= 1750, "each request needs a full visible countdown")
   await until((s) => !s.includes("Permission required") && !s.includes("Permission analysis"), 5000)
@@ -301,7 +308,7 @@ try {
   if (scenario === "external-edit") {
     assert.equal(await readFile(target, "utf8"), "after fixture\n")
     const stages = new Map(reviews().map((entry) => { const e = JSON.parse(entry.body.messages[1].content); return [e.permission.id, e.kind] }))
-    assert.deepEqual([...stages.values()], ["external-directory", "edit"])
+    assert.deepEqual([...stages.values()], plan.reviewKinds)
   }
   if (scenario === "external-read" || scenario === "external-search") {
     const outputs = requests.filter((entry) => entry.url.startsWith("/main")).flatMap((entry) => entry.body.messages)
@@ -335,9 +342,7 @@ try {
   }
   await save("resolved")
   assert.deepEqual(fixtureErrors, [], "fixture transport and pre-terminal assertions must succeed")
-  const expectedKinds = scenario === "external-edit" ? [...(disabled ? [] : ["external-directory"]), "edit"]
-    : disabled ? [] : [mcp ? "mcp" : custom ? "custom" : "external-directory"]
-  audit.verify(expectedKinds, correction && !flag("error") ? 2 : 1)
+  audit.verify(plan.reviewKinds, plan.attemptsPerReview)
   assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)
   await writeFile(path.join(root, `.runtime/permission-${tag}-requests.json`), JSON.stringify({ requests, rpc }, null, 2))
   console.log(`PASS ${tag}: real native ${tool}, correct evidence/prompt routing, ${reviews().length} reviewer attempts, once-only fixture completion and panel cleanup. ${temp}`)

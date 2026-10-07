@@ -22,6 +22,7 @@ export interface View {
 type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void, onProgress: (progress: ReviewProgress) => void) => Promise<ReviewResult | null>
 interface Entry {
   view: View; abort: AbortController; root?: string; gateRevision: number
+  suspension?: "mode" | "unavailable"
   cancelTimer?: () => void; deadline?: number; approvalAbort?: AbortController
   attempt: number; progressGeneration: number; pendingProgress?: ReviewProgress; cancelProgress?: () => void
 }
@@ -64,7 +65,7 @@ export class Controller {
     this.publish()
   }
 
-  private suspend(entry: Entry) {
+  private suspend(entry: Entry, reason: "mode" | "unavailable" = "mode") {
     const id = entry.view.request.id
     const state = entry.view.autoApproval?.status
     if (state) this.manual.set(id, state === "failed" || state === "allowing" ? "failed" : "cancelled")
@@ -72,6 +73,7 @@ export class Controller {
     this.clearProgress(entry)
     entry.approvalAbort?.abort()
     entry.abort.abort()
+    entry.suspension = reason
     entry.view = { request: entry.view.request, status: "suspended" }
   }
 
@@ -264,7 +266,7 @@ export class Controller {
             this.suspend(entry); this.publish(); return null
           }
         } catch {
-          if (active()) { this.suspend(entry); this.publish() }
+          if (active()) { this.suspend(entry, "unavailable"); this.publish() }
           return null
         }
       }
@@ -319,7 +321,9 @@ export class Controller {
     for (const request of requests) {
       const entry = this.entries.get(request.id)
       if (entry && !entry.root) entry.gateRevision = this.version
-      if (entry?.view.status === "suspended" && (!entry.root || this.modes?.enabled(entry.root))) {
+      if (entry?.view.status === "suspended" && (entry.suspension === "unavailable" || !entry.root || this.modes?.enabled(entry.root))) {
+        // A failed saved-mode read is unknown, not a cached disabled choice.
+        // Only an accepted fresh snapshot may retry the gate, never enrichment directly.
         this.entries.delete(request.id)
       }
       this.asked(request)

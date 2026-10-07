@@ -40,7 +40,11 @@ function estimatedUsage(body: Record<string, unknown>, requestedModel: string, p
   const result = { input: usage.prompt_tokens, output: usage.completion_tokens }
   const prices = pricing?.(typeof body.model === "string" ? body.model : requestedModel)
   if (!prices) return result
-  const details = record(usage.prompt_tokens_details)
+  // Omission permits the conventional zero-cache default. Explicit malformed
+  // containers (including null) cannot support an estimated charge.
+  const rawDetails = usage.prompt_tokens_details
+  if (rawDetails !== undefined && (!rawDetails || typeof rawDetails !== "object" || Array.isArray(rawDetails))) return result
+  const details = record(rawDetails)
   const cached = details.cached_tokens === undefined ? 0 : details.cached_tokens
   const written = details.cache_write_tokens === undefined ? 0 : details.cache_write_tokens
   // Native Anthropic usage is a different contract; do not guess its mapping to prompt_tokens.
@@ -75,7 +79,8 @@ export function usageAttempt(baseURL: string, requestedModel: string, pricing?: 
       if (!finalized) {
         finalized = true
         if (usage) {
-          try { onUsage?.({ ...usage }) } catch { /* The observer owns persistence diagnostics. */ }
+          try { void Promise.resolve(onUsage?.({ ...usage })).catch(() => {}) }
+          catch { /* The observer owns persistence diagnostics. */ }
         }
       }
       return current()

@@ -4,7 +4,8 @@ import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { collectEvidence, collectEditEvidence, discover } from "../src/evidence.js"
-import { diffDelta } from "../src/files.js"
+import { DiffBudget, diffDelta } from "../src/files.js"
+import { withDeadline } from "../src/deadline.js"
 import { parseConfig } from "../src/config.js"
 import type { EditContext } from "../src/types.js"
 
@@ -87,6 +88,53 @@ test("unified diff counts distinguish headers, context, no-newline markers and m
   assert.deepEqual(diffDelta("@@ -0,0 +1,2 @@\n+a\n+b\n", signal()), { added: 2, removed: 0 })
   assert.deepEqual(diffDelta("@@ -1,2 +0,0 @@\n-a\n-b\n", signal()), { added: 0, removed: 2 })
   for (const bad of [undefined, "", "+not-a-diff", "@@ -1 +1 @@\n-old\n", "@@ -1 +1 @@\n-old\n+new\n+extra", "@@ -1,999999999999999999 +0,0 @@\n-x"]) assert.equal(diffDelta(bad, signal()), undefined)
+})
+
+test("diff counting shares exact UTF-8 byte and line allowances, including invalid scans", () => {
+  const bytes = Buffer.byteLength(diff)
+  const byteBudget = new DiffBudget({ bytes: bytes * 2 - 1, lines: 100, ms: 1000 })
+  assert.deepEqual(diffDelta(diff, signal(), byteBudget), { added: 2, removed: 1 })
+  assert.equal(diffDelta(diff, signal(), byteBudget), undefined)
+  const lineBudget = new DiffBudget({ bytes: 10000, lines: 7, ms: 1000 })
+  assert.deepEqual(diffDelta(diff, signal(), lineBudget), { added: 2, removed: 1 })
+  assert.equal(diffDelta(diff, signal(), lineBudget), undefined)
+  assert.equal(lineBudget.exhausted, true)
+  const small = "@@ -1 +1 @@\n-old\n+é\n"
+  assert.equal(diffDelta(small, signal(), new DiffBudget({ bytes: small.length, lines: 10, ms: 1000 })), undefined)
+  const invalid = new DiffBudget({ bytes: 100, lines: 2, ms: 1000 })
+  assert.equal(diffDelta("header\nheader\nheader\n", signal(), invalid), undefined)
+  assert.equal(diffDelta("@@ -0,0 +0,0 @@\n", signal(), invalid), undefined)
+})
+
+test("optional counting time is cumulative active work and never turns parent cancellation or expiry into omission", async () => {
+  let clock = 0
+  const budget = new DiffBudget({ bytes: 10000, lines: 100, ms: 5 }, () => ++clock)
+  assert.equal(diffDelta(diff, signal(), budget), undefined)
+  assert.equal(budget.exhausted, true)
+  assert.equal(budget.ms, 0)
+  assert.equal(diffDelta(diff, signal(), budget), undefined)
+  assert.throws(() => diffDelta(diff, AbortSignal.abort(new Error("native resolved"))), /native resolved/)
+  await assert.rejects(withDeadline(signal(), 10, async s => {
+    const until = performance.now() + 20
+    while (performance.now() < until) { /* Delay timer delivery. */ }
+    diffDelta(diff, s)
+  }), /timed out/)
+})
+
+test("canonical source aliases promote an unqualified direct executable once and preserve its identity", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "review-promotion-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const source = "# extensionless interpreter/reader source\n"
+  await writeFile(`${dir}/run`, source)
+  await symlink(`${dir}/run`, `${dir}/alias`)
+  const result = await collectEvidence({ command: "./run; python alias; cat alias", cwd: dir, userPrompt: "Inspect" }, { ...config, maxFiles: 1 }, signal())
+  assert.equal(result.files.length, 1)
+  assert.equal(result.files[0]?.filename, "./run")
+  assert.equal(result.files[0]?.contents, source)
+  assert.deepEqual(result.files[0]?.aliases, [`${dir}/alias`])
+  assert.equal(result.files[0]?.warning, undefined)
+  const exact = await collectEvidence({ command: "./run; python ./run", cwd: dir, userPrompt: "Inspect" }, config, signal())
+  assert.equal(exact.files[0]?.contents, source)
 })
 
 test("cat/head operands are literal and flags, stdin, expansions and unsupported options are not guessed", () => {
