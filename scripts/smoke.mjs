@@ -369,6 +369,10 @@ try {
       if (scenario === "auto-shell") await assertUsage()
       assert.equal(styleAt(ansi, "✓ Safe").fg, "127,216,143")
       assert.equal(styleAt(ansi, "✓ Safe").bold, true)
+      for (const property of ["fg", "bg"]) {
+        assert.equal(styleAt(ansi, "Allowed in")[property], styleAt(ansi, "Allow once")[property], "selected auto control must match the native permission button")
+        assert.equal(styleAt(ansi, "Cancel")[property], styleAt(ansi, "Allow always")[property], "unselected auto control must match the native permission button")
+      }
       return { started, footerRow }
     }
     const clickFooter = (label, row) => {
@@ -496,8 +500,19 @@ try {
         await until((s) => s.includes("Permission analysis"), 3000)
         record("panel-restored")
         await save("restored")
-      } else if (scenario === "auto-immediate") clickFooter("Allowed in", footerRow)
-      else if (scenario === "auto-manual") {
+      } else if (scenario === "auto-immediate") {
+        const x = screen.split("\n")[footerRow].indexOf("Cancel") + 2
+        mouse(35, x, footerRow + 1)
+        await until(() => {
+          const ansi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
+          return ["fg", "bg"].every((property) =>
+            styleAt(ansi, "Cancel")[property] === styleAt(ansi, "Allow once")[property]
+            && styleAt(ansi, "Allowed in")[property] === styleAt(ansi, "Allow always")[property])
+        }, 3000)
+        await unchanged()
+        await save("hover-cancel")
+        clickFooter("Allowed in", footerRow)
+      } else if (scenario === "auto-manual") {
         tmux("send-keys", "-t", "smoke", "Enter")
         record("native-enter")
       }

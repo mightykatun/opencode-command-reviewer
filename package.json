@@ -1,6 +1,7 @@
 {
   "name": "opencode-reviewer",
-  "version": "0.2.2",
+  "version": "0.2.3",
+  "license": "MIT",
   "description": "Safety reviews and optional one-time auto-approval for OpenCode shell and edit permissions",
   "type": "module",
   "repository": {

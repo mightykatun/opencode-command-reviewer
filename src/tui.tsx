@@ -55,20 +55,29 @@ function ownsHit(node: Renderable, hit: number): boolean {
   return node.num === hit || node.getChildren().some((child) => ownsHit(child, hit))
 }
 
-function ReviewButton(props: { api: TuiPluginApi; label: string; disabled?: boolean; onClick: () => void }) {
-  const [hover, setHover] = createSignal(false)
+function ReviewButton(props: { api: TuiPluginApi; label: string; selected?: boolean; disabled?: boolean; onHover?: () => void; onClick: () => void }) {
+  const selected = () => props.selected && !props.disabled
+  const foreground = () => {
+    const theme = props.api.theme.current
+    if (!selected()) return theme.textMuted
+    if (theme.selectedListItemText.a !== 0) return theme.selectedListItemText
+    // Transparent themes need contrast against the permission selection color.
+    const { r, g, b } = theme.warning
+    return 0.299 * r + 0.587 * g + 0.114 * b > 0.5 ? RGBA.fromInts(0, 0, 0) : RGBA.fromInts(255, 255, 255)
+  }
   return <box paddingLeft={1} paddingRight={1}
-    backgroundColor={hover() && !props.disabled ? props.api.theme.current.primary : props.api.theme.current.backgroundElement}
-    onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)}
+    backgroundColor={selected() ? props.api.theme.current.warning : props.api.theme.current.backgroundMenu}
+    onMouseOver={() => { if (!props.disabled) props.onHover?.() }}
     onMouseUp={(event) => {
       event.stopPropagation()
       if (event.button === 0 && !props.disabled) props.onClick()
     }}>
-    <text fg={props.disabled ? props.api.theme.current.textMuted : hover() ? props.api.theme.current.selectedListItemText : props.api.theme.current.text}>{props.label}</text>
+    <text fg={foreground()}>{props.label}</text>
   </box>
 }
 
 function ReviewFooter(props: { api: TuiPluginApi; view: View; controller: Controller; enabled: boolean }) {
+  const [selected, setSelected] = createSignal<"approve" | "cancel">("approve")
   const state = () => props.view.autoApproval
   const label = () => { const current = state(); return current?.status === "countdown" ? `Allowed in ${current.seconds}s` : "Checking…" }
   return <Show when={props.enabled && props.view.assessment?.safe}>
@@ -77,8 +86,10 @@ function ReviewFooter(props: { api: TuiPluginApi; view: View; controller: Contro
         <Match when={state()?.status === "countdown" || state()?.status === "checking"}>
           <box flexDirection="row" gap={1}>
             <ReviewButton api={props.api} label={label()} disabled={state()?.status === "checking"}
+              selected={selected() === "approve"} onHover={() => setSelected("approve")}
               onClick={() => { void props.controller.approveNow(props.view.request.id) }} />
-            <ReviewButton api={props.api} label="Cancel" onClick={() => props.controller.cancelAutoApproval(props.view.request.id)} />
+            <ReviewButton api={props.api} label="Cancel" selected={selected() === "cancel"} onHover={() => setSelected("cancel")}
+              onClick={() => props.controller.cancelAutoApproval(props.view.request.id)} />
           </box>
         </Match>
         <Match when={state()?.status === "allowing"}>

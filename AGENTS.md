@@ -76,7 +76,7 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   or Solid DOM. TypeScript only checks types; the build emits ESM `dist/tui.js`.
   Solid/OpenTUI/OpenCode imports remain external and are supplied by the host.
 - `shell-quote` is bundled; retain `THIRD_PARTY_NOTICES.md`. The packaging check
-  requires exactly `dist/tui.js`, `package.json`, `README.md`, and
+  requires exactly `dist/tui.js`, `package.json`, `README.md`, `LICENSE`, and
   `THIRD_PARTY_NOTICES.md`. Generated `dist/` and runtime captures are ignored.
 - Defaults/validation live in `src/config.ts`, evidence shapes in `src/types.ts`,
   overridable prompt text in `prompts/`, fixed contract in `contracts/`, and response validation in
