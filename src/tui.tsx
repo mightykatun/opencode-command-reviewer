@@ -341,7 +341,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                         <b>{rating() ? "✓ Safe" : "✗ Unsafe"}</b>
                       </text>
                     </Show>
-                    <Show when={view().status === "analyzing"}>
+                    <Show when={view().status === "analyzing" && rating() === undefined}>
                       <ReviewLoading api={api} retrying={view().progress?.phase === "retrying"} />
                     </Show>
                     <Show when={view().status === "unavailable"}>

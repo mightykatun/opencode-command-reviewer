@@ -1036,7 +1036,7 @@ test("complete SSE reviews discard stale estimates from report and lifetime but 
     await store.flush()
     const expected = { input: 100, output, ...(reported ? { cost: 0.000102 } : {}) }
     assert.deepEqual(result, { safe: true, desc: "Bounded effects.", usage: expected })
-    assert.equal(usageText(result.usage!), `tokens in/out: 100/${output}${reported ? "\ncost: $0.0001" : ""}`)
+    assert.equal(usageText(result.usage!), `token: 100 in ${output} out${reported ? "\ncost: $0.0001" : ""}`)
     assert.deepEqual(observed, [expected], "one final accounting observation, not cumulative-frame increments")
     assert.equal(calls, 1)
     const totals = await new LifetimeUsage(directory).totals()

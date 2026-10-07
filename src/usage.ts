@@ -103,7 +103,7 @@ export function sumUsage(previous: Usage | undefined, next: Usage | undefined): 
 
 export function usageText(usage: Usage): string {
   return [
-    ...(count(usage.input) && count(usage.output) ? [`tokens in/out: ${usage.input}/${usage.output}`] : []),
+    ...(count(usage.input) && count(usage.output) ? [`token: ${usage.input} in ${usage.output} out`] : []),
     ...(usage.cost === undefined ? [] : [`cost: $${usage.cost.toFixed(4)}`]),
   ].join("\n")
 }

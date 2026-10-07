@@ -197,7 +197,7 @@ try {
     },
     held: async () => {
       await until((s) => !!release && s.includes("Permission analysis") && /[■⬝]{8}|\[⋯\]/.test(s))
-      if (flag("stats")) assert.doesNotMatch(screen, /tokens in\/out:|lifetime:/, "loading must not show historical lifetime by itself")
+      if (flag("stats")) assert.doesNotMatch(screen, /token:|lifetime:/, "loading must not show historical lifetime by itself")
       await save("loading")
       metrics.mark("held-review-released", reviews().length)
       release()
@@ -250,12 +250,12 @@ try {
       if (flag("stats")) {
         const missing = flag("no-usage") || flag("error") || flag("missing-usage")
         if (missing) {
-          assert.doesNotMatch(capture(), /tokens in\/out:|lifetime:/, "invalid/missing request usage must hide the entire stats block")
+          assert.doesNotMatch(capture(), /token:|lifetime:/, "invalid/missing request usage must hide the entire stats block")
         } else {
           const attempts = stage.attempts
-          await until((s) => s.includes(`tokens in/out: ${100 * attempts}/${20 * attempts}`) && s.includes("lifetime:"), 5000)
+          await until((s) => s.includes(`token: ${100 * attempts} in ${20 * attempts} out`) && s.includes("lifetime:"), 5000)
           const rows = screen.split("\n").map((line) => line.slice(118).trim())
-          const first = rows.findIndex((line) => line.startsWith("tokens in/out:"))
+          const first = rows.findIndex((line) => line.startsWith("token:"))
           assert.ok(first >= 0)
           if (flag("unpriced")) {
             assert.match(rows[first + 1], /^lifetime:/)
@@ -330,7 +330,7 @@ try {
       const total = 1 + recorded, priced = 1 + (flag("unpriced") ? 0 : recorded)
       const cost = (0.01 + (flag("unpriced") ? 0 : recorded * (stream ? 0.000115 : 0.00014))).toFixed(4)
       assert.equal(screen.match(/\b\d+ requests with recorded usage\b/)?.[0], `${total} requests with recorded usage`)
-      assert.equal(screen.match(/tokens in\/out: \d+\/\d+(?: \(partial coverage\))?/)?.[0], `tokens in/out: ${100 * total}/${20 * total}`)
+      assert.equal(screen.match(/token: \d+ in \d+ out(?: \(partial coverage\))?/)?.[0], `token: ${100 * total} in ${20 * total} out`)
       assert.equal(screen.match(/Token counts available: \d+\/\d+ requests/)?.[0], `Token counts available: ${total}/${total} requests`)
       assert.equal(screen.match(/Pricing available: \d+\/\d+ requests/)?.[0], `Pricing available: ${priced}/${total} requests`)
       assert.equal(screen.match(/lifetime: \$\d+\.\d{4}(?: \(partial pricing\))?/)?.[0], `lifetime: $${cost}${priced < total ? " (partial pricing)" : ""}`)

@@ -131,6 +131,7 @@ let screen = "", outcome = "failed"
 const capture = () => tmux("capture-pane", "-p", "-t", "stream")
 const send = (...keys) => tmux("send-keys", "-t", "stream", ...keys)
 const sidebar = (s) => s.split("\n").map((line) => line.slice(118)).join("\n")
+const noLoading = (s) => assert.doesNotMatch(sidebar(s), / Evaluating| Retrying|\[⋯\]|[■⬝]/, "a streamed rating must hide the entire loading indicator")
 const until = async (condition, timeout = 20000) => {
   const end = Date.now() + timeout
   while (Date.now() < end) {
@@ -262,10 +263,11 @@ try {
   let current = reviews[0]
   if (streaming) {
     current.content('{"safe":true,')
-    await until((s) => sidebar(s).includes("✓ Safe") && sidebar(s).includes(" Evaluating"))
+    await until((s) => sidebar(s).includes("✓ Safe") && !sidebar(s).includes(" Evaluating"))
     await pendingFor(delay * 1000 + 300, (s) => {
       assert.match(sidebar(s), /✓ Safe/)
-      assert.doesNotMatch(sidebar(s), /tokens in\/out|lifetime:/)
+      noLoading(s)
+      assert.doesNotMatch(sidebar(s), /token:|lifetime:/)
     })
     await save("rating-only")
     const ratingOnly = JSON.parse(await readFile(diagnosticsFile, "utf8"))
@@ -273,7 +275,7 @@ try {
       "first-display must observe the rating frame before any description is sent")
     current.content('"desc":"' + encoded(prefix + longText))
     await until((s) => sidebar(s).includes("STREAM START") && sidebar(s).includes("PAINTED_CODE") && sidebar(s).includes("\\u001b[2J\\u202e"))
-    await pendingFor(500, (s) => assert.match(sidebar(s), / Evaluating/))
+    await pendingFor(500, noLoading)
     await save("partial-description")
   } else await pendingFor(300, (s) => assert.doesNotMatch(sidebar(s), /✓ Safe|STREAM START/))
 
@@ -299,6 +301,8 @@ try {
     current.content('{"desc":"' + encoded(`CORRECTED START\n\n${code}\n\nCorrected explanation.`))
     await until((s) => sidebar(s).includes("CORRECTED START") && sidebar(s).includes("PAINTED_CODE"))
     assert.doesNotMatch(sidebar(screen), /✓ Safe|✗ Unsafe/)
+    assert.match(sidebar(screen), / Retrying| Evaluating/, "description-first retries keep loading until a rating arrives")
+    if (staticAnimations) assert.match(sidebar(screen), /\[⋯\]/)
     await save("retry-scroll-reset")
     current.content('","safe":true}')
   } else if (scenario === "cancel" || scenario === "manual") {
@@ -339,10 +343,10 @@ try {
   if (!["cancel", "manual", "error"].includes(scenario)) {
     if (streaming) {
       await until((s) => sidebar(s).includes("✓ Safe"))
-      await pendingFor(300, (s) => assert.match(sidebar(s), / Evaluating/))
+      await pendingFor(300, noLoading)
       current.stop()
       // A full JSON object and finish metadata are still provisional without DONE/EOF.
-      await pendingFor(delay * 1000 + 300, (s) => assert.match(sidebar(s), / Evaluating/))
+      await pendingFor(delay * 1000 + 300, noLoading)
       await save("complete-json-not-terminal")
     }
     let scrolledRow

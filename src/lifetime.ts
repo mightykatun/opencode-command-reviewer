@@ -135,7 +135,7 @@ export function lifetimeCost(totals: LifetimeTotals): string {
 
 export function lifetimeReport(totals: LifetimeTotals): string {
   return [lifetimeCost(totals), `${totals.requests} requests with recorded usage`,
-    totals.tokenRequests ? `tokens in/out: ${totals.input}/${totals.output}${totals.tokenRequests < totals.requests ? " (partial coverage)" : ""}` : "tokens unavailable",
+    totals.tokenRequests ? `token: ${totals.input} in ${totals.output} out${totals.tokenRequests < totals.requests ? " (partial coverage)" : ""}` : "tokens unavailable",
     `Token counts available: ${totals.tokenRequests}/${totals.requests} requests`,
     `Pricing available: ${totals.priced}/${totals.requests} requests`,
     ...(totals.since === null ? [] : [`Recorded since: ${new Date(totals.since).toISOString().slice(0, 10)}`]),

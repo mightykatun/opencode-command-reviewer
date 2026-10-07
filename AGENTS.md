@@ -262,7 +262,10 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   `displayText` first. Keep strict outer JSON and native approval controls active.
 - Loading uses an eight-cell, 40 ms block scanner in the theme's muted color with
   `Evaluating`, or `Retrying` at the start of a format correction. Keep the indicator
-  visible alongside provisional ratings/text until final completion. Honor
+  visible while the rating is unknown, including description-first previews; hide
+  its label and spinner immediately when either provisional rating arrives. Format
+  retries clear the rating and restore the indicator. Hiding it never makes the
+  assessment final or starts approval early. Honor
   `animations_enabled` through the public KV API, use `[⋯]` plus the same label when
   disabled, and stop the timer on unmount. `src/appearance.ts` holds theme scopes
   and scanner frames; do not import private OpenCode theme/spinner helpers.

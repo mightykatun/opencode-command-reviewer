@@ -77,9 +77,10 @@ The sidebar shows Safe, Unsafe, or Analysis unavailable. Explanations support
 Markdown and scrolling. If the sidebar is hidden, use OpenCode's Show sidebar
 command.
 
-With streaming enabled, the rating remains provisional while Evaluating is shown.
-A format retry clears the preview and shows Retrying. Auto-approval starts only
-after the full response is validated and rendered.
+With streaming enabled, Evaluating and its spinner disappear when a rating arrives.
+The rating remains provisional until the full response is validated. A format retry
+clears the preview and restores the loading indicator. Auto-approval
+starts only after the full response is validated and rendered.
 
 During an auto-approval countdown, click the countdown to allow once immediately,
 or Cancel to leave the request manual. Hiding or covering the panel also cancels

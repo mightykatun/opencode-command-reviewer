@@ -363,9 +363,9 @@ try {
     if (scenario === "correction" || scenario === "auto-scroll") {
       for (let i = 0; i < 30 && !capture().includes("lifetime:"); i++) { mouse(65, 140, 20); await sleep(40) }
     }
-    await until((s) => s.includes(`tokens in/out: ${input}/${output}`), 5000)
+    await until((s) => s.includes(`token: ${input} in ${output} out`), 5000)
     const ansi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
-    assert.equal(styleAt(ansi, `tokens in/out: ${input}/${output}`).fg, styleAt(ansi, "fullscreen").fg, "usage footer must use the active theme's muted color")
+    assert.equal(styleAt(ansi, `token: ${input} in ${output} out`).fg, styleAt(ansi, "fullscreen").fg, "usage footer must use the active theme's muted color")
     const sidebarText = screen.split("\n").map((line) => line.slice(118)).join("\n")
     if (knownPricing) assert.match(sidebarText, correction ? /cost: \$0\.0011/ : /cost: \$0\.0005/)
     else assert.doesNotMatch(sidebarText, /cost:\s*\$/, "unknown pricing must not invent a cost")
@@ -374,7 +374,7 @@ try {
     assert.equal(styleAt(lifetimeAnsi, "lifetime:").fg, styleAt(lifetimeAnsi, "fullscreen").fg)
     if (knownPricing) {
       const rows = screen.split("\n").map((line) => line.slice(118).trim())
-      const first = rows.findIndex((line) => line === `tokens in/out: ${input}/${output}`)
+      const first = rows.findIndex((line) => line === `token: ${input} in ${output} out`)
       assert.match(rows[first + 1] ?? "", /^cost: \$/)
       assert.match(rows[first + 2] ?? "", /^lifetime: \$/)
     }
@@ -803,7 +803,7 @@ try {
     await writeFile(path.join(root, `.runtime/${scenario}-pending.txt`), screen)
     const styledScreen = tmux("capture-pane", "-p", "-e", "-t", "smoke")
     if (withUsage && scenario !== "correction") await assertUsage()
-    if (!withUsage) assert.doesNotMatch(screen.split("\n").map((line) => line.slice(initialWidth - 42)).join("\n"), /tokens in\/out: \d+\/\d+|lifetime:/, "missing endpoint usage must leave no request or standalone lifetime footer")
+    if (!withUsage) assert.doesNotMatch(screen.split("\n").map((line) => line.slice(initialWidth - 42)).join("\n"), /token: \d+ in \d+ out|lifetime:/, "missing endpoint usage must leave no request or standalone lifetime footer")
     await writeFile(path.join(root, `.runtime/${scenario}-pending.ansi`), styledScreen)
     if (!disabledReview) assert.match(styledScreen.split("\n").find((line) => line.includes("Permission analysis")) ?? "", /\x1b\[1m/, "overlay heading should be bold")
     if (scenario === "correction" || scenario === "external") {
@@ -967,7 +967,7 @@ try {
         tmux("send-keys", "-t", "smoke", "Enter")
         await until((s) => s.includes("Reviewer lifetime usage") && s.includes("2 requests with recorded usage"), 10000)
         assert.match(screen, /lifetime: \$0\.0011/)
-        assert.match(screen, /tokens in\/out: 1000\/40/)
+        assert.match(screen, /token: 1000 in 40 out/)
         assert.match(screen, /Token counts available: 2\/2 requests/)
         assert.match(screen, /Pricing available: 2\/2 requests/)
         assert.doesNotMatch(screen, /Permission analysis/)
