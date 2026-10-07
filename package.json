@@ -1,7 +1,11 @@
 {
   "name": "opencode-reviewer",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "description": "Safety reviews and optional one-time auto-approval for OpenCode shell, edit, MCP, custom-tool and directory permissions",
   "type": "module",
   "repository": {

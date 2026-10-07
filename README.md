@@ -6,31 +6,33 @@ Reviews native shell execution and edit/write/apply-patch changes by default. In
 
 ## Install
 
-**1. Download and extract** the built `.tgz` asset from [Releases](https://github.com/mightykatun/opencode-reviewer/releases), not the source archive. Replace the archive path below with your download; older releases use the previous project name.
+Add the [npm package](https://www.npmjs.com/package/opencode-reviewer) to `~/.config/opencode/tui.json` or `.opencode/tui.json`, preserving existing entries. OpenCode downloads the prebuilt package and loads its TUI entry automatically. No archive extraction, separate `npm install`, or absolute plugin file path is needed.
 
-```sh
-mkdir -p opencode-reviewer
-tar -xzf /path/to/downloaded-asset.tgz -C opencode-reviewer --strip-components=1
+Minimal configuration:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    ["opencode-reviewer@0.4.0", {
+      "baseURL": "https://api.example.com/v1",
+      "model": "your-model",
+      "apiKeyEnv": "OPENCODE_REVIEWER_API_KEY"
+    }]
+  ]
+}
 ```
 
-For an npm-managed installation/update, use the **same prefix as the bundle registered in `tui.json`**. For example, an existing installation under `~/.local/share/opencode-command-reviewer` can be updated from any working directory with:
+Set `OPENCODE_REVIEWER_API_KEY` in your environment before launching OpenCode. Use your endpoint's model identifier. For OpenRouter, set `baseURL` to `https://openrouter.ai/api/v1`.
 
-```sh
-VERSION=X.Y.Z
-npm install --prefix "$HOME/.local/share/opencode-command-reviewer" --save-exact --allow-remote=all --ignore-scripts "https://github.com/mightykatun/opencode-reviewer/releases/download/v${VERSION}/opencode-reviewer-${VERSION}.tgz"
-npm ls --prefix "$HOME/.local/share/opencode-command-reviewer" opencode-reviewer --depth=0
-```
-
-Replace `X.Y.Z` with a published release version. Its bundle is `~/.local/share/opencode-command-reviewer/node_modules/opencode-reviewer/dist/tui.js`; use the expanded absolute path in `tui.json`. The remote-download flag is required by npm 12. The archive is prebuilt and needs no install scripts. Installing into the source checkout instead updates a different copy.
-
-**2. Add the plugin** to `~/.config/opencode/tui.json` or `.opencode/tui.json`, preserving existing entries. This example includes every option. Replace the placeholder paths, endpoint, model and authentication values; remove optional settings you do not use:
+The following expanded example shows **every configuration option**, with all five review categories explicitly enabled. Replace endpoint/model/authentication values and the optional custom prompt-directory path; omit options you do not use:
 
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
     [
-      "/absolute/path/to/opencode-reviewer/dist/tui.js",
+      "opencode-reviewer@0.4.0",
       {
         "baseURL": "https://api.example.com/v1",
         "model": "your-model",
@@ -57,7 +59,13 @@ Replace `X.Y.Z` with a published release version. Its bundle is `~/.local/share/
 
 This example explicitly enables all five review categories; the three new categories default to **off** when omitted. Use a local or hosted **OpenAI-compatible Chat Completions endpoint**. The plugin appends `/chat/completions`. `apiKey` takes precedence over `apiKeyEnv`; remove `apiKey` to use the environment variable, and set it before launch. Remove both for an unauthenticated endpoint. Remove `instructions` to use built-in prompts, or point it at an existing custom prompt directory.
 
-**Restart OpenCode.** The release bundle needs no dependency installation. The plugin reviews requests that OpenCode asks about; configure permission rules in `opencode.json`, for example `"permission": { "bash": "ask", "edit": "ask" }`.
+**Restart OpenCode.** The plugin reviews requests that OpenCode asks about; configure permission rules in `opencode.json`, for example `"permission": { "bash": "ask", "edit": "ask" }`.
+
+### Updates and migration to npm
+
+To update, replace `opencode-reviewer@0.4.0` with the desired published version and restart OpenCode. Exact versions keep upgrades intentional; see [npm versions](https://www.npmjs.com/package/opencode-reviewer?activeTab=versions) and [release notes](https://github.com/mightykatun/opencode-reviewer/releases).
+
+If you previously registered an extracted bundle, a `file://` URL, or a manually installed `dist/tui.js`, replace that plugin entry with the npm package specifier and preserve its options. Do not keep both entries. Usage history and saved conversation modes remain under OpenCode's state directory, independent of how the plugin is installed. Published npm packages begin with v0.4.0; older releases were distributed as GitHub assets.
 
 **Upgrading from `opencode-command-reviewer`:** replace the old plugin entry rather than adding a second one. The new plugin ID is `opencode-reviewer`; reapply any saved enable/disable preference if needed. Use documentation matching your installed release.
 
@@ -65,7 +73,7 @@ This example explicitly enables all five review categories; the three new catego
 
 ## Configuration
 
-Put options beside the plugin path in `tui.json`. Only **`baseURL` and `model`** are required. Omitted options use these defaults:
+Put options beside the npm package specifier in `tui.json`. Only **`baseURL` and `model`** are required. Omitted options use these defaults:
 
 | Option | Default | Meaning / accepted values |
 | --- | --- | --- |
@@ -90,6 +98,8 @@ Put options beside the plugin path in `tui.json`. Only **`baseURL` and `model`**
 Booleans must be `true`/`false`, numbers must be integers, and strings are trimmed and must be nonempty. Unknown keys, explicit `null`, and invalid supplied values are rejected even for disabled features. Omit both API-key options for unauthenticated endpoints.
 
 Disable review categories independently; disabling all five leaves all decisions manual. Disabled kinds skip evidence/model work, although identifying an unknown tool's category may require a minimal host lookup. Oversized sources or whole diffs are omitted with reasons; an oversized mandatory command, tool payload, or permission scope fails review. Optional definitions/metadata can be omitted explicitly. New JSON payloads are bounded to 32 nesting levels and 16,384 values. **Restart after configuration changes.**
+
+For progressive display, set `"stream": true`. For a temporary conversation-level switch, use `/reviewer-disable` or `/reviewer-enable`; the saved conversation mode is not a configuration option.
 
 Shell evidence includes literal Python/shell sources and supported `cat`/`head` file operands. Each permission gets a fresh file/byte budget; repeated edit entries retain their separate diffs. Omitted files carry `[!] File "path" not included in context.`; omitted edits also carry `[Δ] "path": +N −M lines` when a valid diff or host counts provide the numbers. Paths are JSON-quoted, and unknown counts are never invented. No omitted file content is sent.
 

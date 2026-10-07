@@ -1,4 +1,14 @@
-# Unreleased
+# v0.4.0: npm distribution, streaming reviews and conversation controls
+
+First npm release: register `opencode-reviewer@0.4.0` with its options in
+`tui.json`. OpenCode installs the prebuilt package. Replace any old file-path plugin
+entry, preserving its options and state directories, then restart OpenCode.
+Published GitHub releases now also publish the verified archive to npm; prereleases
+use the `next` dist-tag. The existing v0.3.0 tag was a local unpublished checkpoint
+and is preserved without rewriting it.
+
+This release includes the v0.3.0 checkpoint's MCP/custom/directory reviews and all
+changes below. See README for every configuration option and the v0.2.x migration.
 
 - Target OpenCode **1.18.35**, local Linux TUI. Optional `stream: true` enables SSE
   transport with early provisional ratings and progressive Markdown; the default
@@ -21,15 +31,14 @@
   recorded in `IMPLEMENTATION_PLAN.md`. These local fixtures do not establish
   live-provider performance, NFS/SSHFS behavior or a full legacy runtime-matrix rerun.
 
-Update the bundle and restart OpenCode. Existing configurations keep non-streaming
+Update the package specifier and restart OpenCode. Existing configurations keep non-streaming
 behavior; add `"stream": true` to opt in. Preserve both usage-history directories.
 Conversation-mode save failures explicitly report local-only application and
 possible use of the previous setting on resume.
 
-# v0.3.0 release notes
+# v0.3.0 checkpoint (unpublished)
 
-Prepared for the local v0.3.0 checkpoint and release tag. Publication remains a
-separate step; no release asset is available until the release is published.
+Historical local checkpoint. Its features are distributed in v0.4.0.
 
 ## Changes
 
@@ -77,7 +86,7 @@ override filenames remain supported. New assessment templates are:
 - `CUSTOM-TOOL-REVIEW-PROMPT.md`
 - `EXTERNAL-DIRECTORY-REVIEW-PROMPT.md`
 
-Rebuild/reinstall the bundle and quit/restart OpenCode after migration.
+Use the current npm package entry and quit/restart OpenCode after migration.
 
 ## Limitations
 
@@ -113,15 +122,3 @@ verified by injected filesystem-stall tests.
 
 Fixtures used isolated temporary files, local MCP/model servers, and private tmux
 supervision. They verified integration mechanics, not live-model judgment.
-
-## Update after publication
-
-For the installation currently referenced by the user's `tui.json`:
-
-```sh
-npm install --prefix "$HOME/.local/share/opencode-command-reviewer" --save-exact --allow-remote=all --ignore-scripts https://github.com/mightykatun/opencode-reviewer/releases/download/v0.3.0/opencode-reviewer-0.3.0.tgz
-```
-
-Verify the installed version, preserve the matching bundle path in `tui.json`,
-and restart OpenCode. This command becomes valid only after that release asset
-has been published.

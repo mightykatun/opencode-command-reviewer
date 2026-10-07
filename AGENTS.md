@@ -102,9 +102,20 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - `npm pack` rebuilds via `prepack`. `.github/workflows/release.yml` runs on published
   GitHub releases (including prereleases), validates `v<package.json version>` and
   lockfile versions, runs typecheck/tests and `check:package` (two builds), then
-  uploads the `.tgz` asset.
+  uploads and publishes the same `.tgz` to npm. Stable versions use `latest`;
+  prereleases use `next`. Existing npm versions must match archive integrity on rerun.
+  Publishing uses GitHub OIDC with `id-token: write` and npm 12.2.0, with optional
+  `NPM_TOKEN` secret fallback. Configure npm trusted publishing for GitHub owner
+  `mightykatun`, repository `opencode-reviewer`, workflow `release.yml`, no environment,
+  and direct publish permission. First publication may require authenticated local
+  bootstrap before npm permits trust setup; never put credentials in the repository.
   Use `npm version X.Y.Z --no-git-tag-version` to update both manifests; release tags
   must include the workflow. CI packs with `--ignore-scripts` after verification.
+- User installation is the npm package specifier in `tui.json` (e.g.
+  `opencode-reviewer@0.4.0`), resolved by OpenCode. Document migration by replacing
+  an old file-path entry while retaining options; do not prescribe extraction,
+  global installation or a manually maintained local prefix. Isolated fixture
+  bundle copies remain development mechanisms, not user installation instructions.
 
 ## Wiring and build quirks
 

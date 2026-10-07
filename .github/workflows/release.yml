@@ -7,12 +7,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,8 +26,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Use an OIDC-capable npm CLI
+        run: npm install --global npm@12.2.0 --ignore-scripts
 
       - name: Check release version
         env:
@@ -39,6 +47,7 @@ jobs:
 
       - run: npm ci --ignore-scripts
       - run: npm run typecheck && npm test
+      - run: node --test test/smoke-measurements.test.mjs test/publish-release.test.mjs
       - run: npm run check:package
 
       - name: Pack verified build
@@ -51,3 +60,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/release-package/*.tgz --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish verified package to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: node scripts/publish-release.mjs "$RUNNER_TEMP"/release-package/*.tgz

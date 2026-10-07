@@ -13,6 +13,11 @@ const manifest = JSON.parse(await readFile("package.json", "utf8"))
 const lock = JSON.parse(await readFile("package-lock.json", "utf8"))
 assert.equal(lock.name, manifest.name, "lockfile name must match package.json")
 assert.equal(lock.packages[""].name, manifest.name, "lockfile root name must match package.json")
+assert.equal(lock.version, manifest.version, "lockfile version must match package.json")
+assert.equal(lock.packages[""].version, manifest.version, "lockfile root version must match package.json")
+assert.equal(manifest.exports["./tui"], "./dist/tui.js", "npm installs must expose the public TUI entry")
+assert.equal(manifest.publishConfig.access, "public")
+assert.equal(manifest.publishConfig.registry, "https://registry.npmjs.org/")
 // npm <=11 returns an array; npm 12 keys results by package name.
 const pack = Array.isArray(output) ? output[0] : output[manifest.name]
 assert.ok(pack?.files, "npm pack must report package contents")
