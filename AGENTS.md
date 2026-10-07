@@ -103,9 +103,13 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   `v*` tags or manual dispatch with an existing `tag`. Manual dispatch must use the
   default branch. Checkout and validation verify the exact tag commit, semantic
   version and matching package/lockfile versions. CI runs typecheck/tests and
-  `check:package` (two builds), automatically creates a GitHub release with generated
-  notes and the archive, then publishes the same `.tgz` to npm. Reruns reuse the
-  release and refresh its asset. Stable versions use GitHub latest and npm `latest`;
+  `check:package` (two builds), publishes to npm, and verifies version metadata,
+  the expected dist-tag and downloaded archive integrity before creating a GitHub
+  release with generated notes and the same archive. Registry reads use unique
+  query parameters to bypass cached 404s; npm upload acceptance is not publication
+  completion. Verification polls for at most ten minutes and never retries a POST.
+  An unverified publication fails with a clear processing/availability error.
+  Reruns reuse the release and refresh its asset. Stable versions use GitHub latest and npm `latest`;
   semantic prerelease versions use GitHub prerelease and npm `next`, without replacing
   GitHub latest. Existing npm versions must match archive integrity on rerun.
   Publishing uses GitHub OIDC with `id-token: write` and npm 12.2.0, with optional
@@ -116,11 +120,11 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Use `npm version X.Y.Z --no-git-tag-version` to update both manifests; release tags
   must include the workflow. CI packs with `--ignore-scripts` after verification.
   Manually publishing a GitHub release is no longer a trigger. Run publishing and
-  version validation tests with `node --test test/publish-release.test.mjs test/release-version.test.mjs`.
+  version validation tests with `node --test test/publish-release.test.mjs test/release-version.test.mjs test/npm-publication.test.mjs`.
 - User installation is the npm package specifier in `tui.json` (e.g.
-  `opencode-reviewer@0.4.0`), resolved by OpenCode. Document migration by replacing
-  an old file-path entry while retaining options; do not prescribe extraction,
-  global installation or a manually maintained local prefix. Isolated fixture
+  `opencode-reviewer@latest`), resolved by OpenCode. Keep README to one full config
+  example, installation and essential behavior. Omit migration instructions and
+  release history; GitHub generates release notes. Isolated fixture
   bundle copies remain development mechanisms, not user installation instructions.
 
 ## Wiring and build quirks

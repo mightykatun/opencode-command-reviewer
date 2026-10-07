@@ -10,7 +10,8 @@ const integrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}
 test("identical published archives are idempotent and never invoke npm", async () => {
   const result = await publishRelease("/tmp/verified.tgz", pkg, bytes, {
     fetcher: async (url) => {
-      assert.equal(url, "https://registry.npmjs.org/opencode-reviewer/0.4.0")
+      assert.equal(new URL(url).pathname, "/opencode-reviewer/0.4.0")
+      assert.ok(new URL(url).searchParams.has("release_check"))
       return Response.json({ dist: { integrity } })
     },
     run: () => assert.fail("must not republish an existing version"),
@@ -39,7 +40,7 @@ test("new releases publish the existing archive, with stable/prerelease tags and
         assert.equal(command, "npm")
         assert.deepEqual(args, ["publish", "/tmp/verified.tgz", "--ignore-scripts", "--access", "public", "--provenance", "--tag", tag, "--registry", "https://registry.npmjs.org/"])
       },
-    }), "published")
+    }), "submitted")
     assert.equal(calls, 1)
   }
 })

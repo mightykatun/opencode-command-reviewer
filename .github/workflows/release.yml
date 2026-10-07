@@ -60,13 +60,19 @@ jobs:
 
       - run: npm ci --ignore-scripts
       - run: npm run typecheck && npm test
-      - run: node --test test/smoke-measurements.test.mjs test/publish-release.test.mjs test/release-version.test.mjs
+      - run: node --test test/smoke-measurements.test.mjs test/publish-release.test.mjs test/release-version.test.mjs test/npm-publication.test.mjs
       - run: npm run check:package
 
       - name: Pack verified build
         run: |
           mkdir -p "$RUNNER_TEMP/release-package"
           npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release-package"
+
+      - name: Publish package and verify npm availability
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: node scripts/publish-release.mjs "$RUNNER_TEMP"/release-package/*.tgz
 
       - name: Create GitHub release and attach package
         env:
@@ -89,9 +95,3 @@ jobs:
           else
             gh release create "$RELEASE_TAG" "$RUNNER_TEMP"/release-package/*.tgz "${flags[@]}" --repo "$GITHUB_REPOSITORY"
           fi
-
-      - name: Publish verified package to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          RELEASE_PRERELEASE: ${{ steps.version.outputs.prerelease }}
-        run: node scripts/publish-release.mjs "$RUNNER_TEMP"/release-package/*.tgz
