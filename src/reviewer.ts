@@ -171,7 +171,7 @@ export async function review(
   if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset or empty`)
   const prompt = prompts[evidence.kind]
   const messages = [
-    { role: "system", content: [prompt.instructions, ...(config.autoApprove ? [prompts.extraCareful] : []), CONTRACT].join("\n\n") },
+    { role: "system", content: [prompt.instructions, ...(config.autoApprove && config.extraCareful ? [prompts.extraCareful] : []), CONTRACT].join("\n\n") },
     { role: "user", content: JSON.stringify(evidence) },
   ]
   let usage: Usage | undefined

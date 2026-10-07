@@ -73,7 +73,8 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Flags include `--auto`, `--disabled`, `--cancel`, `--unsafe`, `--error`,
   `--correction`, `--held`, `--no-usage`, `--missing-usage`, `--unpriced`,
   `--storage-error`, `--native-bash-enabled`, `--resource-whitespace`, `--stream`,
-  and `--stats`. `npm run test:runtime-permissions` runs a
+  `--stats`, and `--no-extra-careful`. The latter verifies omitted extra-careful
+  guidance while keeping auto-approval enabled. `npm run test:runtime-permissions` runs a
   focused matrix. Seeded lifetime assertions verify the real rendered UI.
   Requires Linux, Git, Python 3, tmux and `opencode` on PATH;
   `OPENCODE_BIN` selects another binary.
@@ -449,7 +450,9 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   grants. Preserve exact metadata, but ignore proposed remembered patterns for
   the rating. Bash-only closing guidance may remind users to prefer Allow once;
   it must not certify future grants. Shared `EXTRA-CAREFUL-REVIEW-PROMPT.md` is overridable with normal
-  fallback/validation, included only in auto mode, and never announces automation.
+  fallback/validation, included only in auto mode when `extraCareful` is true
+  (the default), and never announces automation. `extraCareful: false` omits this
+  guidance without changing the fixed contracts or approval eligibility.
   Add no automation metadata or plugin notices to either model's conversation.
 
 ## Usage and lifetime accounting

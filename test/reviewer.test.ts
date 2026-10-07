@@ -54,6 +54,7 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   assert.equal(cfg.reviewCustomTools, false)
   assert.equal(cfg.reviewExternalDirectories, false)
   assert.equal(cfg.autoApprove, false)
+  assert.equal(cfg.extraCareful, true)
   assert.equal(cfg.stream, false)
   assert.equal(cfg.autoApproveDelaySeconds, 15)
   for (const override of [ { baseURL: "file:///tmp" }, { baseURL: "https://secret@example.org" }, { model: "" }, { apiKeyEnv: "bad name" }, { timeoutMs: 0 }, { formatRetries: -1 }, { formatRetries: 1.2 }, { retries: 3 } ]) {
@@ -68,8 +69,8 @@ test("review switches are independent strict booleans with enabled defaults", ()
     assert.equal(config.reviewBash, reviewBash)
     assert.equal(config.reviewEdits, reviewEdits)
   }
-  for (const name of ["reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "stream"] as const) {
-    assert.equal(parseConfig({ ...options, [name]: undefined })[name], name === "reviewBash" || name === "reviewEdits")
+  for (const name of ["reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "extraCareful", "stream"] as const) {
+    assert.equal(parseConfig({ ...options, [name]: undefined })[name], name === "reviewBash" || name === "reviewEdits" || name === "extraCareful")
     for (const value of [true, false]) assert.equal(parseConfig({ ...options, [name]: value })[name], value)
     for (const value of [null, 0, 1, "true", "false", {}, []]) {
       assert.throws(() => parseConfig({ ...options, [name]: value }), { message: `${name} must be a boolean` })
@@ -453,22 +454,30 @@ test("edit evidence uses its own assessment and fixed correction, retaining part
   }
 })
 
-test("auto mode adds only the extra-careful template to both review kinds, including corrections", async (t) => {
-  const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index % 2 ? '{"safe":true,"desc":"Bounded effects."}' : "invalid JSON")))
+test("extra-careful guidance defaults on and can be omitted from native auto reviews and corrections in both transport modes", async (t) => {
+  let stream = false
+  const { config, requests } = await endpoint(t, (index, res) => {
+    const content = index % 2 ? '{"safe":true,"desc":"Bounded effects."}' : "invalid JSON"
+    res.writeHead(200, { "Content-Type": stream ? "text/event-stream" : "application/json" })
+    res.end(stream ? `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n` : envelope(content))
+  })
   const edit = await collectEditEvidence({
     kind: "edit", tool: "edit", userPrompt: "Update note", limitations: [], session: evidence.session,
     location: { instanceDirectory: "/project", instanceWorktree: "/project" },
     permission: { ...evidence.permission!, type: "edit", metadata: { filepath: "/project/note", diff: "-old\n+new" } },
   }, config, signal())
-  for (const input of [evidence, edit]) for (const autoApprove of [false, true]) {
+  for (const input of [evidence, edit]) for (const autoApprove of [false, true]) for (const extraCareful of [undefined, true, false]) for (const streaming of [false, true]) {
+    stream = streaming
     const prompts = { ...BUILTIN_PROMPTS, extraCareful: "CUSTOM EXTRA CARE: check the supplied evidence carefully." }
     const start = requests.length
-    await review(input, { ...config, autoApprove, autoApproveDelaySeconds: 17 }, signal(), fetch, {}, prompts)
+    const settings = parseConfig({ ...config, autoApprove, extraCareful, stream, autoApproveDelaySeconds: 17 })
+    await review(input, settings, signal(), fetch, {}, prompts)
     const kind = input.kind === "edit" ? "edit" : "shell"
     for (const request of requests.slice(start)) {
-      assert.equal(request.body.messages[0].content, [prompts[kind].instructions, ...(autoApprove ? [prompts.extraCareful] : []), CONTRACT].join("\n\n"))
+      assert.equal(request.body.messages[0].content, [prompts[kind].instructions, ...(autoApprove && extraCareful !== false ? [prompts.extraCareful] : []), CONTRACT].join("\n\n"))
       assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
-      assert.doesNotMatch(JSON.stringify(request.body), /autoApprove|countdown|automatic approval/)
+      assert.equal(request.body.stream, stream)
+      assert.doesNotMatch(JSON.stringify(request.body), /"extraCareful"|autoApprove|countdown|automatic approval/)
     }
     assert.equal(requests.length - start, 2)
   }
@@ -482,21 +491,28 @@ test("provider reasoning stays outside the displayed assessment", async (t) => {
 })
 
 test("new review kinds select only their own instructions and share the fixed correction contract", async (t) => {
-  const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index % 2 ? '{"safe":true,"desc":"Bounded operation."}' : "bad format")))
-  for (const kind of ["mcp", "custom", "external-directory"] as const) for (const autoApprove of [false, true]) {
+  let stream = false
+  const { config, requests } = await endpoint(t, (index, res) => {
+    const content = index % 2 ? '{"safe":true,"desc":"Bounded operation."}' : "bad format"
+    res.writeHead(200, { "Content-Type": stream ? "text/event-stream" : "application/json" })
+    res.end(stream ? `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n` : envelope(content))
+  })
+  for (const kind of ["mcp", "custom", "external-directory"] as const) for (const autoApprove of [false, true]) for (const extraCareful of [undefined, true, false]) for (const streaming of [false, true]) {
+    stream = streaming
     const common = { kind, tool: "fixture_tool", userPrompt: "Perform fixture operation", limitations: [],
       permission: { ...evidence.permission!, type: kind === "external-directory" ? "external_directory" : "fixture_tool" }, location: { instanceDirectory: "/fixture", instanceWorktree: "/fixture" }, partial: false }
     const input: ReviewEvidence = kind === "external-directory"
       ? { ...common, kind, operation: { input: { path: "/outside" }, inputStatus: "complete" }, permission: { ...common.permission, metadataStatus: "complete" } }
       : { ...common, kind, input: { target: "fixture" }, origin: { source: kind === "mcp" ? "host MCP routing" : "host registry", server: null }, definition: { status: "unavailable", reason: "Fixture definition unavailable" } }
     const start = requests.length
-    await review(input, { ...config, autoApprove }, signal())
+    await review(input, parseConfig({ ...config, autoApprove, extraCareful, stream }), signal())
     assert.equal(requests.length - start, 2)
     for (const request of requests.slice(start)) {
-      assert.equal(request.body.messages[0].content, [BUILTIN_PROMPTS[kind].instructions, ...(autoApprove ? [BUILTIN_PROMPTS.extraCareful] : []), CONTRACT].join("\n\n"))
+      assert.equal(request.body.messages[0].content, [BUILTIN_PROMPTS[kind].instructions, ...(autoApprove && extraCareful !== false ? [BUILTIN_PROMPTS.extraCareful] : []), CONTRACT].join("\n\n"))
       assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
       assert.equal(request.body.tools, undefined)
-      assert.equal(request.body.stream, false)
+      assert.equal(request.body.stream, stream)
+      assert.doesNotMatch(JSON.stringify(request.body), /"extraCareful"|autoApprove|countdown|automatic approval/)
     }
     assert.equal(requests[start + 1]!.body.messages[3].content, CORRECTION.replace("{{validationError}}", "Invalid JSON"))
   }

@@ -30,6 +30,7 @@ OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-revie
         "reviewCustomTools": false,
         "reviewExternalDirectories": false,
         "autoApprove": false,
+        "extraCareful": true,
         "autoApproveDelaySeconds": 15,
         "formatRetries": 1,
         "timeoutMs": 30000,
@@ -64,6 +65,7 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 | `reviewCustomTools` | Review permissions requested by registered custom tools. |
 | `reviewExternalDirectories` | Review directory access independently of the other switches. Directory approval can resume the operation without another prompt. |
 | `autoApprove` | Allow completed Safe reviews once after the visible countdown. |
+| `extraCareful` | Include the extra-careful prompt in auto-mode reviews. Defaults to `true`; set `false` to omit it. |
 | `autoApproveDelaySeconds` | Countdown duration, 0–3600 seconds. |
 | `formatRetries` | Additional attempts to correct malformed assessment JSON, 0–100. |
 | `timeoutMs` | Total review deadline, 1–3,600,000 ms. |

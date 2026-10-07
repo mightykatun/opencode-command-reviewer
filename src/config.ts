@@ -14,13 +14,14 @@ export interface Config extends Limits {
   reviewCustomTools: boolean
   reviewExternalDirectories: boolean
   autoApprove: boolean
+  extraCareful: boolean
   autoApproveDelaySeconds: number
   formatRetries: number
   timeoutMs: number
 }
 
 export function parseConfig(options: Record<string, unknown> = {}): Config {
-  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "stream", "reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
+  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "stream", "reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "extraCareful", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
   for (const key of Object.keys(options)) if (!keys.has(key)) throw new Error(`Unknown opencode-reviewer setting: ${key}`)
   const text = (name: string, optional = false): string | undefined => {
     const value = options[name]
@@ -62,6 +63,7 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     reviewMcp: boolean("reviewMcp", false), reviewCustomTools: boolean("reviewCustomTools", false),
     reviewExternalDirectories: boolean("reviewExternalDirectories", false),
     autoApprove: boolean("autoApprove", false),
+    extraCareful: boolean("extraCareful"),
     autoApproveDelaySeconds: number("autoApproveDelaySeconds", 15, 0, 3600),
     formatRetries: number("formatRetries", 1, 0, 100),
     timeoutMs: number("timeoutMs", 30000, 1, 3600000),

@@ -90,6 +90,8 @@ const server = createServer(async (req, res) => {
     requests.push({ url: req.url, body })
     if (req.url === "/review/chat/completions") {
       const observation = audit.request(req.method, text)
+      assert.equal(body.messages[0].content.includes("Take extra care"), auto && !flag("no-extra-careful"),
+        "extra-careful guidance follows its switch independently of auto-approval")
       const evidence = JSON.parse(body.messages[1].content)
       const attempt = (perRequest.get(evidence.permission.id) ?? 0) + 1
       perRequest.set(evidence.permission.id, attempt)
@@ -170,7 +172,7 @@ try {
     models: { review: { name: "Review", limit: { context: 32000, output: 1000 }, cost: { input: 1, output: 2, cache_read: 0, cache_write: 0 } } } }
   const tui = path.join(temp, "tui.json")
   await writeFile(tui, JSON.stringify({ theme: "opencode", plugin: [[plugin, { baseURL: `http://127.0.0.1:${port}/review`, model: "review",
-    ...plan.settings, autoApprove: auto, autoApproveDelaySeconds: 2, stream }]] }))
+    ...plan.settings, autoApprove: auto, ...(flag("no-extra-careful") ? { extraCareful: false } : {}), autoApproveDelaySeconds: 2, stream }]] }))
   const env = { HOME: temp, XDG_CONFIG_HOME: path.join(temp, "config"), XDG_DATA_HOME: path.join(temp, "data"), XDG_STATE_HOME: path.join(temp, "state"), XDG_CACHE_HOME: path.join(temp, "cache"),
     OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_CONFIG: "", OPENCODE_CONFIG_DIR: path.join(temp, "config"), OPENCODE_TUI_CONFIG: tui,
     OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_EXTERNAL_SKILLS: "1", OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1" }
