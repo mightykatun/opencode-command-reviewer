@@ -8,6 +8,7 @@ import { candidateEnabled, type ReviewOptions } from "./classification.js"
 import type { SessionModeGate } from "./session-mode.js"
 import { SCANNER_INTERVAL_MS } from "./appearance.js"
 import { remainingTime } from "./deadline.js"
+import { uiText } from "./ui-text.js"
 
 export type AutoApproval = { status: "countdown"; seconds: number } | { status: "checking" | "allowing" | "cancelled" | "failed" }
 
@@ -330,7 +331,7 @@ export class Controller {
     }, (error: unknown) => {
       this.clearProgress(entry)
       if (active()) {
-        entry.view = { ...entry.view, status: entry.view.status === "identifying" ? "unidentified" : "unavailable", progress: undefined, error: error instanceof Error ? error.message : "Review failed" }
+        entry.view = { ...entry.view, status: entry.view.status === "identifying" ? "unidentified" : "unavailable", progress: undefined, error: error instanceof Error ? error.message : uiText.review.failed }
         this.publish()
       }
     })

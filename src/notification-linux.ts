@@ -2,9 +2,10 @@ import type { NotificationConfig } from "./notification-config.js"
 import { NotificationAudio } from "./notification-audio.js"
 import { OwnedNotificationProcesses, type NotificationProcesses } from "./notification-process.js"
 import { activateGnomeTerminal, gnomeTerminalIdentity, type TerminalIdentity } from "./notification-terminal.js"
-import { notificationMarkup, type NotificationBackend, type NotificationMessage } from "./notification-types.js"
+import { notificationMarkup, notificationText, type NotificationBackend, type NotificationMessage } from "./notification-types.js"
 import type { NotificationProcess } from "./notification-process.js"
 import { NotificationIcon } from "./notification-icon.js"
+import { uiText } from "./ui-text.js"
 
 /** freedesktop/libnotify adapter. Action ownership is bounded to the banner lifetime. */
 export class LinuxNotifications implements NotificationBackend {
@@ -56,17 +57,17 @@ export class LinuxNotifications implements NotificationBackend {
     }
     this.closers.add(close)
     parent.addEventListener("abort", close, { once: true })
-    const process = this.start("notify-send", ["--app-name=Opencode", ...(icon ? [`--icon=${icon}`] : []),
+    const process = this.start("notify-send", [`--app-name=${uiText.notifications.application}`, ...(icon ? [`--icon=${icon}`] : []),
       // GNOME uses the desktop-entry's source icon, ignoring --icon there.
       // image-path supplies the separate image beside the notification heading.
       ...(icon ? [`--hint=string:image-path:${icon}`] : []),
       "--urgency=normal", "--expire-time=-1", "--transient", "--hint=boolean:suppress-sound:true", "--print-id",
       // GNOME emits an activation token only for a recognized application.
       ...(this.identity ? ["--hint=string:desktop-entry:org.gnome.Terminal"] : []),
-      ...(this.identity ? ["--action=default=Open session"] : []), "--wait", "--", "Opencode",
-      // GNOME flattens newlines in collapsed banners. Keep an explicit separator
-      // so the session title cannot run into the event message.
-      `${notificationMarkup(message.title)} · ${notificationMarkup(message.body)}`.replaceAll("\\", "\\\\")],
+      ...(this.identity ? [`--action=default=${uiText.notifications.openSession}`] : []), "--wait", "--",
+      // Summaries are plain text; only the body supports desktop markup.
+      uiText.notifications.heading(notificationText(message.body)).replaceAll("\\", "\\\\"),
+      uiText.notifications.body(notificationMarkup(message.title)).replaceAll("\\", "\\\\")],
       120000, AbortSignal.any([local.signal, this.abort.signal]), line => {
         if (/^[1-9][0-9]{0,9}$/.test(line)) {
           id = line

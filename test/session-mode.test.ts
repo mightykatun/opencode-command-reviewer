@@ -439,7 +439,7 @@ test("local palette/slash commands capture session, persist, report failures and
   route = { name: "session", params: { sessionID: "child" } }
   await commands[1]!.run()
   assert.equal(modes.enabled("root"), false)
-  assert.match(toasts.at(-1)!.message, /Saved for resume/)
+  assert.equal(toasts.at(-1)!.message, "Reviewer disabled for this conversation.")
   fail = true
   await commands[0]!.run()
   assert.equal(modes.enabled("root"), true)

@@ -88,7 +88,7 @@ const palette = async (enabled) => {
   send("-l", title)
   await until((s) => (s.match(new RegExp(title, "g")) ?? []).length >= 2)
   send("Enter")
-  await until((s) => s.includes("Saved for resume") && !s.includes("Commands"))
+  await until((s) => s.includes(`Reviewer ${enabled ? "enabled" : "disabled"} for this conversation.`) && !s.includes("Commands"))
 }
 const unchanged = async () => assert.rejects(access(path.join(project, "executed")))
 try {
@@ -144,7 +144,7 @@ try {
   send("-l", "/reviewer-disable")
   await until((s) => s.includes("reviewer-disable"))
   send("Enter")
-  await until((s) => s.includes("Saved for resume") && s.includes("Reviewer disabled"))
+  await until((s) => s.includes("Reviewer disabled for this conversation."))
   await save("slash-disabled")
   assert.equal(mainCount(), slashBefore, "slash action must not become an assistant prompt")
   const storeDirectory = path.join(temp, "state/opencode/opencode-reviewer/session-mode-v1")
@@ -177,7 +177,7 @@ try {
   await unchanged()
   assert.deepEqual(errors, [])
   for (const call of calls.filter((call) => call.url === "/main/chat/completions")) {
-    assert.doesNotMatch(JSON.stringify(call.body.messages), /reviewer-enable|reviewer-disable|Saved for resume|Permission analysis/)
+    assert.doesNotMatch(JSON.stringify(call.body.messages), /reviewer-enable|reviewer-disable|Reviewer (?:enabled|disabled) for this conversation\.|Permission analysis/)
   }
   await writeFile(path.join(root, ".runtime/session-mode-results.json"), JSON.stringify({ version, reviews: reviews.length,
     aborted, persisted: true, resumedRoot: true, localCommandsOnly: true, tombstoneSurvived: true, temp }, null, 2))

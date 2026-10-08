@@ -1,4 +1,5 @@
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
+import { uiText } from "./ui-text.js"
 import type { View } from "./controller.js"
 import type { NotificationConfig } from "./notification-config.js"
 import { notificationClock, notificationText, type NotificationBackend, type NotificationClock,
@@ -86,7 +87,7 @@ export class NotificationPolicy {
     if (entry.phase === "attention") return
     this.withdraw(entry.banner)
     entry.phase = "attention"
-    entry.banner = this.show("attention", "Session needs attention", entry.target)
+    entry.banner = this.show("attention", uiText.notifications.attention, entry.target)
   }
   snapshot(views: readonly View[]) {
     if (this.stopped) return
@@ -107,7 +108,7 @@ export class NotificationPolicy {
         this.withdraw(entry.banner)
         entry.phase = "automatic"
         entry.banner = state === "countdown" && this.delay > 0
-          ? this.show("attention", `Reviewer will approve permission in ${view.autoApproval!.status === "countdown" ? view.autoApproval!.seconds : this.delay} s`, entry.target) : undefined
+          ? this.show("attention", uiText.notifications.countdown(view.autoApproval!.status === "countdown" ? view.autoApproval!.seconds : this.delay), entry.target) : undefined
       }
       return
     }
@@ -132,7 +133,7 @@ export class NotificationPolicy {
   approved(request: PermissionRequest, target?: Target) {
     if (!this.remember(`approved:${request.id}`)) return
     const current = this.permissions.get(request.id)
-    if (current || target) this.show("approved", "Reviewer approved a permission", current?.target ?? target!)
+    if (current || target) this.show("approved", uiText.notifications.approved, current?.target ?? target!)
   }
   resolved(kind: "permission" | "question", id: string) {
     const entries = kind === "permission" ? this.permissions : this.questions
@@ -143,7 +144,7 @@ export class NotificationPolicy {
     this.remember(`${kind}:${id}`)
   }
   turn(kind: "error" | "ended", id: string, target: Target) {
-    if (this.remember(`turn:${target.root}:${id}`)) this.show(kind, kind === "error" ? "Session error" : "Session ended", target)
+    if (this.remember(`turn:${target.root}:${id}`)) this.show(kind, uiText.notifications[kind], target)
   }
   deleted(sessionID: string) {
     for (const banner of this.banners) if (banner.target.root === sessionID || banner.target.sessionID === sessionID) this.withdraw(banner)

@@ -1,4 +1,5 @@
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
+import { uiText } from "./ui-text.js"
 import type { Config } from "./config.js"
 import { candidateEnabled, classify, enabledKind, type ReviewOptions } from "./classification.js"
 import { loadContext, loadEditContext, loadConversationContext, loadInvocation, permissionContext, type ContextReader } from "./context.js"
@@ -27,7 +28,7 @@ export async function evaluateEvidence(request: PermissionRequest, reader: Conte
   if (!classified) return null
   if (!enabledKind(classified.kind, options)) return null
   onIdentified()
-  if (!config) throw new Error(configError || "Invalid configuration")
+  if (!config) throw new Error(configError || uiText.review.invalidConfiguration)
   const scope = files.scope(signal)
   if (classified.kind === "shell") {
     const context = await loadContext(request, reader, signal, scope, invocation)

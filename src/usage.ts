@@ -1,4 +1,5 @@
 import type { Model, Provider } from "@opencode-ai/sdk/v2"
+import { uiText } from "./ui-text.js"
 
 /** Token counts are a pair; cost is independently available. */
 export interface Usage { input?: number; output?: number; cost?: number }
@@ -103,7 +104,7 @@ export function sumUsage(previous: Usage | undefined, next: Usage | undefined): 
 
 export function usageText(usage: Usage): string {
   return [
-    ...(count(usage.input) && count(usage.output) ? [`token: ${usage.input} in ${usage.output} out`] : []),
-    ...(usage.cost === undefined ? [] : [`cost: $${usage.cost.toFixed(4)}`]),
+    ...(count(usage.input) && count(usage.output) ? [uiText.usage.tokens(usage.input, usage.output)] : []),
+    ...(usage.cost === undefined ? [] : [uiText.usage.cost(usage.cost.toFixed(4))]),
   ].join("\n")
 }

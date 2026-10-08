@@ -24,6 +24,7 @@ import type { NotificationBackend } from "./notification-types.js"
 import { LinuxNotifications } from "./notification-linux.js"
 import type { NotificationConfig } from "./notification-config.js"
 import type { NotificationProcesses } from "./notification-process.js"
+import { uiText } from "./ui-text.js"
 export type { DiagnosticEvent, DiagnosticObserver } from "./diagnostics.js"
 
 function ReviewLoading(props: { api: TuiPluginApi; retrying: boolean }) {
@@ -37,7 +38,7 @@ function ReviewLoading(props: { api: TuiPluginApi; retrying: boolean }) {
   })
   return (
     <text fg={props.api.theme.current.textMuted} height={1}>
-      <Show when={animated()} fallback="[⋯]">
+      <Show when={animated()} fallback={uiText.review.staticIndicator}>
         <Index each={cells()}>{(cell) => {
           const color = createMemo(() => {
             const base = props.api.theme.current.textMuted
@@ -47,7 +48,7 @@ function ReviewLoading(props: { api: TuiPluginApi; retrying: boolean }) {
           return <span style={{ fg: color() }}>{cell().character}</span>
         }}</Index>
       </Show>
-      {props.retrying ? " Retrying" : " Evaluating"}
+      {" "}{props.retrying ? uiText.review.retrying : uiText.review.evaluating}
     </text>
   )
 }
@@ -94,7 +95,7 @@ function ReviewButton(props: { api: TuiPluginApi; label: string; selected?: bool
 function ReviewFooter(props: { api: TuiPluginApi; view: View; controller: Controller; enabled: boolean }) {
   const [selected, setSelected] = createSignal<"approve" | "cancel">("approve")
   const state = () => props.view.autoApproval
-  const label = () => { const current = state(); return current?.status === "countdown" ? `Allowed in ${current.seconds}s` : "Checking…" }
+  const label = () => { const current = state(); return current?.status === "countdown" ? uiText.autoApproval.countdown(current.seconds) : uiText.autoApproval.checking }
   return <Show when={props.enabled && props.view.assessment?.safe}>
     <box marginTop={1} paddingTop={1} minHeight={3} flexShrink={0} border={["top"]} borderColor={props.api.theme.current.borderSubtle}>
       <Switch>
@@ -103,18 +104,18 @@ function ReviewFooter(props: { api: TuiPluginApi; view: View; controller: Contro
             <ReviewButton api={props.api} label={label()} disabled={state()?.status === "checking"}
               selected={selected() === "approve"} onHover={() => setSelected("approve")}
               onClick={() => { void props.controller.approveNow(props.view.request.id) }} />
-            <ReviewButton api={props.api} label="Cancel" selected={selected() === "cancel"} onHover={() => setSelected("cancel")}
+            <ReviewButton api={props.api} label={uiText.autoApproval.cancel} selected={selected() === "cancel"} onHover={() => setSelected("cancel")}
               onClick={() => props.controller.cancelAutoApproval(props.view.request.id)} />
           </box>
         </Match>
         <Match when={state()?.status === "allowing"}>
-          <ReviewButton api={props.api} label="Allowing…" disabled onClick={() => {}} />
+          <ReviewButton api={props.api} label={uiText.autoApproval.allowing} disabled onClick={() => {}} />
         </Match>
         <Match when={state()?.status === "cancelled"}>
-          <text fg={props.api.theme.current.textMuted}>Auto-approval canceled</text>
+          <text fg={props.api.theme.current.textMuted}>{uiText.autoApproval.cancelled}</text>
         </Match>
         <Match when={state()?.status === "failed"}>
-          <text fg={props.api.theme.current.warning}>! Auto-approval unavailable. Use native controls.</text>
+          <text fg={props.api.theme.current.warning}>{uiText.autoApproval.unavailable}</text>
         </Match>
       </Switch>
     </box>
@@ -171,7 +172,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
     reviewOptions = parsed
     prompts = await withDeadline(api.lifecycle.signal, parsed.timeoutMs, (signal) => loadPrompts(parsed.instructions, signal), "Prompt loading")
     config = parsed
-  } catch (error) { configError = error instanceof Error ? error.message : "Invalid configuration" }
+  } catch (error) { configError = error instanceof Error ? error.message : uiText.review.invalidConfiguration }
   api.lifecycle.signal.throwIfAborted()
   const lifetime = lifetimeTracker(api)
   const [views, setViews] = createSignal<View[]>([])
@@ -367,18 +368,18 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                   position="absolute" top={0} right={0} bottom={0} width={42} zIndex={1}
                   paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2}
                   backgroundColor={api.theme.current.backgroundPanel}>
-                  <text fg={api.theme.current.text} flexShrink={0}><b>Permission analysis</b></text>
+                  <text fg={api.theme.current.text} flexShrink={0}><b>{uiText.review.heading}</b></text>
                   <box marginTop={1} flexShrink={0}>
                     <Show when={rating() !== undefined}>
                       <text fg={rating() ? api.theme.current.success : api.theme.current.error}>
-                        <b>{rating() ? "✓ Safe" : "✗ Unsafe"}</b>
+                        <b>{rating() ? uiText.review.safe : uiText.review.unsafe}</b>
                       </text>
                     </Show>
                     <Show when={view().status === "analyzing" && rating() === undefined}>
                       <ReviewLoading api={api} retrying={view().progress?.phase === "retrying"} />
                     </Show>
                     <Show when={view().status === "unavailable"}>
-                      <text fg={api.theme.current.warning}><b>! Analysis unavailable</b></text>
+                      <text fg={api.theme.current.warning}><b>{uiText.review.unavailable}</b></text>
                     </Show>
                   </box>
                   <scrollbox ref={(value: ScrollBoxRenderable) => { scroll = value }} marginTop={1} flexGrow={1} minHeight={0} contentOptions={{ minHeight: 0 }}
@@ -389,7 +390,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                     <ReviewDescription api={api} text={report()} streaming={view().status === "analyzing"} ref={(value) => { description = value }} />
                     <Show when={view().status === "unavailable"}>
                       <text fg={api.theme.current.text} width="100%" flexShrink={0}>
-                        {displayText(view().error ?? "Review failed")}
+                        {displayText(view().error ?? uiText.review.failed)}
                       </text>
                     </Show>
                     <Show when={view().assessment?.usage}>{(usage) => <>

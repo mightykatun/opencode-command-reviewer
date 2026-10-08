@@ -1,4 +1,5 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
+import { uiText } from "./ui-text.js"
 import type { Message, PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2"
 import type { ApprovalFact, View } from "./controller.js"
 import type { NotificationPolicy } from "./notification-policy.js"
@@ -150,7 +151,7 @@ export class NotificationHost {
     }
     const root = this.roots.get(rootID)
     if (!root || request.received < root.since) return
-    const target = { root: rootID, sessionID: rootID, title: this.api.state.session.get(rootID)?.title ?? "OpenCode session" }
+    const target = { root: rootID, sessionID: rootID, title: this.api.state.session.get(rootID)?.title ?? uiText.notifications.fallbackSession }
     request.target = target
     if (kind === "question") this.policy.question(id, target, true)
     else {
@@ -165,7 +166,7 @@ export class NotificationHost {
     if (this.stopped) return
     this.views = views
     for (const request of this.permissions.values()) if (request.target) {
-      request.target.title = this.api.state.session.get(request.target.root)?.title ?? "OpenCode session"
+      request.target.title = this.api.state.session.get(request.target.root)?.title ?? uiText.notifications.fallbackSession
     }
     this.policy.snapshot(views)
     for (const [id, request] of this.permissions) this.admit("permission", id, request)
@@ -181,7 +182,7 @@ export class NotificationHost {
       const dispatched = this.dispatched.get(fact.request.id)
       this.dispatched.delete(fact.request.id)
       if (dispatched?.automatic) {
-        dispatched.target.title = this.api.state.session.get(dispatched.target.root)?.title ?? "OpenCode session"
+        dispatched.target.title = this.api.state.session.get(dispatched.target.root)?.title ?? uiText.notifications.fallbackSession
         this.policy.approved(fact.request, dispatched.target)
       }
     } else this.dispatched.delete(fact.request.id)
@@ -229,7 +230,7 @@ export class NotificationHost {
       if (this.views.some(v => this.rootOf(v.request.sessionID) === id)
         || [...this.questions.values()].some(q => this.rootOf(q.sessionID) === id)
         || this.api.state.session.question(id).length || this.api.state.session.permission(id).length) return
-      const target = { root: id, sessionID: id, title: this.api.state.session.get(id)?.title ?? "OpenCode session" }
+      const target = { root: id, sessionID: id, title: this.api.state.session.get(id)?.title ?? uiText.notifications.fallbackSession }
       const message = root.assistant
       if (message?.error || (root.error && (!message?.time.completed || !message.finish || message.finish === "error"))) {
         this.policy.turn("error", root.user ?? root.error!.id, target)

@@ -3,6 +3,7 @@ import { mkdir, open, readdir, rename, unlink } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import path from "node:path"
 import type { Usage } from "./usage.js"
+import { uiText } from "./ui-text.js"
 
 export interface LifetimeTotals {
   requests: number
@@ -128,17 +129,17 @@ export class LifetimeUsage {
 }
 
 export function lifetimeCost(totals: LifetimeTotals): string {
-  if (!totals.requests) return "lifetime: no recorded usage"
-  if (!totals.priced) return "lifetime: cost unavailable"
-  return `lifetime: $${totals.cost.toFixed(4)}${totals.priced < totals.requests ? " (partial pricing)" : ""}`
+  if (!totals.requests) return uiText.lifetime.empty
+  if (!totals.priced) return uiText.lifetime.costUnavailable
+  return uiText.lifetime.cost(totals.cost.toFixed(4), totals.priced < totals.requests)
 }
 
 export function lifetimeReport(totals: LifetimeTotals): string {
-  return [lifetimeCost(totals), `${totals.requests} requests with recorded usage`,
-    totals.tokenRequests ? `token: ${totals.input} in ${totals.output} out${totals.tokenRequests < totals.requests ? " (partial coverage)" : ""}` : "tokens unavailable",
-    `Token counts available: ${totals.tokenRequests}/${totals.requests} requests`,
-    `Pricing available: ${totals.priced}/${totals.requests} requests`,
-    ...(totals.since === null ? [] : [`Recorded since: ${new Date(totals.since).toISOString().slice(0, 10)}`]),
-    "", "Received usage only, including interrupted or unsuccessful reviews. Unreported charges remain unknown. Costs combine endpoint-reported amounts and catalog estimates; legacy history retains its original estimates. Earlier unrecorded usage cannot be recovered.",
+  return [lifetimeCost(totals), uiText.lifetime.requests(totals.requests),
+    totals.tokenRequests ? uiText.lifetime.tokens(totals.input, totals.output, totals.tokenRequests < totals.requests) : uiText.lifetime.tokensUnavailable,
+    uiText.lifetime.tokenCoverage(totals.tokenRequests, totals.requests),
+    uiText.lifetime.pricingCoverage(totals.priced, totals.requests),
+    ...(totals.since === null ? [] : [uiText.lifetime.since(new Date(totals.since).toISOString().slice(0, 10))]),
+    "", uiText.lifetime.explanation,
   ].join("\n")
 }

@@ -3,6 +3,15 @@
 ## Writing style
 
 - NEVER use em dashes.
+- Keep fixed user-facing interface copy in `src/ui-text.ts`: review labels,
+  approval controls, palette titles, toasts, usage summaries and desktop banners.
+  Use named strings and typed formatters rather than assembling sentences in views.
+  Edit values while retaining keys and formatter parameters; run `npm run build`
+  and restart OpenCode to use a rebuilt plugin. This is source-level customization,
+  not a `tui.json` option. Keep labels short enough for the 42-column sidebar.
+  Model prompts/contracts, model-generated reports, host-owned controls and
+  technical diagnostics retain their own sources. Keep behavioral tests' expected
+  wording independent of the catalog so accidental display changes are detectable.
 
 ## Scope and integration
 
@@ -372,7 +381,7 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   contents are only `{ version: 1, enabled: boolean }`, capped at 1 KiB on read.
   Serialize writes, use exclusive temporary files, sync and atomic rename, and
   flush on disposal. Do not persist evidence, model text or cancellation history.
-- Apply a local switch immediately and acknowledge `Saved for resume` only after
+- Apply a local switch immediately and show the success confirmation only after
   persistence succeeds. A failed save reports local application and that resume
   may use the previous setting. Failed ancestry/load reports setting unavailable;
   enabling must not bypass a corrupt saved record. Command order and load revisions

@@ -1,5 +1,6 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { SessionModes } from "./session-mode.js"
+import { uiText } from "./ui-text.js"
 
 export function sessionModeCommands(api: TuiPluginApi, modes: SessionModes, changed: (root: string) => void) {
   let sequence = 0
@@ -11,7 +12,7 @@ export function sessionModeCommands(api: TuiPluginApi, modes: SessionModes, chan
   return api.keymap.registerLayer({ commands: [true, false].map((enabled) => ({
     name: `opencode-reviewer.${enabled ? "enable" : "disable"}`,
     namespace: "palette", slashName: `reviewer-${enabled ? "enable" : "disable"}`,
-    title: `Reviewer: ${enabled ? "Enable" : "Disable"} for conversation`, category: "Reviewer",
+    title: enabled ? uiText.commands.enable : uiText.commands.disable, category: uiText.commands.category,
     enabled: () => selected() !== undefined,
     run: async () => {
       const sessionID = selected()
@@ -32,11 +33,11 @@ export function sessionModeCommands(api: TuiPluginApi, modes: SessionModes, chan
         changed(root)
         await persisted
         if (!api.lifecycle.signal.aborted && latest.get(root) === order) api.ui.toast({ variant: "success",
-          message: `Reviewer ${enabled ? "enabled" : "disabled"} for this conversation and descendants. Saved for resume.` })
+          message: uiText.sessionMode.saved(enabled) })
       } catch {
         if (!api.lifecycle.signal.aborted && (root === undefined || latest.get(root) === order)) api.ui.toast({ variant: "error", message: applied
-          ? `Reviewer ${enabled ? "enabled" : "disabled"} locally, but saving failed. Resume may use the previous setting.`
-          : "Reviewer setting unavailable. Session ancestry or saved mode could not be read." })
+          ? uiText.sessionMode.saveFailed(enabled)
+          : uiText.sessionMode.unavailable })
       }
     },
   })) })

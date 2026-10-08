@@ -24,8 +24,9 @@ const tui = withNotificationProcesses(() => ({
     if (command === "notify-send") {
       id = String(sequence++)
       children.set(id, finish)
-      const bodyText = args.at(-1), separator = bodyText.indexOf(" · ")
-      const title = bodyText.slice(0, separator), body = bodyText.slice(separator + 3)
+      const summary = args.at(-2)
+      if (!summary.startsWith("Opencode (") || !summary.endsWith(")")) throw new Error("Unexpected notification heading")
+      const title = args.at(-1), body = summary.slice("Opencode (".length, -1)
       record({ event: "notification", id, summary: args.at(-2), title, body, args })
       queueMicrotask(() => line?.(id))
     } else if (command === "gdbus") {

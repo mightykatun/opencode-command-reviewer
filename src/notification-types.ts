@@ -1,3 +1,5 @@
+import { uiText } from "./ui-text.js"
+
 export type NotificationKind = "attention" | "approved" | "error" | "ended"
 export interface NotificationMessage {
   kind: NotificationKind
@@ -22,7 +24,7 @@ export const notificationClock: NotificationClock = {
 
 export function notificationText(value: string): string {
   return Array.from(value.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " "))
-    .slice(0, 256).join("").trim() || "OpenCode session"
+    .slice(0, 256).join("").trim() || uiText.notifications.fallbackSession
 }
 
 /** Desktop body-markup is not trusted to interpret conversation titles. */
