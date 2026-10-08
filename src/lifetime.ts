@@ -4,6 +4,20 @@ import { randomUUID } from "node:crypto"
 import path from "node:path"
 import type { Usage } from "./usage.js"
 import { uiText } from "./ui-text.js"
+import type { ReviewTiming } from "./types.js"
+
+export interface LifetimeActivity {
+  reviews: number
+  usageRequests: number
+  retries: number
+  autoApproved: number
+  timedReviews: number
+  meanFullReportMs: number
+  meanRatingMs: number
+  since: number | null
+}
+const emptyActivity = (): LifetimeActivity => ({ reviews: 0, usageRequests: 0, retries: 0, autoApproved: 0,
+  timedReviews: 0, meanFullReportMs: 0, meanRatingMs: 0, since: null })
 
 export interface LifetimeTotals {
   requests: number
@@ -16,9 +30,10 @@ export interface LifetimeTotals {
   safe: number
   unsafe: number
   ratingsSince: number | null
+  activity: LifetimeActivity
 }
 const empty = (): LifetimeTotals => ({ requests: 0, tokenRequests: 0, input: 0, output: 0, priced: 0, cost: 0, since: null,
-  safe: 0, unsafe: 0, ratingsSince: null })
+  safe: 0, unsafe: 0, ratingsSince: null, activity: emptyActivity() })
 const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0
 const amount = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0
 const snapshotName = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.json$/
@@ -33,7 +48,21 @@ function validate(value: LifetimeTotals): LifetimeTotals {
     || (value.safe + value.unsafe > 0 ? !count(value.ratingsSince) || value.ratingsSince > 8.64e15 : value.ratingsSince !== null)) {
     throw new Error("Invalid lifetime usage totals")
   }
+  const activity = value.activity
+  if (!activity || ![activity.reviews, activity.usageRequests, activity.retries, activity.autoApproved, activity.timedReviews].every(count)
+    || activity.reviews > value.safe + value.unsafe || activity.usageRequests > value.requests || activity.timedReviews > activity.reviews
+    || ![activity.meanFullReportMs, activity.meanRatingMs].every(amount) || activity.meanRatingMs > activity.meanFullReportMs
+    || (!activity.timedReviews && (activity.meanFullReportMs !== 0 || activity.meanRatingMs !== 0))
+    || (activity.reviews || activity.usageRequests || activity.retries || activity.autoApproved
+      ? !count(activity.since) || activity.since > 8.64e15 : activity.since !== null)) throw new Error("Invalid lifetime activity totals")
   return value
+}
+
+/** Merge online means using their weights, never a history of individual timings. */
+function mean(left: number, leftCount: number, right: number, rightCount: number): number {
+  if (!leftCount) return right
+  if (!rightCount) return left
+  return left + (right - left) * (rightCount / (leftCount + rightCount))
 }
 
 function add(left: LifetimeTotals, right: LifetimeTotals): LifetimeTotals {
@@ -44,6 +73,16 @@ function add(left: LifetimeTotals, right: LifetimeTotals): LifetimeTotals {
     since: left.since === null ? right.since : right.since === null ? left.since : Math.min(left.since, right.since),
     safe: left.safe + right.safe, unsafe: left.unsafe + right.unsafe,
     ratingsSince: left.ratingsSince === null ? right.ratingsSince : right.ratingsSince === null ? left.ratingsSince : Math.min(left.ratingsSince, right.ratingsSince),
+    activity: {
+      reviews: left.activity.reviews + right.activity.reviews,
+      usageRequests: left.activity.usageRequests + right.activity.usageRequests,
+      retries: left.activity.retries + right.activity.retries,
+      autoApproved: left.activity.autoApproved + right.activity.autoApproved,
+      timedReviews: left.activity.timedReviews + right.activity.timedReviews,
+      meanFullReportMs: mean(left.activity.meanFullReportMs, left.activity.timedReviews, right.activity.meanFullReportMs, right.activity.timedReviews),
+      meanRatingMs: mean(left.activity.meanRatingMs, left.activity.timedReviews, right.activity.meanRatingMs, right.activity.timedReviews),
+      since: left.activity.since === null ? right.activity.since : right.activity.since === null ? left.activity.since : Math.min(left.activity.since, right.activity.since),
+    },
   })
 }
 
@@ -67,13 +106,27 @@ export class LifetimeUsage {
       return Promise.reject(new Error("Invalid request usage"))
     }
     return this.increment({ ...empty(), requests: 1, tokenRequests: tokens ? 1 : 0, input: usage.input ?? 0, output: usage.output ?? 0,
-      priced: usage.cost === undefined ? 0 : 1, cost: usage.cost ?? 0, since: Date.now() })
+      priced: usage.cost === undefined ? 0 : 1, cost: usage.cost ?? 0, since: Date.now(),
+      activity: { ...emptyActivity(), usageRequests: 1, since: Date.now() } })
   }
 
   /** One accepted final review, independent of POST count or received usage. */
-  recordRating(safe: boolean): Promise<void> {
+  recordRating(safe: boolean, timing?: ReviewTiming): Promise<void> {
     if (typeof safe !== "boolean") return Promise.reject(new Error("Invalid review rating"))
-    return this.increment({ ...empty(), safe: safe ? 1 : 0, unsafe: safe ? 0 : 1, ratingsSince: Date.now() })
+    if (timing && (![timing.fullReportMs, timing.ratingMs].every(amount) || timing.ratingMs > timing.fullReportMs)) {
+      return Promise.reject(new Error("Invalid review timing"))
+    }
+    return this.increment({ ...empty(), safe: safe ? 1 : 0, unsafe: safe ? 0 : 1, ratingsSince: Date.now(),
+      activity: { ...emptyActivity(), reviews: 1, since: Date.now(), timedReviews: timing ? 1 : 0,
+        meanFullReportMs: timing?.fullReportMs ?? 0, meanRatingMs: timing?.ratingMs ?? 0 } })
+  }
+
+  recordRetry(): Promise<void> {
+    return this.increment({ ...empty(), activity: { ...emptyActivity(), retries: 1, since: Date.now() } })
+  }
+
+  recordAutoApproval(): Promise<void> {
+    return this.increment({ ...empty(), activity: { ...emptyActivity(), autoApproved: 1, since: Date.now() } })
   }
 
   private increment(increment: LifetimeTotals): Promise<void> {
@@ -84,7 +137,7 @@ export class LifetimeUsage {
       const temporary = path.join(this.directory, `${this.id}.${randomUUID()}.tmp`)
       try {
         const file = await open(temporary, "wx", 0o600)
-        try { await file.writeFile(JSON.stringify({ version: 3, ...this.local })); await file.sync() }
+        try { await file.writeFile(JSON.stringify({ version: 4, ...this.local })); await file.sync() }
         finally { await file.close() }
         await rename(temporary, path.join(this.directory, `${this.id}.json`))
         const directory = await open(this.directory, constants.O_RDONLY | constants.O_DIRECTORY)
@@ -136,12 +189,13 @@ export class LifetimeUsage {
         }
         if (size > 1024) throw new Error("Invalid lifetime usage snapshot")
         const value = JSON.parse(bytes.subarray(0, size).toString("utf8"))
-        if (value?.version !== 1 && value?.version !== 2 && value?.version !== 3) throw new Error("Unsupported lifetime usage snapshot")
+        if (![1, 2, 3, 4].includes(value?.version)) throw new Error("Unsupported lifetime usage snapshot")
         total = add(total, validate({ requests: value.requests, input: value.input, output: value.output,
           tokenRequests: value.version === 1 ? value.requests : value.tokenRequests,
           priced: value.priced, cost: value.cost, since: value.since,
-          safe: value.version === 3 ? value.safe : 0, unsafe: value.version === 3 ? value.unsafe : 0,
-          ratingsSince: value.version === 3 ? value.ratingsSince : null }))
+          safe: value.version >= 3 ? value.safe : 0, unsafe: value.version >= 3 ? value.unsafe : 0,
+          ratingsSince: value.version >= 3 ? value.ratingsSince : null,
+          activity: value.version === 4 ? value.activity : emptyActivity() }))
       } finally { await file.close() }
       signal?.throwIfAborted()
     }
@@ -157,12 +211,16 @@ export function lifetimeCost(totals: LifetimeTotals): string {
 }
 
 export function lifetimeReport(totals: LifetimeTotals): string {
-  return [lifetimeCost(totals), uiText.lifetime.ratings(totals.safe, totals.unsafe), uiText.lifetime.requests(totals.requests),
-    totals.tokenRequests ? uiText.lifetime.tokens(totals.input, totals.output, totals.tokenRequests < totals.requests) : uiText.lifetime.tokensUnavailable,
-    uiText.lifetime.tokenCoverage(totals.tokenRequests, totals.requests),
-    uiText.lifetime.pricingCoverage(totals.priced, totals.requests),
-    ...(totals.since === null ? [] : [uiText.lifetime.since(new Date(totals.since).toISOString().slice(0, 10))]),
-    ...(totals.ratingsSince === null ? [] : [uiText.lifetime.ratingsSince(new Date(totals.ratingsSince).toISOString().slice(0, 10))]),
-    "", uiText.lifetime.explanation, "", uiText.lifetime.ratingsExplanation,
+  const reviews = totals.safe + totals.unsafe, activity = totals.activity
+  const percentage = (count: number) => reviews ? (count / reviews * 100).toFixed(1) : undefined
+  const partial = activity.reviews < reviews || activity.usageRequests < totals.requests
+  return [uiText.lifetime.dialogReviews(reviews), uiText.lifetime.dialogRetries(activity.retries, partial),
+    totals.tokenRequests ? uiText.lifetime.dialogTokens(totals.input, totals.output, totals.tokenRequests < totals.requests) : uiText.lifetime.dialogTokensUnavailable,
+    uiText.lifetime.dialogCost(totals.priced ? totals.cost.toFixed(4) : undefined, totals.priced < totals.requests),
+    "", uiText.lifetime.dialogSafe(totals.safe, percentage(totals.safe)),
+    uiText.lifetime.dialogUnsafe(totals.unsafe, percentage(totals.unsafe)),
+    uiText.lifetime.dialogAutoApproved(activity.autoApproved, percentage(activity.autoApproved), partial),
+    "", uiText.lifetime.averageFullReport(activity.timedReviews ? (activity.meanFullReportMs / 1000).toFixed(2) : undefined),
+    uiText.lifetime.averageRating(activity.timedReviews ? (activity.meanRatingMs / 1000).toFixed(2) : undefined),
   ].join("\n")
 }

@@ -207,7 +207,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
         if (!evidence) return null
         signal.throwIfAborted()
         const result = review(evidence, config!, signal, undefined, undefined, prompts,
-          (model) => modelPricing(api.state.provider, config!.baseURL, model), lifetime.record, onProgress, trace?.forward)
+          (model) => modelPricing(api.state.provider, config!.baseURL, model), lifetime.record, onProgress, trace?.forward, lifetime.recordRetry)
         worker = result
         return result
       })
@@ -231,7 +231,10 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
         view ? "approval-verification" : "approval-read", () => approval.list(signal))
     },
     once: (request, signal) => measured(traces?.get(request), "approval-reply", () => approval.once(request, signal)),
-  } : approval), visibleID: () => visibleApproval() }, undefined, modes, fact => notifications?.fact(fact), lifetime.recordRating)
+  } : approval), visibleID: () => visibleApproval() }, undefined, modes, fact => {
+    if (fact.type === "confirmed" && fact.automatic) lifetime.recordAutoApproval()
+    notifications?.fact(fact)
+  }, lifetime.recordRating)
 
   api.event.on("permission.asked", (event) => controller.asked(event.properties))
   api.event.on("permission.replied", (event) => controller.replied(event.properties.requestID))

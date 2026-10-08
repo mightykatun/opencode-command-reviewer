@@ -11,7 +11,8 @@ import { usageAttempt } from "../src/usage.js"
 
 const totals = (requests: number): LifetimeTotals => ({ requests, tokenRequests: requests, input: requests * 10,
   output: requests * 2, priced: requests, cost: requests * 0.01, since: 1700000000000,
-  safe: requests, unsafe: 0, ratingsSince: requests ? 1700000000000 : null })
+  safe: requests, unsafe: 0, ratingsSince: requests ? 1700000000000 : null,
+  activity: { reviews: 0, usageRequests: 0, retries: 0, autoApproved: 0, timedReviews: 0, meanFullReportMs: 0, meanRatingMs: 0, since: null } })
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -21,7 +22,7 @@ function deferred<T>() {
 
 async function fixture(t: TestContext) {
   const state = await mkdtemp(path.join(tmpdir(), "review-lifetime-ui-"))
-  const directory = path.join(state, "opencode-reviewer", "usage-v3")
+  const directory = path.join(state, "opencode-reviewer", "usage-v4")
   const originalTotals = LifetimeUsage.prototype.totals
   const calls: { signal: AbortSignal; value: ReturnType<typeof deferred<LifetimeTotals>>; cleanup: ReturnType<typeof deferred<void>> }[] = []
   let actual = 0, maximum = 0, replacements = 0, open = false, unregistered = 0
@@ -122,6 +123,22 @@ test("rating-only records persist and refresh independently of request usage", a
   await f.tracker.flush(); await settle()
   f.finish(2, await f.saved()); await settle()
   assert.equal(f.tracker.text(), "lifetime: $0.1000\n1 ✓ 1 ✗")
+})
+
+test("activity counters persist without usage and recover together after a failed write", async t => {
+  const f = await fixture(t)
+  await mkdir(path.dirname(f.directory), { recursive: true })
+  await writeFile(f.directory, "blocked")
+  f.tracker.recordRetry(); f.tracker.recordAutoApproval()
+  await f.tracker.flush(); await settle()
+  assert.equal(f.tracker.text(), "lifetime: usage unavailable")
+  await unlink(f.directory)
+  f.tracker.recordRating(true, { fullReportMs: 2000, ratingMs: 800 })
+  await f.tracker.flush(); await settle()
+  const totals = await f.saved()
+  assert.equal(totals.requests, 0)
+  assert.equal(totals.activity.retries, 1); assert.equal(totals.activity.autoApproved, 1)
+  assert.equal(totals.activity.meanFullReportMs, 2000); assert.equal(totals.activity.meanRatingMs, 800)
 })
 
 test("disposal finalizers record and flush while timed-out totals cleanup remains outstanding", async (t) => {

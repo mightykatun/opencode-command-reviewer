@@ -167,6 +167,7 @@ export async function review(
   onUsage?: (usage: Usage) => void,
   onProgress?: (progress: ReviewProgress) => void,
   onDiagnostics?: DiagnosticObserver,
+  onRetry?: () => unknown,
 ): Promise<ReviewResult> {
   // Production already shares a deadline with evidence collection. Direct
   // callers get the same bound, including all internal backoff and POSTs.
@@ -174,7 +175,7 @@ export async function review(
     let worker: Promise<ReviewResult> | undefined
     try {
       return await withDeadline(signal, config.timeoutMs, (bounded) =>
-        worker = review(evidence, config, bounded, fetcher, environment, prompts, pricing, onUsage, onProgress, onDiagnostics))
+        worker = review(evidence, config, bounded, fetcher, environment, prompts, pricing, onUsage, onProgress, onDiagnostics, onRetry))
     } finally { await worker?.catch(() => {}) }
   }
   const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)
@@ -209,11 +210,19 @@ export async function review(
           ...(config.stream ? { stream_options: { include_usage: true } } : {}) })
         reviewStage(signal, "Reviewer response")
         diagnose = onDiagnostics ? diagnosticAttempt(onDiagnostics, attempt) : undefined
-        response = await abortable(fetcher(`${config.baseURL}/chat/completions`, {
-          method: "POST", redirect: "error", signal: AbortSignal.any([signal, requestAbort.signal]),
-          headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
-          body,
-        }), signal, cancelBody)
+        signal.throwIfAborted()
+        let pending: Promise<Response>
+        try {
+          pending = fetcher(`${config.baseURL}/chat/completions`, {
+            method: "POST", redirect: "error", signal: AbortSignal.any([signal, requestAbort.signal]),
+            headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+            body,
+          })
+        } finally {
+          // Count dispatched extra attempts, not proposed or canceled backoff.
+          if (attempt > 0) { try { void Promise.resolve(onRetry?.()).catch(() => {}) } catch {} }
+        }
+        response = await abortable(pending, signal, cancelBody)
         diagnose?.("headers")
       } catch (error) {
         signal.throwIfAborted()

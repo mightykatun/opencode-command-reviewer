@@ -116,11 +116,19 @@ costs use reported charges; other endpoints use available catalog estimates.
 Received usage counts even if a review fails or is interrupted. Unreported charges
 are missing from the totals.
 
-Lifetime statistics also show **Safe** and **Unsafe** review counts. Each completed,
-validated review counts once, even without usage data. Previews, retries and failed
-or interrupted analyses do not count. Re-enabling a conversation can produce a new
-review, which counts again. The totals persist across restarts; earlier ratings
-were not recorded and cannot be reconstructed.
+The lifetime dialog shows completed reviews, retries, tokens, cost, Safe/Unsafe
+percentages, confirmed auto-approvals, and average time to a rating and full report.
+Percentages use recorded completed reviews as their denominator. Each validated
+review counts once, even without usage data; a fresh review after re-enabling counts
+again. Retries count extra API attempts actually dispatched, including format
+corrections and transport recovery. Manual approvals are not auto-approvals.
+Timings run from evaluation start, including evidence and retries, to the accepted
+attempt's first rating and final validated response, excluding rendering/countdown
+time. Non-streaming reviews use the final response time for both measurements.
+Only running averages and sample counts are stored, not individual timings.
+Totals persist across restarts. New metrics show partial history when older records
+lack them; averages include measured reviews only. Earlier unrecorded values cannot
+be reconstructed.
 
 Reviews send the pending request, latest user prompt, project context, and relevant
 file snapshots, diffs, or tool arguments to your endpoint before approval. Shell

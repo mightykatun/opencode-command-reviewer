@@ -69,9 +69,12 @@ test("transient HTTP failures recover with byte-identical POSTs and independent 
     res.end(envelope(index === 1 ? bad : '{"safe":true,"desc":"Recovered."}'))
   })
   const progress: ReviewProgress[] = []
-  const result = await review(evidence, config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, undefined, p => { progress.push(p) })
+  let retries = 0
+  const result = await review(evidence, config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, undefined, p => { progress.push(p) }, undefined,
+    () => { retries++ })
   assert.deepEqual(result, { safe: true, desc: "Recovered." })
   assert.equal(requests.length, 4)
+  assert.equal(retries, 3, "count both transport retries and format corrections at dispatch")
   assert.deepEqual(requests[0]!.body, requests[1]!.body)
   assert.deepEqual(requests[2]!.body, requests[3]!.body)
   assert.equal(requests[2]!.body.messages.length, 4)
@@ -111,6 +114,20 @@ test("format correction cannot replenish the transport retry budget", async () =
   assert.equal(calls, 4, "one format correction plus two total transport retries")
 })
 
+for (const failure of ["throw", "reject"] as const) test(`retry metric observer ${failure} cannot affect the review`, async () => {
+  let calls = 0, retries = 0
+  const config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture" })
+  const result = await review(evidence, config, signal(), async () => ++calls === 1
+    ? new Response(null, { status: 503 }) : new Response(envelope('{"safe":true,"desc":"Recovered."}')),
+  {}, BUILTIN_PROMPTS, undefined, undefined, undefined, undefined, () => {
+    retries++
+    if (failure === "throw") throw new Error("metric unavailable")
+    return Promise.reject(new Error("metric unavailable"))
+  })
+  assert.equal(result.safe, true)
+  assert.equal(calls, 2); assert.equal(retries, 1)
+})
+
 test("a disconnected non-streaming body restarts the exact POST rather than joining partial envelopes", async () => {
   let calls = 0, reads = 0
   const bodies: string[] = []
@@ -148,14 +165,15 @@ test("retry attempts have distinct diagnostic ordinals and cannot outlive the or
 
 test("backoff cancellation and insufficient review time never dispatch another POST", async t => {
   const abort = new AbortController(), reason = new Error("native resolution")
-  let calls = 0
+  let calls = 0, retries = 0
   const fetcher: typeof fetch = async () => { calls++; return new Response(null, { status: 503 }) }
   const config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture" })
-  const pending = review(evidence, config, abort.signal, fetcher)
+  const pending = review(evidence, config, abort.signal, fetcher, {}, BUILTIN_PROMPTS, undefined, undefined, undefined, undefined, () => { retries++ })
   await sleep(10)
   abort.abort(reason)
   await assert.rejects(pending, error => error === reason)
   assert.equal(calls, 1)
+  assert.equal(retries, 0, "canceled backoff is not a dispatched retry")
   calls = 0
   await assert.rejects(review(evidence, { ...config, timeoutMs: 200 }, signal(), fetcher), /HTTP 503/)
   assert.equal(calls, 1)
@@ -1211,7 +1229,10 @@ test("complete SSE reviews discard stale estimates from report and lifetime but 
     assert.deepEqual(observed, [expected], "one final accounting observation, not cumulative-frame increments")
     assert.equal(calls, 1)
     const totals = await new LifetimeUsage(directory).totals()
-    assert.deepEqual({ ...totals, since: null }, { requests: 1, tokenRequests: 1, input: 100, output,
+    const { activity, ...usageTotals } = totals
+    assert.equal(activity.usageRequests, 1)
+    assert.equal(activity.reviews, 0)
+    assert.deepEqual({ ...usageTotals, since: null }, { requests: 1, tokenRequests: 1, input: 100, output,
       priced: reported ? 1 : 0, cost: reported ? 0.000102 : 0, since: null, safe: 0, unsafe: 0, ratingsSince: null })
     assert.equal(lifetimeCost(totals), reported ? "lifetime: $0.0001" : "lifetime: cost unavailable")
   })

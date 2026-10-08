@@ -5,7 +5,7 @@ import type { PermissionRequest } from "@opencode-ai/sdk/v2"
 import { Controller as CoreController, displayText, visibleReview, type View } from "../src/controller.js"
 import { loadContext, type ContextReader } from "../src/context.js"
 import { withDeadline } from "../src/reviewer.js"
-import type { Assessment } from "../src/types.js"
+import type { Assessment, ReviewProgress, ReviewTiming } from "../src/types.js"
 import { SessionModes } from "../src/session-mode.js"
 
 // Existing directory lifecycle cases opt into the newly independent category.
@@ -73,6 +73,37 @@ test("lifetime ratings observe each accepted final review once, not previews, re
   controller.presented("safe"); controller.presented()
   await tick()
   assert.deepEqual(ratings, [true, false])
+  await controller.dispose()
+})
+
+test("review timing uses the accepted attempt's first rating and excludes later display/approval time", async () => {
+  let now = 100, finish!: (value: Assessment) => void, progress!: (value: ReviewProgress) => void
+  const timings: ReviewTiming[] = []
+  const controller = new CoreController((_req, _signal, identified, onProgress) => {
+    identified(); progress = onProgress; return new Promise(resolve => { finish = resolve })
+  }, () => {}, { reviewBash: true, reviewEdits: true, stream: true }, undefined,
+  { now: () => now, after: () => () => {} }, undefined, undefined, (_safe, timing) => { timings.push(timing) })
+  controller.asked(request("a")); await tick()
+  progress({ attempt: 0, phase: "evaluating" })
+  now = 150; progress({ attempt: 0, phase: "streaming", preview: { desc: "Description first" } })
+  now = 300; progress({ attempt: 0, phase: "streaming", preview: { safe: false } })
+  now = 500; progress({ attempt: 1, phase: "retrying" })
+  now = 700; progress({ attempt: 1, phase: "streaming", preview: { safe: true } })
+  now = 800; progress({ attempt: 1, phase: "streaming", preview: { safe: true, desc: "More text" } })
+  now = 900; progress({ attempt: 0, phase: "streaming", preview: { safe: false } })
+  now = 1000; finish(result); await tick()
+  now = 5000; controller.presented("a"); controller.reconcile([request("a")], controller.revision)
+  assert.deepEqual(timings, [{ fullReportMs: 900, ratingMs: 600 }])
+  await controller.dispose()
+})
+
+test("non-streaming timing records the final response time for both measures", async () => {
+  let now = 100
+  const timings: ReviewTiming[] = []
+  const controller = new CoreController(async () => { now = 1100; return result }, () => {}, undefined, undefined,
+    { now: () => now, after: () => () => {} }, undefined, undefined, (_safe, timing) => { timings.push(timing) })
+  controller.asked(request("a")); await tick()
+  assert.deepEqual(timings, [{ fullReportMs: 1000, ratingMs: 1000 }])
   await controller.dispose()
 })
 

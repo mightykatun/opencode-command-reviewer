@@ -5,11 +5,12 @@ import { LifetimeUsage, lifetimeCost, lifetimeReport, type LifetimeTotals } from
 import { LifetimeRefresh } from "./lifetime-refresh.js"
 import type { Usage } from "./usage.js"
 import { uiText } from "./ui-text.js"
+import type { ReviewTiming } from "./types.js"
 
 /** Independent accounting UI: no session writes and no dependency on review visibility. */
 export function lifetimeTracker(api: TuiPluginApi) {
   const directory = path.join(api.state.path.state, "opencode-reviewer")
-  const store = new LifetimeUsage(path.join(directory, "usage-v3"), path.join(directory, "usage-v2"), path.join(directory, "usage-v1"))
+  const store = new LifetimeUsage(path.join(directory, "usage-v4"), path.join(directory, "usage-v3"), path.join(directory, "usage-v2"), path.join(directory, "usage-v1"))
   const [totals, setTotals] = createSignal<LifetimeTotals>()
   const [unavailable, setUnavailable] = createSignal(false)
   const refresh = new LifetimeRefresh((signal) => store.totals(signal), (value) => {
@@ -39,8 +40,10 @@ export function lifetimeTracker(api: TuiPluginApi) {
       // Finalizers still enqueue writes after the refresh coordinator is stopped.
       void store.record(usage).then(() => refresh.refresh(), () => refresh.failed())
     },
-    recordRating: (safe: boolean) => {
-      void store.recordRating(safe).then(() => refresh.refresh(), () => refresh.failed())
+    recordRating: (safe: boolean, timing?: ReviewTiming) => {
+      void store.recordRating(safe, timing).then(() => refresh.refresh(), () => refresh.failed())
     },
+    recordRetry: () => { void store.recordRetry().then(() => refresh.refresh(), () => refresh.failed()) },
+    recordAutoApproval: () => { void store.recordAutoApproval().then(() => refresh.refresh(), () => refresh.failed()) },
   }
 }

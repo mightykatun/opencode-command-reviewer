@@ -1,5 +1,5 @@
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
-import type { ReviewProgress, ReviewResult } from "./types.js"
+import type { ReviewProgress, ReviewResult, ReviewTiming } from "./types.js"
 import type { Config } from "./config.js"
 import type { ApprovalTransport } from "./approval.js"
 import { isDeepStrictEqual } from "node:util"
@@ -28,6 +28,7 @@ interface Entry {
   suspension?: "mode" | "unavailable"
   cancelTimer?: () => void; deadline?: number; approvalAbort?: AbortController
   attempt: number; progressGeneration: number; pendingProgress?: ReviewProgress; cancelProgress?: () => void
+  startedAt?: number; ratingAt?: number
 }
 
 export interface ApprovalClock {
@@ -62,7 +63,7 @@ export class Controller {
   constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
     private options: Options = { reviewBash: true, reviewEdits: true },
     private approval?: Approval, private time: ApprovalClock = clock, private modes?: SessionModeGate,
-    private approvalObserver?: ApprovalObserver, private ratingObserver?: (safe: boolean) => unknown) {}
+    private approvalObserver?: ApprovalObserver, private ratingObserver?: (safe: boolean, timing: ReviewTiming) => unknown) {}
   get revision() { return this.version }
   get views() { return [...this.entries.values()].map((entry) => entry.view) }
   private publish() { if (!this.stopped) this.changed(this.views) }
@@ -147,6 +148,7 @@ export class Controller {
       if (value.attempt !== entry.attempt + 1 || value.phase !== (value.attempt ? "retrying" : "evaluating")) return
       this.clearProgress(entry)
       entry.attempt = value.attempt
+      entry.ratingAt = undefined
       entry.view = { ...entry.view, progress: { attempt: value.attempt, phase: value.phase } }
       this.publish()
       return
@@ -160,6 +162,7 @@ export class Controller {
     }
     const preview = { ...(typeof value.preview.safe === "boolean" ? { safe: value.preview.safe } : {}),
       ...(typeof value.preview.desc === "string" ? { desc: value.preview.desc } : {}) }
+    if (typeof preview.safe === "boolean" && entry.ratingAt === undefined) entry.ratingAt = this.time.now()
     entry.pendingProgress = { attempt: value.attempt, phase: "streaming", preview }
     if (preview.safe !== entry.view.progress?.preview?.safe) {
       const desc = entry.view.progress?.preview?.desc
@@ -315,6 +318,7 @@ export class Controller {
           return null
         }
       }
+      entry.startedAt = this.time.now()
       return this.evaluate(request, entry.abort.signal, () => {
         // A timed-out evaluator may still call back after its review has settled.
         if (active() && (entry.view.status === "identifying" || entry.view.status === "analyzing")) {
@@ -329,7 +333,11 @@ export class Controller {
         // Count final accepted reviews, not previews, transport attempts or UI
         // publications. Accounting failures cannot affect review or approval.
         if (assessment) {
-          try { void Promise.resolve(this.ratingObserver?.(assessment.safe)).catch(() => {}) } catch {}
+          try {
+            const fullReportMs = Math.max(0, this.time.now() - entry.startedAt!)
+            const ratingMs = entry.ratingAt === undefined ? fullReportMs : Math.max(0, entry.ratingAt - entry.startedAt!)
+            void Promise.resolve(this.ratingObserver?.(assessment.safe, { fullReportMs, ratingMs })).catch(() => {})
+          } catch {}
         }
         this.publish()
       }

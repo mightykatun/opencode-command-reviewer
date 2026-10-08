@@ -558,21 +558,36 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Inline lifetime belongs only in this completed valid-request-usage block, never
   alone while loading, failed or missing all report usage. The lifetime palette
   command remains independent. Unknown costs are not free; label partial coverage.
-- `LifetimeUsage` writes version 3 per-instance atomic snapshots under
-  `opencode-reviewer/usage-v3/` in the public state directory. Read legacy
-  `opencode-reviewer/usage-v1/` and `usage-v2/` alongside them without copying/rewriting snapshots
+- `LifetimeUsage` writes version 4 per-instance atomic snapshots under
+  `opencode-reviewer/usage-v4/` in the public state directory. Read legacy
+  `opencode-reviewer/usage-v1/`, `usage-v2/` and `usage-v3/` alongside them without copying/rewriting snapshots
   or reinterpreting original estimates. Keep separate request, token-coverage and
   pricing counts, final Safe/Unsafe review counts, numeric totals and timestamps only; reads are capped at 1 KiB
   per snapshot. No checkout or native session-accounting writes.
 - Count ratings at controller acceptance of each completed, validated review,
   independently of received usage. Previews, transport/format attempts, errors,
   stale/aborted results and repeated display updates never count. A fresh accepted
-  review after re-enable counts again. The observer receives only a boolean;
+  review after re-enable counts again. The observer receives only a boolean and numeric durations;
   exceptions/rejected promises cannot affect review or approval. Persist rating
   counts and their own earliest timestamp with usage through the same serialized
   atomic writer. Older snapshots contribute no ratings; explain the missing
   historical coverage. Display counts alongside inline lifetime cost only in the
   existing completed-report usage block, and always in the lifetime palette.
+- The compact lifetime dialog shows Reviews, Retries, Tokens, Cost, Safe, Unsafe,
+  Auto-approved and average time to the full report and rating. Reviews means
+  accepted final assessments; percentages use those recorded reviews. Count retries
+  when extra reviewer POSTs are dispatched, including format and transport attempts,
+  never just when a backoff is scheduled. Count only confirmed automatic approvals,
+  independently of notification settings. Manual approvals and uncertain writes do
+  not count. Metrics observers cannot affect review or approval.
+- Measure monotonic durations from evaluation start after the mode gate through
+  evidence/retries to final controller acceptance and the accepted attempt's first
+  parsed rating. Clear the rating timestamp on format/transport retry. Non-streaming
+  ratings use completion time. Exclude rendering and countdown time. Persist only
+  sample counts and online means; combine instance means by sample weight. Never
+  store timing arrays or individual observations. Legacy snapshots contribute no
+  fabricated activity metrics; mark partial history, preserve received-only token/
+  pricing coverage and show unavailable averages before the first measured review.
 - Accounting and persistence failures cannot change review outcomes. Abort and
   await actual review workers/finalizers before flushing queued lifetime writes on
   disposal. Failed storage reports unavailable without silently resetting history.

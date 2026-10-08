@@ -326,28 +326,36 @@ try {
   for (const entry of requests.filter((entry) => entry.url.startsWith("/main"))) assert.doesNotMatch(JSON.stringify(entry.body.messages), /Take extra care|Permission analysis|Allowed in|countdown/)
   if (flag("stats")) {
     const recorded = flag("no-usage") || flag("error") ? 0 : [...perRequest.values()].reduce((sum, attempts) => sum + attempts - (flag("missing-usage") ? 1 : 0), 0)
+    const rated = flag("error") ? 0 : perRequest.size
+    const approved = auto && !flag("unsafe") && !flag("error") && !flag("cancel") ? plan.reviewKinds.length : 0
     tmux("send-keys", "-t", "smoke", "C-p")
     await until((s) => s.includes("Commands"), 5000)
     tmux("send-keys", "-t", "smoke", "-l", "Reviewer: Lifetime usage")
     await until((s) => (s.match(/Reviewer: Lifetime usage/g) ?? []).length >= 2, 5000)
     tmux("send-keys", "-t", "smoke", "Enter")
-    await until((s) => s.includes("Reviewer lifetime usage") && s.includes(flag("storage-error") ? "Lifetime usage unavailable" : `${1 + recorded} requests with recorded usage`), 5000)
+    await until((s) => s.includes("Reviewer lifetime usage") && s.includes(flag("storage-error") ? "Lifetime usage unavailable" : `Auto-approved: ${approved} (`), 5000)
     if (!flag("storage-error")) {
       // The v1 seed contributes one priced/token-counted request and $0.01.
       // Missing usage contributes nothing; unpriced usage retains its token counts.
       const total = 1 + recorded, priced = 1 + (flag("unpriced") ? 0 : recorded)
       const cost = (0.01 + (flag("unpriced") ? 0 : recorded * (stream ? 0.000115 : 0.00014))).toFixed(4)
-      assert.equal(screen.match(/\b\d+ requests with recorded usage\b/)?.[0], `${total} requests with recorded usage`)
-      assert.equal(screen.match(/token: \d+ in \d+ out(?: \(partial coverage\))?/)?.[0], `token: ${100 * total} in ${20 * total} out`)
-      assert.equal(screen.match(/Token counts available: \d+\/\d+ requests/)?.[0], `Token counts available: ${total}/${total} requests`)
-      assert.equal(screen.match(/Pricing available: \d+\/\d+ requests/)?.[0], `Pricing available: ${priced}/${total} requests`)
-      assert.equal(screen.match(/lifetime: \$\d+\.\d{4}(?: \(partial pricing\))?/)?.[0], `lifetime: $${cost}${priced < total ? " (partial pricing)" : ""}`)
-      assert.match(screen, /Recorded since: 1970-01-01/, "legacy history must retain its first-recorded date")
+      assert.equal(screen.match(/Tokens: \d+ in \d+ out(?: \(partial coverage\))?/)?.[0], `Tokens: ${100 * total} in ${20 * total} out`)
+      assert.equal(screen.match(/Cost: \$\d+\.\d{4}(?: \(partial pricing\))?/)?.[0], `Cost: $${cost}${priced < total ? " (partial pricing)" : ""}`)
+      const retries = [...perRequest.values()].reduce((sum, attempts) => sum + attempts - 1, 0)
+      assert.match(screen, new RegExp(`Retries: ${retries} \\(partial history\\)`), "old usage does not invent old retry totals")
       if (!flag("cancel")) {
-        const rated = flag("error") ? 0 : perRequest.size
-        assert.equal(screen.match(/\d+ ✓ \d+ ✗/)?.[0],
-          `${flag("unsafe") ? 0 : rated} ✓ ${flag("unsafe") ? rated : 0} ✗`,
-          "count final ratings once per review, including responses without usage")
+        assert.equal(screen.match(/Reviews: \d+/)?.[0], `Reviews: ${rated}`)
+        const percentage = count => rated ? `${(count / rated * 100).toFixed(1)}%` : "n/a"
+        for (const [label, count] of [["Safe", flag("unsafe") ? 0 : rated], ["Unsafe", flag("unsafe") ? rated : 0], ["Auto-approved", approved]]) {
+          assert.ok(screen.includes(`${label}: ${count} (${percentage(count)})`))
+        }
+        if (rated) {
+          const full = screen.match(/Average time to full report: (\d+\.\d+)s/)?.[1]
+          const rating = screen.match(/Average time to rating: (\d+\.\d+)s/)?.[1]
+          assert.ok(full !== undefined && rating !== undefined && Number(full) >= Number(rating))
+          if (stream) assert.ok(Number(full) > Number(rating), "streamed rating precedes the full report")
+          else assert.equal(full, rating)
+        } else assert.match(screen, /Average time to full report: unavailable/)
       }
     }
     assert.doesNotMatch(screen, /Permission analysis/)

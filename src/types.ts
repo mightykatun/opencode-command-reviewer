@@ -142,6 +142,12 @@ export interface Assessment {
   desc: string
 }
 
+/** Monotonic durations from evaluation start, excluding approval/countdown time. */
+export interface ReviewTiming {
+  fullReportMs: number
+  ratingMs: number
+}
+
 /** Provisional transport observations only. Never an assessment or approval eligibility.
  * Attempts are zero-based; evaluating/retrying (and absent preview) clear prior content.
  * The display layer must sanitize prefixes before rendering.

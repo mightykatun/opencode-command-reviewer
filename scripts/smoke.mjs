@@ -977,18 +977,25 @@ try {
     }
     assert.match(capture(), /Context/, "native sidebar sections should remain after the temporary review is removed")
     if (scenario === "edit") {
+      let originalAverages
       const showLifetime = async () => {
         tmux("send-keys", "-t", "smoke", "C-p")
         await until((s) => s.includes("Commands"), 10000)
         tmux("send-keys", "-t", "smoke", "-l", "Reviewer: Lifetime usage")
         await until((s) => (s.match(/Reviewer: Lifetime usage/g) ?? []).length >= 2, 10000)
         tmux("send-keys", "-t", "smoke", "Enter")
-        await until((s) => s.includes("Reviewer lifetime usage") && s.includes("2 requests with recorded usage"), 10000)
-        assert.match(screen, /lifetime: \$0\.0011/)
-        assert.match(screen, /token: 1000 in 40 out/)
-        assert.match(screen, /Token counts available: 2\/2 requests/)
-        assert.match(screen, /Pricing available: 2\/2 requests/)
-        assert.match(screen, /1 ✓ 0 ✗/, "one final rating survives restart despite two format attempts")
+        await until((s) => s.includes("Reviewer lifetime usage") && s.includes("Reviews: 1") && s.includes("Average time to rating:"), 10000)
+        assert.match(screen, /Cost: \$0\.0011/)
+        assert.match(screen, /Tokens: 1000 in 40 out/)
+        assert.match(screen, /Retries: 1/)
+        assert.match(screen, /Safe: 1 \(100\.0%\)/, "one final rating survives restart despite two format attempts")
+        assert.match(screen, /Unsafe: 0 \(0\.0%\)/)
+        assert.match(screen, /Auto-approved: 0 \(0\.0%\)/, "native manual approval is not auto-approval")
+        const averages = [screen.match(/Average time to full report: (\d+\.\d+)s/)?.[1], screen.match(/Average time to rating: (\d+\.\d+)s/)?.[1]]
+        assert.ok(averages.every(value => value !== undefined))
+        assert.equal(averages[0], averages[1], "non-streamed rating arrives with the full report")
+        if (originalAverages) assert.deepEqual(averages, originalAverages, "running averages survive restart")
+        originalAverages = averages
         assert.doesNotMatch(screen, /Permission analysis/)
       }
       await showLifetime()
