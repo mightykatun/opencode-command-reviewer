@@ -480,6 +480,8 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Do not include omitted content or invent zero counts for unavailable diffs.
 - Use HTTP Chat Completions with compact textual JSON evidence; `stream` is a strict
   boolean defaulting to false and controls both transport and progressive display.
+  Every reviewer POST sets `max_tokens: 2000`, including transport retries and
+  format corrections. This fixed output cap is not a configuration option.
   Streaming sends `stream_options: { include_usage: true }` and requires
   `text/event-stream`. No tool calling, provider-specific JSON mode or stream
   resumption. Keep endpoint/model configurable and evidence semantics

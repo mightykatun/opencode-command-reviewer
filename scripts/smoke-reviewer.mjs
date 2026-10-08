@@ -15,7 +15,8 @@ export function reviewerAudit({ stream = false } = {}) {
       const body = JSON.parse(text), messages = body.messages
       assert.ok(text === JSON.stringify(body), "request envelope must already be compact JSON")
       assert.equal(body.stream, stream)
-      assert.deepEqual(Object.keys(body).sort(), ["model", "messages", "stream", ...(stream ? ["stream_options"] : [])].sort())
+      assert.equal(body.max_tokens, 2000)
+      assert.deepEqual(Object.keys(body).sort(), ["model", "messages", "max_tokens", "stream", ...(stream ? ["stream_options"] : [])].sort())
       if (stream) assert.deepEqual(body.stream_options, { include_usage: true })
       assert.ok(Array.isArray(messages) && messages.length >= 2)
       assert.ok(messages[0].role === "system" && typeof messages[0].content === "string" && messages[0].content.length > 0)

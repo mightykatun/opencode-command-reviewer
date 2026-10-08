@@ -63,7 +63,7 @@ test("separate origins measure a fresh reviewer connection then warm reuse witho
 const initial = () => ({ model: "PRIVATE-MODEL", messages: [
   { role: "system", content: "PRIVATE-SYSTEM" },
   { role: "user", content: JSON.stringify({ kind: "mcp", permission: { id: "PRIVATE-ID" }, input: "PRIVATE-EVIDENCE" }) },
-], stream: false })
+], max_tokens: 2000, stream: false })
 const corrected = (body) => ({ ...structuredClone(body), messages: [...structuredClone(body.messages),
   { role: "assistant", content: "PRIVATE-BAD-RESPONSE" }, { role: "user", content: "Format validation failed: Invalid JSON" }] })
 

@@ -205,7 +205,7 @@ export async function review(
       let response: Response
       let diagnose: ReturnType<typeof diagnosticAttempt> | undefined
       try {
-        const body = JSON.stringify({ model: config.model, messages, stream: config.stream,
+        const body = JSON.stringify({ model: config.model, messages, max_tokens: 2000, stream: config.stream,
           ...(config.stream ? { stream_options: { include_usage: true } } : {}) })
         reviewStage(signal, "Reviewer response")
         diagnose = onDiagnostics ? diagnosticAttempt(onDiagnostics, attempt) : undefined

@@ -630,6 +630,7 @@ test("extra-careful guidance defaults on and can be omitted from native auto rev
       assert.equal(request.body.messages[0].content, [prompts[kind].instructions, ...(autoApprove && extraCareful !== false ? [prompts.extraCareful] : []), CONTRACT].join("\n\n"))
       assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
       assert.equal(request.body.stream, stream)
+      assert.equal(request.body.max_tokens, 2000)
       assert.doesNotMatch(JSON.stringify(request.body), /"extraCareful"|autoApprove|countdown|automatic approval/)
     }
     assert.equal(requests.length - start, 2)
@@ -665,6 +666,7 @@ test("new review kinds select only their own instructions and share the fixed co
       assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
       assert.equal(request.body.tools, undefined)
       assert.equal(request.body.stream, stream)
+      assert.equal(request.body.max_tokens, 2000)
       assert.doesNotMatch(JSON.stringify(request.body), /"extraCareful"|autoApprove|countdown|automatic approval/)
     }
     assert.equal(requests[start + 1]!.body.messages[3].content, CORRECTION.replace("{{validationError}}", "Invalid JSON"))
