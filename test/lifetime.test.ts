@@ -27,7 +27,7 @@ test("ratings persist independently of usage and retain their own recording star
   const total = await restarted.totals()
   assert.equal(total.safe, 2); assert.equal(total.unsafe, 1)
   assert.equal(total.ratingsSince, first.ratingsSince)
-  assert.match(lifetimeReport(total), /Safe: 2 · Unsafe: 1/)
+  assert.match(lifetimeReport(total), /2 ✓ 1 ✗/)
   assert.match(lifetimeReport(total), /Ratings recorded since: \d{4}-\d{2}-\d{2}/)
   assert.match(lifetimeReport(total), /Earlier ratings were not recorded/)
   for (const value of [undefined, null, "true", 1, {}]) await assert.rejects(store.recordRating(value as boolean), /Invalid review rating/)

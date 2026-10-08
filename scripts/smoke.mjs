@@ -382,7 +382,7 @@ try {
     if (knownPricing) assert.match(sidebarText, correction ? /cost: \$0\.0011/ : /cost: \$0\.0005/)
     else assert.doesNotMatch(sidebarText, /cost:\s*\$/, "unknown pricing must not invent a cost")
     await until((s) => s.includes(knownPricing ? "lifetime: $" : "lifetime: cost unavailable"), 5000)
-    await until((s) => s.includes(scenario === "patch" ? "Safe: 0 · Unsafe: 1" : "Safe: 1 · Unsafe: 0"), 5000)
+    await until((s) => s.includes(scenario === "patch" ? "0 ✓ 1 ✗" : "1 ✓ 0 ✗"), 5000)
     const lifetimeAnsi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
     assert.equal(styleAt(lifetimeAnsi, "lifetime:").fg, styleAt(lifetimeAnsi, "fullscreen").fg)
     if (knownPricing) {
@@ -988,7 +988,7 @@ try {
         assert.match(screen, /token: 1000 in 40 out/)
         assert.match(screen, /Token counts available: 2\/2 requests/)
         assert.match(screen, /Pricing available: 2\/2 requests/)
-        assert.match(screen, /Safe: 1 · Unsafe: 0/, "one final rating survives restart despite two format attempts")
+        assert.match(screen, /1 ✓ 0 ✗/, "one final rating survives restart despite two format attempts")
         assert.doesNotMatch(screen, /Permission analysis/)
       }
       await showLifetime()

@@ -70,14 +70,14 @@ test("palette refresh updates tracker state without replacing or reopening a dis
   assert.equal(f.counts().replacements, 0)
   f.finish(0, totals(1))
   await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0100\nSafe: 1 · Unsafe: 0")
+  assert.equal(f.tracker.text(), "lifetime: $0.0100\n1 ✓ 0 ✗")
   f.command.run()
   await settle()
   assert.equal(f.counts().replacements, 1)
   f.dismiss()
   f.finish(1, totals(2))
   await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0200\nSafe: 2 · Unsafe: 0")
+  assert.equal(f.tracker.text(), "lifetime: $0.0200\n2 ✓ 0 ✗")
   assert.equal(f.counts().replacements, 1)
   assert.equal(f.counts().open, false)
 })
@@ -105,7 +105,7 @@ test("write failure invalidates older queued totals and a later successful recor
   assert.equal(f.counts().reads, 2)
   f.finish(1, saved)
   await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.3000\nSafe: 0 · Unsafe: 0")
+  assert.equal(f.tracker.text(), "lifetime: $0.3000\n0 ✓ 0 ✗")
 })
 
 test("rating-only records persist and refresh independently of request usage", async t => {
@@ -121,7 +121,7 @@ test("rating-only records persist and refresh independently of request usage", a
   f.tracker.record({ cost: 0.1 })
   await f.tracker.flush(); await settle()
   f.finish(2, await f.saved()); await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.1000\nSafe: 1 · Unsafe: 1")
+  assert.equal(f.tracker.text(), "lifetime: $0.1000\n1 ✓ 1 ✗")
 })
 
 test("disposal finalizers record and flush while timed-out totals cleanup remains outstanding", async (t) => {

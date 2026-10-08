@@ -345,8 +345,8 @@ try {
       assert.match(screen, /Recorded since: 1970-01-01/, "legacy history must retain its first-recorded date")
       if (!flag("cancel")) {
         const rated = flag("error") ? 0 : perRequest.size
-        assert.equal(screen.match(/Safe: \d+ · Unsafe: \d+/)?.[0],
-          `Safe: ${flag("unsafe") ? 0 : rated} · Unsafe: ${flag("unsafe") ? rated : 0}`,
+        assert.equal(screen.match(/\d+ ✓ \d+ ✗/)?.[0],
+          `${flag("unsafe") ? 0 : rated} ✓ ${flag("unsafe") ? rated : 0} ✗`,
           "count final ratings once per review, including responses without usage")
       }
     }
