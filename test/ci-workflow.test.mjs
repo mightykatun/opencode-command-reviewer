@@ -1,6 +1,9 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { readFile, readdir } from "node:fs/promises"
+import { readFile, readdir, mkdtemp, mkdir, copyFile, rm } from "node:fs/promises"
+import { execFileSync } from "node:child_process"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import inventory from "../scripts/helper-tests.json" with { type: "json" }
 
 const read = async (file) => readFile(new URL(`../${file}`, import.meta.url), "utf8")
@@ -46,18 +49,33 @@ test("normal checks aggregate every pure helper while keeping host and built-pac
   }
 })
 
-test("active release validation runs the same helper inventory with a complete sparse dependency closure", async () => {
+test("active release validation runs the same helper inventory with a complete sparse dependency closure", async t => {
   const workflow = await read(".github/workflows/release.yml")
   const validate = workflow.split("\n  validate:\n")[1].split("\n  publish:\n")[0]
   assert.match(validate, /node release-policy\/scripts\/test-helpers\.mjs/)
   assert.doesNotMatch(validate, /node --test test\/smoke-measurements\.test\.mjs/)
   const policy = validate.split("      - name: Check out active validation policy\n")[1].split("\n      - ")[0]
   for (const file of [...inventory, "scripts/test-helpers.mjs", "scripts/helper-tests.json", "scripts/smoke-runtime.mjs",
-    "scripts/smoke-reviewer.mjs", "scripts/smoke-stages.mjs", "scripts/smoke-permissions.mjs", "scripts/smoke.mjs",
+    "scripts/smoke-reviewer.mjs", "scripts/smoke-notification-recorder.mjs", "scripts/smoke-stages.mjs", "scripts/smoke-permissions.mjs", "scripts/smoke.mjs",
     "test/release-fixture.mjs", "test/npm-cli-smoke.test.mjs", "package.json", "package-lock.json", "README.md", "AGENTS.md", ".github/workflows/ci.yml"]) {
     assert.ok(policy.includes(`/${file}\n`), `active policy checkout must include ${file}`)
   }
   assert.match(policy, /ref: \$\{\{ github\.workflow_sha \}\}/)
+  // Execute the planning entrypoints using only the actual sparse-checkout
+  // files. A full local checkout otherwise hides missing transitive imports.
+  const sparse = await mkdtemp(path.join(tmpdir(), "reviewer-sparse-policy-"))
+  t.after(() => rm(sparse, { recursive: true, force: true }))
+  for (const [, file] of policy.matchAll(/^\s+\/([^\s]+)$/gm)) {
+    const destination = path.join(sparse, file)
+    await mkdir(path.dirname(destination), { recursive: true })
+    await copyFile(new URL(`../${file}`, import.meta.url), destination)
+  }
+  for (const [script, scenario] of [["smoke.mjs", "auto-shell"], ["smoke-permissions.mjs", "mcp"]]) {
+    const plan = execFileSync(process.execPath, [path.join(sparse, "scripts", script), scenario, "--plan"], {
+      cwd: sparse, encoding: "utf8", timeout: 10000, env: { ...process.env, OPENCODE_BIN: "/no-host-required" },
+    })
+    assert.equal(typeof JSON.parse(plan), "object")
+  }
   const publish = workflow.split("\n  publish:\n")[1]
   assert.doesNotMatch(publish, /test-helpers|helper-tests\.json|npm run check|npm run test/)
 })

@@ -60,6 +60,7 @@ jobs:
             /scripts/github-release.mjs
             /scripts/smoke-runtime.mjs
             /scripts/smoke-reviewer.mjs
+            /scripts/smoke-notification-recorder.mjs
             /scripts/smoke-stages.mjs
             /scripts/smoke-permissions.mjs
             /scripts/smoke.mjs
