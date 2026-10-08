@@ -1,12 +1,12 @@
 {
   "name": "opencode-reviewer",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "license": "MIT",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
-  "description": "Safety reviews and optional one-time auto-approval for OpenCode shell, edit, MCP, custom-tool and directory permissions",
+  "description": "Safety reviews, optional one-time auto-approval and Linux desktop notifications for OpenCode permissions",
   "type": "module",
   "repository": {
     "type": "git",
@@ -64,6 +64,7 @@
     "@types/node": "24.12.2",
     "babel-preset-solid": "1.9.10",
     "esbuild": "0.28.2",
+    "mpg123-decoder": "1.0.3",
     "shell-quote": "1.12.0",
     "solid-js": "1.9.12",
     "tsx": "4.23.15",

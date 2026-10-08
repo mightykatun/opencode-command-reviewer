@@ -8,6 +8,11 @@ const prompts = Object.fromEntries(await Promise.all(
     name, (await readFile(new URL(`../${file}`, import.meta.url), "utf8")).trim(),
   ]),
 ))
+const sounds = Object.fromEntries(await Promise.all(
+  ["attention", "approved", "error", "ended"].map(async name => [name, {
+    format: "mp3", data: (await readFile(new URL(`../sounds/${name}.mp3`, import.meta.url))).toString("base64"),
+  }]),
+))
 
 await build({
   entryPoints: ["src/tui.tsx"],
@@ -16,9 +21,22 @@ await build({
   platform: "node",
   format: "esm",
   target: "es2023",
-  define: { __REVIEW_PROMPTS__: JSON.stringify(prompts) },
+  define: { __REVIEW_PROMPTS__: JSON.stringify(prompts), __REVIEW_SOUNDS__: JSON.stringify(sounds) },
   external: ["solid-js", "solid-js/*", "@opentui/*", "@opencode-ai/*"],
   plugins: [{
+    name: "notification-decoder-only",
+    setup(builder) {
+      // Pinned decoder entrypoints import unused worker adapters with native
+      // CommonJS initialization. Bundle only the public synchronous API used by
+      // notifications; decoder implementation/WASM remain unchanged.
+      builder.onLoad({ filter: /node_modules\/mpg123-decoder\/index\.js$/ }, () => ({
+        contents: 'export { default as MPEGDecoder } from "./src/MPEGDecoder.js"', loader: "js",
+      }))
+      builder.onLoad({ filter: /node_modules\/@wasm-audio-decoders\/common\/index\.js$/ }, () => ({
+        contents: 'export { default as WASMAudioDecoderCommon } from "./src/WASMAudioDecoderCommon.js"', loader: "js",
+      }))
+    },
+  }, {
     name: "opentui-solid",
     setup(builder) {
       builder.onLoad({ filter: /\.tsx$/ }, async ({ path }) => {

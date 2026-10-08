@@ -1,7 +1,8 @@
 import type { Limits } from "./types.js"
 import path from "node:path"
+import { parseNotificationConfig, type NotificationConfig } from "./notification-config.js"
 
-export interface Config extends Limits {
+export interface Config extends Limits, NotificationConfig {
   baseURL: string
   model: string
   apiKey?: string
@@ -21,7 +22,7 @@ export interface Config extends Limits {
 }
 
 export function parseConfig(options: Record<string, unknown> = {}): Config {
-  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "stream", "reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "extraCareful", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes"])
+  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "stream", "reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "extraCareful", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes", "notify", "notifySound", "notificationSoundDirectory"])
   for (const key of Object.keys(options)) if (!keys.has(key)) throw new Error(`Unknown opencode-reviewer setting: ${key}`)
   const text = (name: string, optional = false): string | undefined => {
     const value = options[name]
@@ -54,6 +55,7 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     throw new Error("instructions must be an absolute prompt-directory path; inline instructions are no longer supported")
   }
   return {
+    ...parseNotificationConfig(options),
     baseURL: url.href.replace(/\/+$/, ""),
     model: text("model")!, apiKeyEnv,
     apiKey: text("apiKey", true),

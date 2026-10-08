@@ -7,6 +7,7 @@ import { withDeadline } from "./reviewer.js"
 import { candidateEnabled, type ReviewOptions } from "./classification.js"
 import type { SessionModeGate } from "./session-mode.js"
 import { SCANNER_INTERVAL_MS } from "./appearance.js"
+import { remainingTime } from "./deadline.js"
 
 export type AutoApproval = { status: "countdown"; seconds: number } | { status: "checking" | "allowing" | "cancelled" | "failed" }
 
@@ -17,6 +18,7 @@ export interface View {
   progress?: ReviewProgress
   error?: string
   autoApproval?: AutoApproval
+  approvalPendingConfirmed?: boolean
 }
 
 type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void, onProgress: (progress: ReviewProgress) => void) => Promise<ReviewResult | null>
@@ -35,11 +37,15 @@ const clock: ApprovalClock = {
   now: () => performance.now(),
   after: (ms, callback) => { const timer = setTimeout(callback, ms); return () => clearTimeout(timer) },
 }
+const permissionResolved = Object.freeze({ reason: "permission resolved" })
 type Options = ReviewOptions & Partial<Pick<Config, "autoApprove" | "autoApproveDelaySeconds" | "stream">>
 export interface Approval extends ApprovalTransport {
   /** Recompute actual presentation/order, rather than trusting a stale UI effect. */
   visibleID(): string | undefined
 }
+
+export type ApprovalFact = { type: "dispatched" | "confirmed" | "settled"; request: PermissionRequest; automatic: boolean }
+export type ApprovalObserver = (fact: ApprovalFact) => unknown
 
 /** Reviews remain advisory unless explicitly configured with a once-only writer. */
 export class Controller {
@@ -50,12 +56,19 @@ export class Controller {
   private modeChanges = new Map<string, number>()
   private manual = new Map<string, "cancelled" | "failed">()
   private workers = new Set<Promise<unknown>>()
+  private acknowledgements = new Map<AbortController, PermissionRequest>()
+  private approvalWorkers = new Set<Promise<unknown>>()
   constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
     private options: Options = { reviewBash: true, reviewEdits: true },
-    private approval?: Approval, private time: ApprovalClock = clock, private modes?: SessionModeGate) {}
+    private approval?: Approval, private time: ApprovalClock = clock, private modes?: SessionModeGate,
+    private approvalObserver?: ApprovalObserver) {}
   get revision() { return this.version }
   get views() { return [...this.entries.values()].map((entry) => entry.view) }
   private publish() { if (!this.stopped) this.changed(this.views) }
+  private approvalFact(fact: ApprovalFact) {
+    if (this.stopped) return
+    try { void Promise.resolve(this.approvalObserver?.(fact)).catch(() => {}) } catch {}
+  }
 
   /** Local state is already switched; invalidate snapshots before any publication. */
   modeChanged(root: string) {
@@ -87,8 +100,11 @@ export class Controller {
     }
     const entry = id ? this.entries.get(id) : undefined
     if (!entry || entry.view.autoApproval || !this.eligible(entry)) return
-    entry.deadline = this.time.now() + (this.options.autoApproveDelaySeconds ?? 15) * 1000
-    entry.view = { ...entry.view, autoApproval: { status: "countdown", seconds: this.options.autoApproveDelaySeconds ?? 15 } }
+    const seconds = this.options.autoApproveDelaySeconds ?? 15
+    // Hold the configured starting number for one extra second so the first
+    // rendered countdown value is observable. Zero remains an immediate attempt.
+    entry.deadline = this.time.now() + (seconds + (seconds > 0 ? 1 : 0)) * 1000
+    entry.view = { ...entry.view, autoApproval: { status: "countdown", seconds } }
     this.publish()
     // Even zero delay goes through the same cancellable single-flight path.
     this.schedule(entry)
@@ -176,15 +192,18 @@ export class Controller {
       entry.cancelTimer = undefined
       if (!this.active(entry) || entry.view.autoApproval?.status !== "countdown") return
       if (!this.eligible(entry)) { this.cancelAutoApproval(entry.view.request.id); return }
-      const seconds = Math.max(0, Math.ceil((entry.deadline! - this.time.now()) / 1000))
-      if (seconds === 0) { void this.approveNow(entry.view.request.id); return }
-      entry.view = { ...entry.view, autoApproval: { status: "countdown", seconds } }
-      this.publish()
+      const seconds = Math.min(this.options.autoApproveDelaySeconds ?? 15,
+        Math.max(0, Math.ceil((entry.deadline! - this.time.now()) / 1000)))
+      if (seconds === 0) { void this.approveNow(entry.view.request.id, true); return }
+      if (entry.view.autoApproval.seconds !== seconds) {
+        entry.view = { ...entry.view, autoApproval: { status: "countdown", seconds } }
+        this.publish()
+      }
       this.schedule(entry)
     })
   }
 
-  async approveNow(id: string) {
+  async approveNow(id: string, automatic = false) {
     const entry = this.entries.get(id)
     if (!entry || entry.view.autoApproval?.status !== "countdown" || !this.approval) return
     if (!this.eligible(entry)) { this.cancelAutoApproval(id); return }
@@ -193,6 +212,7 @@ export class Controller {
     entry.approvalAbort = new AbortController()
     entry.view = { ...entry.view, autoApproval: { status: "checking" } }
     this.publish()
+    let dispatched = false
     try {
       await withDeadline(AbortSignal.any([entry.abort.signal, entry.approvalAbort.signal]), 5000, async (signal) => {
         const revision = this.version
@@ -216,7 +236,31 @@ export class Controller {
           return
         }
         this.manual.set(id, "failed") // A dispatched write must never be tried again after a mode switch.
-        await this.approval!.once(entry.view.request, signal)
+        const remaining = remainingTime(signal)
+        this.approvalFact({ type: "dispatched", request: entry.view.request, automatic })
+        signal.throwIfAborted()
+        dispatched = true
+        const acknowledgement = new AbortController()
+        this.acknowledgements.set(acknowledgement, entry.view.request)
+        const abort = () => { if (signal.reason !== permissionResolved) acknowledgement.abort(signal.reason) }
+        signal.addEventListener("abort", abort, { once: true })
+        if (signal.aborted) abort()
+        // Native reply events are confirmation of resolution, not attribution.
+        // Keep this same dispatched POST's acknowledgement alive through the
+        // remaining original deadline, never resend or infer success from idle.
+        const write = withDeadline(acknowledgement.signal, remaining, async (bounded) => {
+          try {
+            await this.approval!.once(entry.view.request, bounded)
+            if (!bounded.aborted) this.approvalFact({ type: "confirmed", request: entry.view.request, automatic })
+          } finally {
+            this.acknowledgements.delete(acknowledgement)
+            signal.removeEventListener("abort", abort)
+            this.approvalFact({ type: "settled", request: entry.view.request, automatic })
+          }
+        })
+        this.approvalWorkers.add(write)
+        void write.then(() => this.approvalWorkers.delete(write), () => this.approvalWorkers.delete(write))
+        await write
         signal.throwIfAborted()
         this.replied(id)
       })
@@ -232,7 +276,7 @@ export class Controller {
         const pending = await withDeadline(entry.abort.signal, 5000, (signal) => this.approval!.list(signal))
         this.reconcile(pending, revision)
       } catch { /* Periodic read-only reconciliation remains active. */ }
-    }
+    } finally { if (!dispatched) this.approvalFact({ type: "settled", request: entry.view.request, automatic }) }
   }
 
   asked(request: PermissionRequest) {
@@ -294,14 +338,14 @@ export class Controller {
     void worker.finally(() => this.workers.delete(worker))
   }
 
-  replied(id: string) {
+  replied(id: string, resolved = true) {
     if (this.stopped) return
     // Increment even for an unknown ID: an in-flight snapshot may still contain it.
     this.version++
     this.entries.get(id)?.cancelTimer?.()
     const entry = this.entries.get(id)
     if (entry) this.clearProgress(entry)
-    this.entries.get(id)?.abort.abort()
+    this.entries.get(id)?.abort.abort(resolved ? permissionResolved : undefined)
     this.manual.delete(id)
     if (this.entries.delete(id)) this.publish()
   }
@@ -310,7 +354,8 @@ export class Controller {
     if (this.stopped) return
     // A startup snapshot may contain requests for a session not yet tracked here.
     this.version++
-    for (const entry of this.entries.values()) if (entry.view.request.sessionID === sessionID) this.replied(entry.view.request.id)
+    for (const [abort, request] of this.acknowledgements) if (request.sessionID === sessionID) abort.abort()
+    for (const entry of this.entries.values()) if (entry.view.request.sessionID === sessionID) this.replied(entry.view.request.id, false)
   }
 
   /** Reject stale HTTP snapshots if permission events arrived during the request. */
@@ -320,6 +365,10 @@ export class Controller {
     for (const id of this.entries.keys()) if (!ids.has(id)) this.replied(id)
     for (const request of requests) {
       const entry = this.entries.get(request.id)
+      if (entry?.view.autoApproval?.status === "failed" && !entry.view.approvalPendingConfirmed) {
+        entry.view = { ...entry.view, approvalPendingConfirmed: true }
+        this.publish()
+      }
       if (entry && !entry.root) entry.gateRevision = this.version
       if (entry?.view.status === "suspended" && (entry.suspension === "unavailable" || !entry.root || this.modes?.enabled(entry.root))) {
         // A failed saved-mode read is unknown, not a cached disabled choice.
@@ -332,9 +381,11 @@ export class Controller {
 
   async dispose() {
     this.stopped = true
+    for (const abort of this.acknowledgements.keys()) abort.abort()
     for (const entry of this.entries.values()) { entry.cancelTimer?.(); this.clearProgress(entry); entry.abort.abort() }
     this.entries.clear()
     await Promise.allSettled([...this.workers])
+    await Promise.allSettled([...this.approvalWorkers])
     this.manual.clear()
   }
 }

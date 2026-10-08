@@ -7,6 +7,7 @@ import path from "node:path"
 import { tmpdir } from "node:os"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { notificationRecorder, assertNotificationAudio } from "./smoke-notification-recorder.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
 const host = process.env.OPENCODE_BIN ?? "opencode"
@@ -19,6 +20,8 @@ await mkdir(path.join(temp, "config"))
 execFileSync("git", ["init", "--quiet", project])
 const plugin = path.join(temp, "reviewer.mjs")
 await copyFile(path.join(root, "dist/tui.js"), plugin)
+const notifications = process.argv.includes("--notifications")
+const notificationRecords = notifications ? await notificationRecorder(plugin, temp) : undefined
 await writeFile(path.join(project, "fixture.py"), 'from pathlib import Path\nPath("executed").write_text("unexpected")\n')
 const calls = [], reviews = []
 let aborted = false, release, sequence = 0, sessionID
@@ -97,7 +100,7 @@ try {
       models: { fixture: { name: "Fixture", limit: { context: 32000, output: 1000 } } } } } }
   const tuiFile = path.join(temp, "tui.json")
   await writeFile(tuiFile, JSON.stringify({ $schema: "https://opencode.ai/tui.json", plugin: [[plugin, {
-    baseURL: `http://127.0.0.1:${port}/review`, model: "fixture", autoApprove: true, autoApproveDelaySeconds: 8,
+    notify: notifications, baseURL: `http://127.0.0.1:${port}/review`, model: "fixture", autoApprove: true, autoApproveDelaySeconds: 8,
   }]] }))
   const env = { HOME: temp, XDG_CONFIG_HOME: path.join(temp, "config"), XDG_DATA_HOME: path.join(temp, "data"),
     XDG_STATE_HOME: path.join(temp, "state"), XDG_CACHE_HOME: path.join(temp, "cache"),
@@ -113,6 +116,7 @@ try {
   const before = mainCount()
   await palette(false)
   await until((s) => aborted && !s.includes("Permission analysis") && s.includes("Permission required"))
+  if (notificationRecords) await until(async () => (await notificationRecords()).some(r => r.event === "notification" && r.title === "Session needs attention"))
   release()
   await sleep(300)
   await save("disabled-in-flight")
@@ -154,6 +158,12 @@ try {
   send("Enter")
   await until((s) => s.includes("Permission required"), 90000)
   await sleep(2300)
+  if (notificationRecords) {
+    const records = await notificationRecords()
+    const latestAsk = records.findLast(r => r.event === "permission.asked")
+    assert.ok(records.some(r => r.event === "notification" && r.title === "Session needs attention" && r.at >= latestAsk.at),
+      "a new permission in a resumed disabled conversation must still notify without review")
+  }
   assert.equal(reviews.length, 3, "resumed disabled root must not call the reviewer")
   assert.doesNotMatch(capture(), /Permission analysis|Allowed in/)
   await save("resumed-disabled")
@@ -171,6 +181,12 @@ try {
   }
   await writeFile(path.join(root, ".runtime/session-mode-results.json"), JSON.stringify({ version, reviews: reviews.length,
     aborted, persisted: true, resumedRoot: true, localCommandsOnly: true, tombstoneSurvived: true, temp }, null, 2))
+  if (notificationRecords) {
+    const records = await notificationRecords()
+    assertNotificationAudio(assert, records)
+    await writeFile(path.join(root, ".runtime/session-mode-notifications.json"), JSON.stringify(records, null, 2))
+    console.log("PASS session-mode notifications: disabled in-flight review and resumed disabled conversation both require attention without model calls")
+  }
   console.log(`PASS session-mode: in-flight HTTP abort, palette enable/disable, slash local action, countdown tombstone, atomic persistence and real host resume; ${reviews.length} reviews. Isolated files: ${temp}`)
 } catch (error) {
   try { screen = capture() } catch {}

@@ -9,6 +9,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { smokeMetrics, smokeRuntime } from "./smoke-runtime.mjs"
 import { reviewerAudit, sendReviewStream } from "./smoke-reviewer.mjs"
 import { permissionStagePlan, runPermissionStages } from "./smoke-stages.mjs"
+import { notificationRecorder, assertNotificationAudio } from "./smoke-notification-recorder.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
 const scenario = process.argv[2] ?? "mcp"
@@ -34,6 +35,7 @@ const target = path.join(outside, "note.txt")
 await writeFile(target, "before fixture\n")
 const plugin = path.join(temp, "reviewer.mjs")
 await copyFile(path.join(root, "dist/tui.js"), plugin)
+const notificationRecords = flag("notifications") ? await notificationRecorder(plugin, temp) : undefined
 const tool = scenario === "mcp" ? "fixture_inspect" : scenario === "mcp-resource" ? "read_mcp_resource"
   : custom ? "local_demo" : patch ? "apply_patch" : scenario === "external-search" ? "grep" : scenario === "external-edit" ? "edit" : "read"
 const input = scenario === "mcp" ? { target: "fixture://remote/item" } : scenario === "mcp-resource" ? { server: mcpName, uri: resourceURI }
@@ -89,6 +91,7 @@ const server = createServer(async (req, res) => {
     }
     requests.push({ url: req.url, body })
     if (req.url === "/review/chat/completions") {
+      const previousNotifications = notificationRecords ? (await notificationRecords()).filter(r => r.event === "notification").length : 0
       const observation = audit.request(req.method, text)
       assert.equal(body.messages[0].content.includes("Take extra care"), auto && !flag("no-extra-careful"),
         "extra-careful guidance follows its switch independently of auto-approval")
@@ -106,6 +109,9 @@ const server = createServer(async (req, res) => {
         await sendReviewStream(res, { content, usage, observation,
           phase: (event) => metrics.mark(event, reviews().length),
           beforeTerminal: async () => {
+            if (notificationRecords && scenario === "mcp") assert.equal(
+              (await notificationRecords()).filter(r => r.event === "notification").length, previousNotifications,
+              "streamed previews and corrections must not emit attention/countdown notifications before terminal validation")
             if (mcp) assert.equal(executions, 0, "MCP cannot execute before terminal review completion")
             if (custom) await assert.rejects(readFile(path.join(project, "executions")))
             if (directory) assert.equal(await readFile(target, "utf8"), "before fixture\n", "directory/edit/patch cannot modify the target from a preview")
@@ -171,7 +177,7 @@ try {
   if (!flag("unpriced")) config.provider.review = { npm: "@ai-sdk/openai-compatible", options: { baseURL: `http://127.0.0.1:${port}/review` },
     models: { review: { name: "Review", limit: { context: 32000, output: 1000 }, cost: { input: 1, output: 2, cache_read: 0, cache_write: 0 } } } }
   const tui = path.join(temp, "tui.json")
-  await writeFile(tui, JSON.stringify({ theme: "opencode", plugin: [[plugin, { baseURL: `http://127.0.0.1:${port}/review`, model: "review",
+  await writeFile(tui, JSON.stringify({ theme: "opencode", plugin: [[plugin, { notify: flag("notifications"), baseURL: `http://127.0.0.1:${port}/review`, model: "review",
     ...plan.settings, autoApprove: auto, ...(flag("no-extra-careful") ? { extraCareful: false } : {}), autoApproveDelaySeconds: 2, stream }]] }))
   const env = { HOME: temp, XDG_CONFIG_HOME: path.join(temp, "config"), XDG_DATA_HOME: path.join(temp, "data"), XDG_STATE_HOME: path.join(temp, "state"), XDG_CACHE_HOME: path.join(temp, "cache"),
     OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_CONFIG: "", OPENCODE_CONFIG_DIR: path.join(temp, "config"), OPENCODE_TUI_CONFIG: tui,
@@ -347,6 +353,21 @@ try {
   audit.verify(plan.reviewKinds, plan.attemptsPerReview)
   assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)
   await writeFile(path.join(root, `.runtime/permission-${tag}-requests.json`), JSON.stringify({ requests, rpc }, null, 2))
+  if (notificationRecords) {
+    await sleep(500)
+    const records = await notificationRecords()
+    const banners = records.filter(record => record.event === "notification")
+    assert.ok(banners.length)
+    assert.ok(banners.every(record => record.summary === "Opencode"))
+    if (auto && !flag("unsafe") && !flag("error") && !flag("cancel")) {
+      assert.equal(banners.filter(record => record.title.startsWith("Reviewer will approve permission")).length, plan.reviewKinds.length)
+      assert.equal(banners.filter(record => record.title === "Reviewer approved a permission").length, plan.reviewKinds.length)
+      assert.ok(records.some(record => record.event === "sound" && record.kind === "approved"))
+    }
+    assertNotificationAudio(assert, records)
+    await writeFile(path.join(root, `.runtime/permission-${tag}-notifications.json`), JSON.stringify(records, null, 2))
+    console.log(`PASS ${tag} notifications: ${banners.map(record => record.title).join("; ")}`)
+  }
   console.log(`PASS ${tag}: real native ${tool}, correct evidence/prompt routing, ${reviews().length} reviewer attempts, once-only fixture completion and panel cleanup. ${temp}`)
   outcome = "passed"
 } catch (error) {

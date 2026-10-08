@@ -2,7 +2,8 @@
 
 Reviews pending permissions in the OpenCode sidebar using a separate LLM. Covers
 shell commands, file edits, MCP calls, custom tools, and external-directory access.
-Supports streaming explanations and optional one-time auto-approval.
+Supports streaming explanations, optional one-time auto-approval, and
+reviewer-aware Linux desktop notifications with distinct sounds.
 
 Requires OpenCode 1.18.35 on Linux.
 
@@ -32,6 +33,9 @@ OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-revie
         "autoApprove": false,
         "extraCareful": true,
         "autoApproveDelaySeconds": 15,
+        "notify": true,
+        "notifySound": true,
+        "notificationSoundDirectory": "/absolute/path/to/notification-sounds",
         "formatRetries": 1,
         "timeoutMs": 30000,
         "maxFiles": 6,
@@ -48,7 +52,8 @@ at that endpoint.
 
 Replace `apiKey`, or remove it and set the variable named by `apiKeyEnv` before
 launching OpenCode. The inline key takes precedence. Omit both for an unauthenticated
-endpoint. Remove `instructions` to use the built-in prompts.
+endpoint. Remove `instructions` to use the built-in prompts and
+`notificationSoundDirectory` to use the bundled sounds.
 
 The remaining values above are the defaults. Restart OpenCode after changing
 configuration. Reviews run when OpenCode asks for permission, so set the relevant
@@ -67,6 +72,9 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 | `autoApprove` | Allow completed Safe reviews once after the visible countdown. |
 | `extraCareful` | Include the extra-careful prompt in auto-mode reviews. Defaults to `true`; set `false` to omit it. |
 | `autoApproveDelaySeconds` | Countdown duration, 0–3600 seconds. |
+| `notify` | Linux desktop notifications and sounds. Defaults to `true`; set `false` to disable both. |
+| `notifySound` | Play notification sounds. Defaults to `true`; set `false` to keep banners silent. |
+| `notificationSoundDirectory` | Absolute custom sound directory. Use `attention`, `approved`, `error`, and `ended` basenames with `.wav` or `.mp3`; WAV takes precedence. Missing or unusable files fall back to bundled sounds. |
 | `formatRetries` | Additional attempts to correct malformed assessment JSON, 0–100. |
 | `timeoutMs` | Total review deadline, 1–3,600,000 ms. |
 | `maxFiles` | File limit per review, 1–1,000. |
@@ -88,6 +96,8 @@ During an auto-approval countdown, click the countdown to allow once immediately
 or Cancel to leave the request manual. Hiding or covering the panel also cancels
 that request's countdown. Cancel before using native Allow always or rejection
 forms; those forms alone do not stop the countdown.
+Positive countdowns hold their configured starting number for one extra second
+before counting down. A zero-second setting still approves without that hold.
 
 `/reviewer-disable` and `/reviewer-enable` control the current conversation and its
 descendants. The setting is saved for resume. Both commands are also in the command
@@ -104,6 +114,50 @@ Reviews send the pending request, latest user prompt, project context, and relev
 file snapshots, diffs, or tool arguments to your endpoint before approval. Shell
 file snapshots can follow symlinks outside the project. Missing evidence is noted
 in the report; ratings are advice based on the supplied evidence.
+
+### Desktop notifications
+
+Transient banners have an **Opencode** heading and a small status icon: green
+checkmark for approvals, orange exclamation mark for attention/countdowns, red X
+for errors, and a neutral code mark for completed responses. GNOME controls the
+heading's font weight. The event
+message and conversation title appear beneath it, even while the terminal is focused.
+An explicit separator keeps them distinct on desktops that flatten banner text:
+
+- **Session needs attention:** questions and manual permissions. Reviewed requests
+  wait for a final validated assessment; failures, canceled automation, and a Safe
+  review blocked from starting its countdown also notify. Unreviewed requests
+  notify immediately, including when conversation review is disabled.
+- **Reviewer will approve permission in X s:** one announcement when a positive
+  countdown starts, using the attention sound. Confirmed automatic approval then
+  sends **Reviewer approved a permission** with the approval sound. Zero delay
+  sends only the confirmed approval notification. Approval sounds are limited to
+  one every two seconds; every eligible banner is retained for delivery.
+- **Session error:** an unrecovered session/provider failure, not a review failure.
+- **Session ended:** a completed root-agent response, not a question/permission
+  pause or an explicit user interruption.
+
+Notifications cover conversations visited in this terminal and their descendants.
+Existing pending requests at startup/resume are not replayed. Clicking can select
+the originating GNOME Terminal tab and root conversation. Native input prompts
+cover root/direct-child requests in the supported host. Open dialogs are
+left intact; other terminals still receive banners and sounds. Desktop policies
+control expiry/history and whether activation actually brings a window forward.
+GNOME Terminal clicks use the desktop activation token to bring the correct tab
+forward across workspaces. GNOME may attribute the notification source to Terminal;
+the banner heading remains Opencode.
+
+Linux delivery uses `notify-send`, `stdbuf`, and `gdbus`; audio uses `paplay` or `pw-play`.
+On Ubuntu, `libnotify-bin`, `coreutils`, `libglib2.0-bin`, and `pulseaudio-utils` provide these
+utilities. The MP3 decoder and four default sounds are bundled; FFmpeg is not
+required. MP3 and mono/stereo PCM/float WAV files up to 4 MiB and 10 seconds are
+normalized toward -20 dBFS RMS with a -3 dBFS peak ceiling before playback.
+Custom sounds are loaded on first use; restart after replacing them.
+Audio is prepared before showing its banner and played from the normalized cache
+with a low-latency buffer; preparation never blocks permission approval.
+`stdbuf` makes delivery acknowledgements immediate instead of waiting for
+`notify-send` to flush its output when the banner closes.
+Disable overlapping notification plugins to avoid duplicate alerts.
 
 ## Development
 

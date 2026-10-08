@@ -241,7 +241,7 @@ try {
       models: { fixture: { name: "Fixture", limit: { context: 32000, output: 1000 } } } } } }
   const tuiFile = path.join(temp, "tui.json")
   await writeFile(tuiFile, JSON.stringify({ $schema: "https://opencode.ai/tui.json", plugin: [[plugin, {
-    baseURL: `http://127.0.0.1:${port}/review`, model: "fixture", stream: streaming, timeoutMs: 120000,
+    notify: false, baseURL: `http://127.0.0.1:${port}/review`, model: "fixture", stream: streaming, timeoutMs: 120000,
     autoApprove: true, autoApproveDelaySeconds: delay,
   }]] }))
   const env = { HOME: temp, XDG_CONFIG_HOME: path.join(temp, "config"), XDG_DATA_HOME: path.join(temp, "data"),

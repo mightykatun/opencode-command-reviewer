@@ -10,11 +10,13 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { smokeMetrics, smokeRuntime } from "./smoke-runtime.mjs"
 import { reviewerAudit, assertReviewerReuse } from "./smoke-reviewer.mjs"
 import { reviewStagePlan } from "./smoke-stages.mjs"
+import { notificationRecorder, assertNotificationAudio } from "./smoke-notification-recorder.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
 const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
 const scenario = process.argv[2] ?? "correction"
 const measureReuse = process.argv.includes("--measure-reuse")
+const notifications = process.argv.includes("--notifications")
 if (measureReuse) assert.equal(scenario, "external", "reuse baseline uses the two-stage external fixture")
 assert.ok(["correction", "cancel", "error", "stalled-file", "external", "edit", "write", "patch", "edit-cancel", "edit-config-error", "edit-disabled", "bash-disabled", "external-disabled", "auto-shell", "auto-cancel", "auto-scroll", "auto-edit", "auto-external", "auto-immediate", "auto-zero", "auto-unsafe", "auto-error", "auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow", "auto-manual", "auto-initially-hidden"].includes(scenario))
 const auto = scenario.startsWith("auto-")
@@ -119,6 +121,7 @@ const temp = await mkdtemp(path.join(tmpdir(), "opencode-reviewer-"))
 // Load the built plugin away from the checkout to catch unbundled source assets.
 const pluginFile = path.join(temp, "reviewer.mjs")
 await copyFile(path.join(root, "dist/tui.js"), pluginFile)
+const notificationRecords = notifications ? await notificationRecorder(pluginFile, temp) : undefined
 const project = path.join(temp, "project")
 await mkdir(project)
 execFileSync("git", ["init", "--quiet", project])
@@ -289,7 +292,7 @@ try {
   await writeFile(tuiFile, JSON.stringify({
     $schema: "https://opencode.ai/tui.json",
     theme: scenario === "correction" ? "tokyonight" : "opencode",
-    plugin: [[pluginFile, { baseURL: `http://127.0.0.1:${reviewPort}/review`, model: "review-fixture", apiKey: "fixture-review-key",
+    plugin: [[pluginFile, { notify: notifications, baseURL: `http://127.0.0.1:${reviewPort}/review`, model: "review-fixture", apiKey: "fixture-review-key",
       ...plan.settings,
       ...(scenario === "edit" || configFailure ? { instructions: customPrompts } : {}),
       ...(scenario === "patch" ? { maxFiles: 2 } : {}),
@@ -990,6 +993,33 @@ try {
   audit.verify(plan.reviewKinds, plan.attemptsPerReview)
   assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)
   if (measureReuse) assertReviewerReuse(metrics.snapshot())
+  if (notificationRecords) {
+    if (["auto-shell", "auto-edit", "auto-external", "auto-scroll"].includes(scenario)) {
+      await until(async () => (await notificationRecords()).some(record => record.event === "sound" && record.kind === "ended"), 10000)
+    } else await sleep(500)
+    const records = await notificationRecords()
+    const banners = records.filter(record => record.event === "notification")
+    assert.ok(banners.length, "the real host must emit a notification")
+    const countdowns = banners.filter(record => record.title.startsWith("Reviewer will approve permission"))
+    const approvals = banners.filter(record => record.title === "Reviewer approved a permission")
+    const attention = banners.filter(record => record.title === "Session needs attention")
+    if (["auto-shell", "auto-edit", "auto-external", "auto-scroll"].includes(scenario)) {
+      assert.equal(countdowns.length, plan.reviewKinds.length)
+      assert.equal(approvals.length, plan.reviewKinds.length)
+      assert.equal(attention.length, 0)
+      assert.ok(banners.some(record => record.title === "Session ended"))
+    } else if (scenario === "auto-zero") {
+      assert.equal(countdowns.length, 0); assert.equal(approvals.length, 1); assert.equal(attention.length, 0)
+    } else if (["auto-unsafe", "auto-error", "error", "bash-disabled", "edit-disabled", "external-disabled", "correction"].includes(scenario)) {
+      assert.ok(attention.length >= 1); assert.equal(countdowns.length, 0); assert.equal(approvals.length, 0)
+    } else if (["auto-cancel", "auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow"].includes(scenario)) {
+      assert.equal(countdowns.length, 1); assert.equal(attention.length, 1); assert.equal(approvals.length, 0)
+      assert.ok(records.some(record => record.event === "withdraw" && record.id === countdowns[0].id))
+    }
+    assertNotificationAudio(assert, records)
+    await writeFile(path.join(root, `.runtime/${scenario}-notifications.json`), JSON.stringify(records, null, 2))
+    console.log(`PASS ${scenario} notifications: ${banners.map(record => record.title).join("; ")}; bundled normalized audio observed.`)
+  }
   outcome = "passed"
 } catch (error) {
   await mkdir(path.join(root, ".runtime"), { recursive: true })

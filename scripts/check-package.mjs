@@ -13,6 +13,12 @@ const digest = async () => createHash("sha256").update(await readFile("dist/tui.
 const first = await digest()
 execFileSync(process.execPath, ["scripts/build.mjs"], { stdio: "inherit" })
 assert.equal(await digest(), first, "two builds must produce identical bundles")
+const bundle = await readFile("dist/tui.js", "utf8")
+for (const kind of ["attention", "approved", "error", "ended"]) {
+  assert.ok(bundle.includes((await readFile(`sounds/${kind}.mp3`)).toString("base64")), `bundle must contain the exact supplied ${kind} sound`)
+}
+assert.ok(bundle.includes("mpeg_frame_decoder_create"), "MP3 decoding must be bundled")
+assert.ok(!bundle.includes('"worker_threads"'), "unused MP3 worker adapters must not enter the package")
 const manifest = JSON.parse(await readFile("package.json", "utf8"))
 const lock = JSON.parse(await readFile("package-lock.json", "utf8"))
 assert.equal(lock.name, manifest.name, "lockfile name must match package.json")

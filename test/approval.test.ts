@@ -1,5 +1,6 @@
 import { test, type TestContext } from "node:test"
 import assert from "node:assert/strict"
+import { remainingTime } from "../src/deadline.js"
 import { setImmediate as settle } from "node:timers/promises"
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
@@ -153,6 +154,8 @@ test("countdown starts only after completed Safe assessment AND a subsequent dis
   f.present()
   assert.deepEqual(f.view()?.autoApproval, { status: "countdown", seconds: 15 })
   f.clock.jump(1000)
+  assert.deepEqual(f.view()?.autoApproval, { status: "countdown", seconds: 15 })
+  f.clock.jump(1000)
   assert.deepEqual(f.view()?.autoApproval, { status: "countdown", seconds: 14 })
   f.present()
   f.clock.jump(13_001)
@@ -169,7 +172,7 @@ test("a late monotonic clock jump expires the original deadline instead of exten
   const f = fixture(t, { options: { autoApproveDelaySeconds: 3 } })
   await f.add()
   f.present()
-  f.clock.jump(2500)
+  f.clock.jump(3500)
   assert.deepEqual(f.view()?.autoApproval, { status: "countdown", seconds: 1 })
   f.present()
   f.clock.jump(20_000)
@@ -177,6 +180,26 @@ test("a late monotonic clock jump expires the original deadline instead of exten
   assert.equal(f.reads.length, 1)
   assert.equal(f.writes.length, 1)
   assert.equal(f.clock.pending, 0)
+})
+
+for (const delay of [1, 5, 3600]) test(`${delay}-second countdown retains its starting number through the extra initial hold`, async t => {
+  const f = fixture(t, { options: { autoApproveDelaySeconds: delay } })
+  await f.add(); f.present()
+  const displayed = () => f.view()?.autoApproval
+  assert.deepEqual(displayed(), { status: "countdown", seconds: delay })
+  f.clock.jump(1000)
+  assert.deepEqual(displayed(), { status: "countdown", seconds: delay })
+  assert.equal(f.writes.length, 0)
+  if (delay > 1) {
+    f.clock.jump(1000)
+    assert.deepEqual(displayed(), { status: "countdown", seconds: delay - 1 })
+    f.clock.jump((delay - 1) * 1000 - 1)
+  } else f.clock.jump(999)
+  assert.equal(f.writes.length, 0)
+  f.clock.jump(1); await settle()
+  assert.equal(f.writes.length, 1)
+  assert.equal(f.view(), undefined)
+  assert.ok(f.publications.every(views => views.every(view => view.autoApproval?.status !== "countdown" || view.autoApproval.seconds <= delay)))
 })
 
 test("zero delay is deferred and still verifies a fresh request before allowing once", async (t) => {
@@ -199,7 +222,8 @@ test("zero delay is deferred and still verifies a fresh request before allowing 
   assert.equal(f.view()?.autoApproval?.status, "allowing")
   assert.equal(f.reads.length, 1)
   assert.deepEqual(f.writes.map((item) => item.request), [original])
-  assert.equal(f.reads[0], f.writes[0]?.signal, "read and write share the verification deadline")
+  assert.ok(remainingTime(f.writes[0]!.signal) <= remainingTime(f.reads[0]!) + 1,
+    "separate acknowledgement signal retains only the original verification time")
   reply.resolve()
   await settle()
   assert.equal(f.view(), undefined)
@@ -210,7 +234,7 @@ for (const delay of [0, 15]) test(`cancel beats an already queued ${delay}-secon
   const f = fixture(t, { options: { autoApproveDelaySeconds: delay } })
   await f.add()
   f.present()
-  const queued = f.clock.dequeueAfter(delay * 1000)
+  const queued = f.clock.dequeueAfter((delay + (delay > 0 ? 1 : 0)) * 1000)
   assert.equal(queued.length, 1)
   f.controller.cancelAutoApproval("b-review")
   for (const callback of queued) callback()
@@ -236,6 +260,8 @@ test("shared-tool directory, bash and edit stages require their own native-first
     f.clock.jump(30_000)
     assert.equal(f.reads.length, index, "waiting while queued must not consume this ID's delay")
     f.present()
+    f.clock.jump(1000)
+    assert.deepEqual(f.view(req.id)?.autoApproval, { status: "countdown", seconds: 2 })
     f.clock.jump(1000)
     assert.deepEqual(f.view(req.id)?.autoApproval, { status: "countdown", seconds: 1 })
     assert.equal(f.writes.length, index)
@@ -319,7 +345,7 @@ for (const notified of [true, false]) test(`hidden countdown cancels ${notified 
   f.present()
   f.host.shown = false
   if (notified) f.present()
-  f.clock.jump(15_000)
+  f.clock.jump(16_000)
   await settle()
   assert.equal(f.view()?.autoApproval?.status, "cancelled")
   f.host.shown = true
@@ -362,7 +388,7 @@ for (const removal of ["reply", "delete", "dispose"] as const) test(`${removal} 
   const f = fixture(t)
   await f.add()
   f.present()
-  const queued = f.clock.dequeueAfter(15_000)
+  const queued = f.clock.dequeueAfter(16_000)
   assert.equal(queued.length, 1)
   remove(f.controller, removal)
   const publications = f.publications.length
@@ -414,7 +440,8 @@ for (const removal of ["reply", "delete", "dispose"] as const) {
     assert.equal(f.view()?.autoApproval?.status, "allowing")
     assert.equal(f.writes.length, 1)
     remove(f.controller, removal)
-    assert.equal(f.writes[0]?.signal.aborted, true)
+    assert.equal(f.writes[0]?.signal.aborted, removal !== "reply",
+      "native resolution retains only the bounded dispatched acknowledgement")
     await operation
     const publications = f.publications.length
     if (outcome === "resolve") reply.resolve()
@@ -434,7 +461,7 @@ test("duplicate clicks racing expiry are single-flight through checking and allo
   const f = fixture(t, { transport: { list: () => fresh.promise, once: () => reply.promise } })
   await f.add()
   f.present()
-  const expiry = f.clock.dequeueAfter(15_000)
+  const expiry = f.clock.dequeueAfter(16_000)
   const operation = f.controller.approveNow("b-review")
   expiry[0]!()
   await Promise.all([f.controller.approveNow("b-review"), f.controller.approveNow("b-review")])
@@ -653,7 +680,7 @@ for (const failure of ["HTTP", "network", "unconfirmed acknowledgement", "unknow
     f.present()
     const before = f.view()!
     await f.controller.approveNow("b-review")
-    assert.deepEqual(f.view(), { ...before, autoApproval: { status: "failed" } })
+    assert.deepEqual(f.view(), { ...before, autoApproval: { status: "failed" }, approvalPendingConfirmed: true })
     assert.deepEqual(sdk.requests.map((req) => req.method), ["GET", "POST", "GET"])
     assert.equal(f.reads.length, 2)
     assert.equal(f.writes.length, 1)
@@ -663,7 +690,7 @@ for (const failure of ["HTTP", "network", "unconfirmed acknowledgement", "unknow
     f.controller.cancelAutoApproval("b-review")
     await f.controller.approveNow("b-review")
     f.clock.jump(60_000)
-    assert.deepEqual(f.view(), { ...before, autoApproval: { status: "failed" } })
+    assert.deepEqual(f.view(), { ...before, autoApproval: { status: "failed" }, approvalPendingConfirmed: true })
     assert.equal(sdk.requests.length, 3)
     assert.equal(JSON.stringify(f.publications).includes("PRIVATE"), false)
   })

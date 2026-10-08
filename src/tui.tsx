@@ -17,6 +17,13 @@ import path from "node:path"
 import { SessionModes, SessionModeStore } from "./session-mode.js"
 import { sessionModeCommands } from "./session-mode-commands.js"
 import { DiagnosticTrace, measured, type DiagnosticObserver } from "./diagnostics.js"
+import { parseNotificationConfig } from "./notification-config.js"
+import { NotificationPolicy } from "./notification-policy.js"
+import { NotificationHost } from "./notification-host.js"
+import type { NotificationBackend } from "./notification-types.js"
+import { LinuxNotifications } from "./notification-linux.js"
+import type { NotificationConfig } from "./notification-config.js"
+import type { NotificationProcesses } from "./notification-process.js"
 export type { DiagnosticEvent, DiagnosticObserver } from "./diagnostics.js"
 
 function ReviewLoading(props: { api: TuiPluginApi; retrying: boolean }) {
@@ -149,13 +156,18 @@ function contextReader(api: TuiPluginApi, trace?: DiagnosticTrace): ContextReade
   }
 }
 
-async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], fileIO?: FileIO, observer?: DiagnosticObserver) {
+export type NotificationBackendFactory = (click: (sessionID: string) => void, config: NotificationConfig) => NotificationBackend
+
+async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], fileIO?: FileIO, observer?: DiagnosticObserver,
+  notificationBackend?: NotificationBackendFactory) {
   let config: Config | undefined
   let reviewOptions: Config | undefined
   let prompts = BUILTIN_PROMPTS
   let configError = ""
+  let notificationConfig: ReturnType<typeof parseNotificationConfig> | undefined
+  try { notificationConfig = parseNotificationConfig(options) } catch { /* Invalid desktop options disable only notifications. */ }
   try {
-    const parsed = parseConfig(options)
+    const parsed = parseConfig(notificationConfig ? options : { ...options, notify: false, notifySound: false, notificationSoundDirectory: undefined })
     reviewOptions = parsed
     prompts = await withDeadline(api.lifecycle.signal, parsed.timeoutMs, (signal) => loadPrompts(parsed.instructions, signal), "Prompt loading")
     config = parsed
@@ -170,6 +182,16 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const reader = contextReader(api, hostTrace)
   const modes = new SessionModes(new SessionModeStore(path.join(api.state.path.state, "opencode-reviewer", "session-mode-v1"),
     api.state.path.directory), async (id, signal) => api.state.session.get(id) ?? reader.session(id, signal))
+  let notifications: NotificationHost | undefined
+  if (notificationConfig?.notify) {
+    try {
+      const click = (id: string) => notifications?.click(id)
+      const backend = notificationBackend ? notificationBackend(click, notificationConfig) : new LinuxNotifications(notificationConfig, click)
+      notifications = new NotificationHost(api,
+        new NotificationPolicy(notificationConfig, reviewOptions?.autoApprove === true, reviewOptions?.autoApproveDelaySeconds ?? 15, backend),
+        (id, signal) => modes.root(id, signal))
+    } catch { /* Desktop initialization cannot change review behavior. */ }
+  }
   const files = new FileAccess(fileIO)
   const approval = approvalTransport(api.client, api.state.path.directory)
   let visibleApproval: () => string | undefined = () => undefined
@@ -192,7 +214,12 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
       // The deadline races its callback. Drain the actual review's usage finalizer too.
       await worker?.catch(() => {})
     }
-  }, setViews, reviewOptions, { ...(observer ? {
+  }, (views) => {
+    setViews(views)
+    // Solid cleanup can synchronously cancel an older countdown during this
+    // publication. Read current controller state rather than replaying its input.
+    notifications?.snapshot(controller.views)
+  }, reviewOptions, { ...(observer ? {
     list: (signal: AbortSignal) => {
       const pending = controller.views
       const view = pending.some((view) => view.autoApproval?.status === "failed") ? undefined
@@ -203,7 +230,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
         view ? "approval-verification" : "approval-read", () => approval.list(signal))
     },
     once: (request, signal) => measured(traces?.get(request), "approval-reply", () => approval.once(request, signal)),
-  } : approval), visibleID: () => visibleApproval() }, undefined, modes)
+  } : approval), visibleID: () => visibleApproval() }, undefined, modes, fact => notifications?.fact(fact))
 
   api.event.on("permission.asked", (event) => controller.asked(event.properties))
   api.event.on("permission.replied", (event) => controller.replied(event.properties.requestID))
@@ -220,11 +247,13 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   api.event.on("session.idle", () => void refresh())
   api.event.on("session.error", () => void refresh())
   api.lifecycle.onDispose(async () => {
+    const notificationCleanup = notifications?.dispose()
     pendingRefresh.dispose()
     clearInterval(interval)
     setSidebar(undefined)
     unregisterMode()
-    await controller.dispose()
+    const reviewCleanup = controller.dispose()
+    await Promise.allSettled([reviewCleanup, notificationCleanup])
     await modes.flush().catch(() => {})
     await lifetime.flush()
   })
@@ -242,6 +271,10 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
         return null
       },
       app: () => {
+        if (notifications) createEffect(() => {
+          const route = api.route.current
+          notifications?.visit(route.name === "session" ? route.params?.sessionID as string | undefined : undefined)
+        })
         const select = () => {
           const mounted = sidebar()
           const route = api.route.current
@@ -385,6 +418,17 @@ export function withFileAccess(io: FileIO): TuiPlugin {
 /** Opt-in embedding/fixture observations only; no configuration, storage or logging. */
 export function withDiagnostics(observer: DiagnosticObserver): TuiPlugin {
   return (api, options) => reviewTui(api, options, undefined, observer)
+}
+
+/** Isolated notification backend for embedding and real-host fixtures. */
+export function withNotifications(factory: NotificationBackendFactory): TuiPlugin {
+  return (api, options) => reviewTui(api, options, undefined, undefined, factory)
+}
+
+/** Fixed-purpose process seam; exercises the bundled Linux/audio pipeline in fixtures. */
+export function withNotificationProcesses(factory: () => NotificationProcesses): TuiPlugin {
+  return (api, options) => reviewTui(api, options, undefined, undefined,
+    (click, config) => new LinuxNotifications(config, click, factory()))
 }
 
 export default { id: "opencode-reviewer", tui: (api, options) => reviewTui(api, options) } satisfies TuiPluginModule

@@ -111,7 +111,7 @@ test("validated completion flushes full final text without waiting for preview t
   assert.equal(f.counts().writes, 0, "validation alone does not mean rendered")
   f.controller.presented("a")
   assert.deepEqual(f.view()?.autoApproval, { status: "countdown", seconds: 15 })
-  f.clock.jump(14_999)
+  f.clock.jump(15_999)
   assert.equal(f.counts().writes, 0)
   f.clock.jump(1)
   await settle()

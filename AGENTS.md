@@ -241,15 +241,20 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   arbitrary or native-like permissions from inside execution; earlier code may
   already have run. Never treat a custom `bash` permission as a native command.
 - `autoApprove` defaults false; `autoApproveDelaySeconds` defaults 15 and accepts
-  integer 0–3600. Only completed, validated Safe assessments are eligible; provisional
-  ratings never populate `assessment` or enable footer approval. Partial evidence
+  integer 0–3600. Only completed, validated Safe assessments are eligible.
+  Positive countdowns add a one-second initial hold while displaying no more than
+  the configured starting number; zero delay has no hold.
+  Provisional ratings never populate `assessment` or enable footer approval. Partial evidence
   is not an additional veto. Each request needs its own full visible countdown. Cancel or
   visibility loss after starting permanently makes that request manual for the
   running controller, including across remounts; scrolling must not cancel it.
 - Fresh pending identity/scope and visibility are rechecked before each once-only
   write. Preserve single-flight submission, stale-snapshot guards, aborts and no
-  automatic write retries. Native resolution may abort our HTTP acknowledgement;
-  never resurrect its view or report a failure after resolution. On uncertain
+  automatic write retries. Native resolution removes/aborts the review view
+  immediately. A dispatched POST's acknowledgement may finish under the remaining
+  original five-second deadline to establish notification attribution; never send
+  a new write, resurrect its view or report a failure after resolution.
+  Deletion/disposal still abort that acknowledgement. On uncertain
   outcome keep any remaining request manual, preserve its rating, and reconcile.
 - Preserve two-second read-only reconciliation for startup/missing reply events and
   its revision guard against stale snapshots. `pending-refresh.ts` reconciles only
@@ -294,6 +299,54 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Cancel before deliberating there. Once dispatched, approval cannot be unsent.
 - Invalid configuration or review failure shows `Analysis unavailable`, never a
   fabricated rating or permission decision.
+
+## Linux notifications
+
+- `notify` and `notifySound` default true. Desktop settings are independently
+  parsed; invalid notification options disable notification work without changing
+  review. `notificationSoundDirectory` is an absolute optional path.
+- Policy, public host events/scope, process ownership, Linux delivery, terminal
+  activation and audio/codec live in separate `src/notification-*.ts` modules.
+  Keep TUI/controller wiring narrow and notifications off approval critical paths.
+- Track visited roots and descendants, with root titles only. Event births establish
+  eligibility; startup snapshots/backlogs do not replay. Final validated assessments
+  gate attention, and final Safe reviews get one second to start their countdown.
+  Manual-wait episodes deduplicate but can renew after canceled automation.
+- Countdown uses attention audio; confirmed automatic success uses approval audio
+  for positive/zero delays. Approval sounds are limited to one per two seconds.
+  Native/manual footer approvals are not automatic successes. Unreviewed requests
+  and disabled conversations still notify. Errors and root-turn completion are
+  distinct from retries, questions, tool steps, children and user interruption.
+- Linux uses owned fixed-purpose `notify-send`, `gdbus`, `paplay`/`pw-play` calls,
+  never a shell or the command under review. Normal transient banners request
+  line-buffered `notify-send` output via `stdbuf`, so its delivery ID reaches audio
+  immediately instead of at banner dismissal. The wrapper execs the owned process.
+  Banners request
+  desktop-default expiry and suppress duplicate desktop sound. GNOME activation
+  uses service/screen identity, never guessed window titles or a new terminal.
+  GNOME requires Terminal desktop-entry attribution to issue an activation token;
+  libnotify's bounded debug output supplies it in memory. Pass it through GTK
+  platform data before presenting the exact screen. Never log/persist tokens.
+  Dialogs prevent navigation, not terminal activation. Other terminals degrade.
+- WAV then MP3 then bundled fallback; capture at most 4 MiB and decode at most
+  ten seconds of mono/stereo audio. Bundled mpg123 WASM avoids FFmpeg/runtime
+  downloads. Normalize to -20 dBFS RMS subject to -3 dBFS peak before private PCM
+  playback. Cooperatively yield; bound preparations/processes and retain actual
+  transaction ownership through late cleanup. Sound originals are unchanged.
+- `sounds/*.mp3` and decoder are embedded in `dist/tui.js`; preserve exactly five
+  package files and third-party notices. Build trims unused decoder worker exports.
+  `withNotifications` and `withNotificationProcesses` are opt-in fixture/embedding
+  seams, not configuration. Generic fixtures explicitly use `notify: false`.
+- `node scripts/smoke.mjs auto-shell --notifications` records real host
+  notification delivery and normalized bundled audio using isolated process I/O.
+  Supported existing scenarios also include `auto-zero`, `auto-unsafe`,
+  `auto-error`, `auto-cancel`, `auto-hide`, `bash-disabled`, and `correction`.
+  `node scripts/smoke-notification-events.mjs question` covers a native question
+  and completed root response; `error`, `ended`, and `cancel` cover other outcomes.
+  These do not prove desktop focus; test real GNOME clicks separately.
+  `npx tsx scripts/smoke-notification-desktop.ts --sounds` exercises actual local
+  playback. `--click` waits ten seconds before banners for manual cross-workspace
+  and terminal-tab acceptance; `--critical` is a diagnostic-only test override.
 
 ## Root-conversation mode
 
