@@ -52,6 +52,71 @@ test("deduplicates events and keeps concurrent assessments bound to their reques
   controller.dispose()
 })
 
+test("lifetime ratings observe each accepted final review once, not previews, retries, errors or republishes", async () => {
+  const ratings: boolean[] = []
+  const controller = new CoreController(async (req, _signal, identified, progress) => {
+    identified()
+    progress({ attempt: 0, phase: "evaluating" })
+    progress({ attempt: 0, phase: "streaming", preview: { safe: true } })
+    progress({ attempt: 1, phase: "retrying" })
+    progress({ attempt: 1, phase: "streaming", preview: { safe: false } })
+    if (req.id === "error") throw new Error("Analysis unavailable")
+    if (req.id === "unrelated") return null
+    return { safe: req.id === "safe", desc: "Final review without usage." }
+  }, () => {}, { reviewBash: true, reviewEdits: true, stream: true }, undefined, undefined, undefined, undefined,
+  safe => { ratings.push(safe) })
+  const requests = ["safe", "unsafe", "error", "unrelated"].map(id => request(id))
+  for (const req of requests) { controller.asked(req); controller.asked(req) }
+  await tick()
+  assert.deepEqual(ratings, [true, false])
+  controller.reconcile(requests, controller.revision)
+  controller.presented("safe"); controller.presented()
+  await tick()
+  assert.deepEqual(ratings, [true, false])
+  await controller.dispose()
+})
+
+for (const action of ["reply", "delete", "disable", "dispose"] as const) {
+  test(`late rating after ${action} is not counted`, async () => {
+    const modes = modeFixture(), ratings: boolean[] = []
+    let finish!: (value: Assessment) => void
+    const controller = new CoreController((_req, _signal, identified) => {
+      identified(); return new Promise(resolve => { finish = resolve })
+    }, () => {}, { reviewBash: true, reviewEdits: true }, undefined, undefined, modes, undefined,
+    safe => { ratings.push(safe) })
+    controller.asked(request("a")); await tick()
+    if (action === "reply") controller.replied("a")
+    if (action === "delete") controller.deleted("root")
+    if (action === "disable") { await modes.set("root", false); controller.modeChanged("root") }
+    const disposing = action === "dispose" ? controller.dispose() : undefined
+    finish(result); await tick(); await disposing
+    assert.deepEqual(ratings, [])
+    await controller.dispose()
+  })
+}
+
+test("a fresh final review after re-enabling contributes a new rating", async () => {
+  const modes = modeFixture(), ratings: boolean[] = []
+  const controller = new CoreController(async () => result, () => {}, { reviewBash: true, reviewEdits: true },
+    undefined, undefined, modes, undefined, safe => { ratings.push(safe) })
+  const req = request("a")
+  controller.asked(req); await tick()
+  await modes.set("root", false); controller.modeChanged("root")
+  await modes.set("root", true); controller.modeChanged("root")
+  controller.reconcile([req], controller.revision); await tick()
+  assert.deepEqual(ratings, [true, true])
+  await controller.dispose()
+})
+
+for (const failure of ["throw", "reject"] as const) test(`rating observer ${failure} cannot change a review`, async () => {
+  const controller = new CoreController(async () => result, () => {}, undefined, undefined, undefined, undefined, undefined,
+    () => { if (failure === "throw") throw new Error("storage unavailable"); return Promise.reject(new Error("storage unavailable")) })
+  controller.asked(request("a")); await tick()
+  assert.equal(controller.views[0]?.status, "complete")
+  assert.equal(controller.views[0]?.assessment?.safe, true)
+  await controller.dispose()
+})
+
 test("resolution aborts work, removes panel and suppresses a late noncooperative result", async () => {
   let resolve!: (value: Assessment) => void
   let signal!: AbortSignal

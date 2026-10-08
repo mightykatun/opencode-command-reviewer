@@ -189,7 +189,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
       const click = (id: string) => notifications?.click(id)
       const backend = notificationBackend ? notificationBackend(click, notificationConfig) : new LinuxNotifications(notificationConfig, click)
       notifications = new NotificationHost(api,
-        new NotificationPolicy(notificationConfig, reviewOptions?.autoApprove === true, reviewOptions?.autoApproveDelaySeconds ?? 15, backend),
+        new NotificationPolicy(notificationConfig, reviewOptions?.autoApprove === true, backend),
         (id, signal) => modes.root(id, signal))
     } catch { /* Desktop initialization cannot change review behavior. */ }
   }
@@ -231,7 +231,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
         view ? "approval-verification" : "approval-read", () => approval.list(signal))
     },
     once: (request, signal) => measured(traces?.get(request), "approval-reply", () => approval.once(request, signal)),
-  } : approval), visibleID: () => visibleApproval() }, undefined, modes, fact => notifications?.fact(fact))
+  } : approval), visibleID: () => visibleApproval() }, undefined, modes, fact => notifications?.fact(fact), lifetime.recordRating)
 
   api.event.on("permission.asked", (event) => controller.asked(event.properties))
   api.event.on("permission.replied", (event) => controller.replied(event.properties.requestID))

@@ -107,6 +107,9 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
     origin followed by a warm request on the same TCP connection. Shared helpers in
     `scripts/smoke-reviewer.mjs` audit compact JSON, stable system prefixes, exact
     correction history and one POST per planned attempt.
+  - `node scripts/smoke.mjs auto-shell --network-retry --notifications` injects
+    HTTP 429 then 503 with Retry-After, audits byte-identical retry bodies, and
+    verifies one final countdown/approval with incomplete report-usage coverage.
   Limit real-host verification concurrency to two; higher contention has caused
   highlighting timeouts. Report exact runs, not inferred full-matrix coverage.
 - Runtime fixtures isolate HOME/XDG/project directories under the OS temp directory,
@@ -321,7 +324,7 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   eligibility; startup snapshots/backlogs do not replay. Final validated assessments
   gate attention, and final Safe reviews get one second to start their countdown.
   Manual-wait episodes deduplicate but can renew after canceled automation.
-- Countdown uses attention audio; confirmed automatic success uses approval audio
+- Countdowns send no desktop banner or audio; confirmed automatic success uses approval audio
   for positive/zero delays. Approval sounds are limited to one per two seconds.
   Native/manual footer approvals are not automatic successes. Unreviewed requests
   and disabled conversations still notify. Errors and root-turn completion are
@@ -478,8 +481,8 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - Use HTTP Chat Completions with compact textual JSON evidence; `stream` is a strict
   boolean defaulting to false and controls both transport and progressive display.
   Streaming sends `stream_options: { include_usage: true }` and requires
-  `text/event-stream`. No tool calling, provider-specific JSON mode, reconnects or
-  automatic POST retries. Keep endpoint/model configurable and evidence semantics
+  `text/event-stream`. No tool calling, provider-specific JSON mode or stream
+  resumption. Keep endpoint/model configurable and evidence semantics
   unchanged; do not add speculative calls, assessment reuse or lossy summarization.
 - Instruction overrides cannot replace the fixed evidence/output contract: exactly
   `{"safe": boolean, "desc": "nonempty text"}`. The shared incremental lexer rejects
@@ -500,10 +503,20 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   reject content after stop and API data after DONE. Keepalives do not extend the
   shared deadline. Cancel/release readers on every exit, own late fetch responses,
   and do not await potentially hanging underlying reader cancellation.
-- Retry only assessment-format errors after successful transport, retaining the
-  exact prior history, failed response and validation feedback under the shared
-  deadline. HTTP/network/envelope/resource-limit errors terminate review; reject
-  redirects and never display API error bodies.
+- Assessment-format corrections require successful transport and retain the exact
+  prior history, failed response and validation feedback under the shared deadline.
+  Internal transport recovery permits at most two extra POSTs per review, shared
+  across format attempts: HTTP 408/429/500/502/503/504 and recognized transient
+  socket/DNS error codes, including body read failures before any decoded assessment
+  content. Retry the exact request with no conversation messages added. Use 250/500 ms
+  exponential backoff plus up to 100% jitter; honor Retry-After seconds/HTTP dates
+  as a minimum. Never extend the deadline or shorten a provider cooldown to fit it.
+  Leave at least 250 ms for the next request. Cancel waits and failed transports on
+  resolution/disable/disposal. Never restart a stream after assessment content starts.
+  TLS/authentication/unknown errors, redirects, invalid envelopes, unfinished streams
+  and resource limits stay terminal. Approval writes still never retry. No new UI
+  or configuration: existing evaluating/retrying states and timeoutMs apply.
+  Never display API error bodies. `src/transport-retry.ts` owns retry policy.
 - Treat command/source/quoted prompts as evidence, not reviewer instructions.
   Default Safe means bounded risk, not merely user-authorized; being outside the
   repository alone is not danger. Keep consequential effects and uncertainty visible.
@@ -536,18 +549,28 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   zero cache counts. Consume rejected asynchronous accounting/progress observers
   without awaiting them. OpenRouter cost
   is independent of token validity. No valid received component means no entry.
-- Sum report components across all format attempts independently: tokens or cost
+- Sum report components across all POSTs, including transport and format attempts,
+  independently: tokens or cost
   appear only if that component covers the entire chain. Cost-only and token-only
   reports are valid. Render stats in theme textMuted inside the report scrollbox.
   Inline lifetime belongs only in this completed valid-request-usage block, never
   alone while loading, failed or missing all report usage. The lifetime palette
   command remains independent. Unknown costs are not free; label partial coverage.
-- `LifetimeUsage` writes version 2 per-instance atomic snapshots under
-  `opencode-reviewer/usage-v2/` in the public state directory. Read legacy
-  `opencode-reviewer/usage-v1/` alongside them without copying/rewriting snapshots
+- `LifetimeUsage` writes version 3 per-instance atomic snapshots under
+  `opencode-reviewer/usage-v3/` in the public state directory. Read legacy
+  `opencode-reviewer/usage-v1/` and `usage-v2/` alongside them without copying/rewriting snapshots
   or reinterpreting original estimates. Keep separate request, token-coverage and
-  pricing counts, numeric totals and timestamps only; reads are capped at 1 KiB
+  pricing counts, final Safe/Unsafe review counts, numeric totals and timestamps only; reads are capped at 1 KiB
   per snapshot. No checkout or native session-accounting writes.
+- Count ratings at controller acceptance of each completed, validated review,
+  independently of received usage. Previews, transport/format attempts, errors,
+  stale/aborted results and repeated display updates never count. A fresh accepted
+  review after re-enable counts again. The observer receives only a boolean;
+  exceptions/rejected promises cannot affect review or approval. Persist rating
+  counts and their own earliest timestamp with usage through the same serialized
+  atomic writer. Older snapshots contribute no ratings; explain the missing
+  historical coverage. Display counts alongside inline lifetime cost only in the
+  existing completed-report usage block, and always in the lifetime palette.
 - Accounting and persistence failures cannot change review outcomes. Abort and
   await actual review workers/finalizers before flushing queued lifetime writes on
   disposal. Failed storage reports unavailable without silently resetting history.

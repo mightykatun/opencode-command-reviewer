@@ -31,6 +31,8 @@ export function reviewerAudit({ stream = false } = {}) {
         assert.equal(messages.length, 2, "first attempt contains exactly system and original evidence")
         permission = { id: permissions.size + 1, kind: evidence.kind, attempts: 0 }
         permissions.set(evidence.permission.id, permission)
+      } else if (permission.transportRetryExpected) {
+        assert.ok(text === permission.request, "transport retry preserves the entire POST byte-for-byte")
       } else {
         assert.ok(permission.retryExpected, "unexpected duplicate/speculative POST without an invalid fixture assessment")
         assert.ok(evidence.kind === permission.kind)
@@ -43,6 +45,8 @@ export function reviewerAudit({ stream = false } = {}) {
       }
       permission.attempts++
       permission.retryExpected = false
+      permission.transportRetryExpected = false
+      permission.request = text
       permission.model = body.model
       permission.history = JSON.stringify(messages)
       permission.messageCount = messages.length
@@ -68,6 +72,7 @@ export function reviewerAudit({ stream = false } = {}) {
           row.fixtureUsage = numeric
         },
         response(content, retryExpected = false) { permission.response = content; permission.retryExpected = retryExpected },
+        transportRetry() { permission.transportRetryExpected = true },
       }
     },
     verify(expectedKinds, attemptsPerPermission) {

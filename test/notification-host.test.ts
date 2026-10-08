@@ -9,7 +9,7 @@ import type { NotificationMessage } from "../src/notification-types.js"
 import type { View } from "../src/controller.js"
 
 const request = (id = "p", sessionID = "root"): PermissionRequest => ({ id, sessionID, permission: "bash", patterns: [], always: [], metadata: {} })
-function fixture(delay = 15, resolve: (id: string) => Promise<string> = async id => id) {
+function fixture(resolve: (id: string) => Promise<string> = async id => id) {
   const listeners = new Map<string, Set<(event: Event) => void>>()
   const sessions = new Map<string, { id: string; parentID?: string; title: string }>([
     ["root", { id: "root", title: "Root title" }], ["child", { id: "child", parentID: "root", title: "Child" }],
@@ -35,7 +35,7 @@ function fixture(delay = 15, resolve: (id: string) => Promise<string> = async id
     route: { navigate(_name: string, params: { sessionID: string }) { navigated.push(params.sessionID) } },
     ui: { dialog: { get open() { return dialog } } }, lifecycle: { signal: new AbortController().signal },
   } as unknown as TuiPluginApi
-  const policy = new NotificationPolicy({ notify: true, notifySound: false }, true, delay, {
+  const policy = new NotificationPolicy({ notify: true, notifySound: false }, true, {
     async show(message) { banners.push(message); return { close() {} } }, dispose() {},
   }, clock)
   const host = new NotificationHost(api, policy, resolve, clock)
@@ -75,7 +75,7 @@ test("only event-born requests in visited roots notify; baseline snapshots and u
 
 test("request events arriving during root visitation survive asynchronous baseline registration", async () => {
   let release!: (value: string) => void
-  const f = fixture(15, () => new Promise(resolve => { release = resolve }))
+  const f = fixture(() => new Promise(resolve => { release = resolve }))
   f.sessions.delete("root"); f.host.visit("root")
   f.emit("question.asked", { id: "during-visit", sessionID: "root", questions: [] })
   await settle(); assert.equal(f.banners.length, 0)
@@ -85,7 +85,7 @@ test("request events arriving during root visitation survive asynchronous baseli
 })
 
 test("zero-delay confirmation retains dispatched attribution after native resolution; manual footer stays silent", async () => {
-  const f = fixture(0); f.host.visit("root")
+  const f = fixture(); f.host.visit("root")
   for (const automatic of [true, false]) {
     const req = request(automatic ? "automatic" : "manual")
     f.emit("permission.asked", req); f.host.snapshot([{ request: req, status: "complete", assessment: { safe: true, desc: "fixture" }, autoApproval: { status: "allowing" } }])

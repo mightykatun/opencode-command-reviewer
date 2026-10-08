@@ -99,7 +99,7 @@ const server = createServer(async (req, res) => {
       const attempt = (perRequest.get(evidence.permission.id) ?? 0) + 1
       perRequest.set(evidence.permission.id, attempt)
       if (flag("held") && requests.filter((entry) => entry.url.startsWith("/review")).length === 1) await new Promise((resolve) => { release = resolve })
-      if (flag("error")) { res.writeHead(503); res.end("PRIVATE fixture error"); return }
+      if (flag("error")) { res.writeHead(401); res.end("PRIVATE fixture error"); return }
       const content = correction && attempt === 1 ? "bad JSON" : JSON.stringify({ safe: !flag("unsafe"),
         desc: stream ? "Bounded **isolated** fixture operation.\n\nOnly the current allowance is assessed. Café fixture." : "Bounded isolated fixture operation. Only the current allowance is assessed." })
       const usage = !flag("no-usage") && !(flag("missing-usage") && attempt === 1)
@@ -343,6 +343,12 @@ try {
       assert.equal(screen.match(/Pricing available: \d+\/\d+ requests/)?.[0], `Pricing available: ${priced}/${total} requests`)
       assert.equal(screen.match(/lifetime: \$\d+\.\d{4}(?: \(partial pricing\))?/)?.[0], `lifetime: $${cost}${priced < total ? " (partial pricing)" : ""}`)
       assert.match(screen, /Recorded since: 1970-01-01/, "legacy history must retain its first-recorded date")
+      if (!flag("cancel")) {
+        const rated = flag("error") ? 0 : perRequest.size
+        assert.equal(screen.match(/Safe: \d+ · Unsafe: \d+/)?.[0],
+          `Safe: ${flag("unsafe") ? 0 : rated} · Unsafe: ${flag("unsafe") ? rated : 0}`,
+          "count final ratings once per review, including responses without usage")
+      }
     }
     assert.doesNotMatch(screen, /Permission analysis/)
     await save("lifetime-dialog")
@@ -358,9 +364,9 @@ try {
     const records = await notificationRecords()
     const banners = records.filter(record => record.event === "notification")
     assert.ok(banners.length)
-    assert.ok(banners.every(record => record.summary === "Opencode"))
+    assert.ok(banners.every(record => record.summary.startsWith("Opencode (") && record.summary.endsWith(")")))
+    assert.equal(banners.filter(record => record.title.startsWith("Reviewer will approve permission")).length, 0)
     if (auto && !flag("unsafe") && !flag("error") && !flag("cancel")) {
-      assert.equal(banners.filter(record => record.title.startsWith("Reviewer will approve permission")).length, plan.reviewKinds.length)
       assert.equal(banners.filter(record => record.title === "Reviewer approved a permission").length, plan.reviewKinds.length)
       assert.ok(records.some(record => record.event === "sound" && record.kind === "approved"))
     }

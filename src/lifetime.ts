@@ -13,19 +13,26 @@ export interface LifetimeTotals {
   priced: number
   cost: number
   since: number | null
+  safe: number
+  unsafe: number
+  ratingsSince: number | null
 }
-const empty = (): LifetimeTotals => ({ requests: 0, tokenRequests: 0, input: 0, output: 0, priced: 0, cost: 0, since: null })
+const empty = (): LifetimeTotals => ({ requests: 0, tokenRequests: 0, input: 0, output: 0, priced: 0, cost: 0, since: null,
+  safe: 0, unsafe: 0, ratingsSince: null })
 const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0
 const amount = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0
 const snapshotName = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.json$/
 
 function validate(value: LifetimeTotals): LifetimeTotals {
-  if (!value || ![value.requests, value.tokenRequests, value.input, value.output, value.priced].every(count)
+  if (!value || ![value.requests, value.tokenRequests, value.input, value.output, value.priced, value.safe, value.unsafe, value.safe + value.unsafe].every(count)
     || !amount(value.cost) || value.priced > value.requests || value.tokenRequests > value.requests
     || value.requests > value.tokenRequests + value.priced
     || (!value.tokenRequests && (value.input !== 0 || value.output !== 0))
     || (value.requests > 0 ? !count(value.since) || value.since > 8.64e15 : value.since !== null || value.input !== 0 || value.output !== 0)
-    || (!value.priced && value.cost !== 0)) throw new Error("Invalid lifetime usage totals")
+    || (!value.priced && value.cost !== 0)
+    || (value.safe + value.unsafe > 0 ? !count(value.ratingsSince) || value.ratingsSince > 8.64e15 : value.ratingsSince !== null)) {
+    throw new Error("Invalid lifetime usage totals")
+  }
   return value
 }
 
@@ -35,6 +42,8 @@ function add(left: LifetimeTotals, right: LifetimeTotals): LifetimeTotals {
     tokenRequests: left.tokenRequests + right.tokenRequests,
     priced: left.priced + right.priced, cost: left.cost + right.cost,
     since: left.since === null ? right.since : right.since === null ? left.since : Math.min(left.since, right.since),
+    safe: left.safe + right.safe, unsafe: left.unsafe + right.unsafe,
+    ratingsSince: left.ratingsSince === null ? right.ratingsSince : right.ratingsSince === null ? left.ratingsSince : Math.min(left.ratingsSince, right.ratingsSince),
   })
 }
 
@@ -43,10 +52,12 @@ export class LifetimeUsage {
   private readonly id = randomUUID()
   private local = empty()
   private pending = Promise.resolve()
-  constructor(readonly directory: string, readonly legacyDirectory?: string) {
-    if (!path.isAbsolute(directory) || (legacyDirectory !== undefined && !path.isAbsolute(legacyDirectory))) {
+  private readonly legacyDirectories: string[]
+  constructor(readonly directory: string, ...legacyDirectories: string[]) {
+    if (![directory, ...legacyDirectories].every(value => path.isAbsolute(value))) {
       throw new Error("Lifetime usage directory must be absolute")
     }
+    this.legacyDirectories = legacyDirectories
   }
 
   record(usage: Usage): Promise<void> {
@@ -55,8 +66,17 @@ export class LifetimeUsage {
       || (usage.cost !== undefined && !amount(usage.cost))) {
       return Promise.reject(new Error("Invalid request usage"))
     }
-    const increment = { requests: 1, tokenRequests: tokens ? 1 : 0, input: usage.input ?? 0, output: usage.output ?? 0,
-      priced: usage.cost === undefined ? 0 : 1, cost: usage.cost ?? 0, since: Date.now() }
+    return this.increment({ ...empty(), requests: 1, tokenRequests: tokens ? 1 : 0, input: usage.input ?? 0, output: usage.output ?? 0,
+      priced: usage.cost === undefined ? 0 : 1, cost: usage.cost ?? 0, since: Date.now() })
+  }
+
+  /** One accepted final review, independent of POST count or received usage. */
+  recordRating(safe: boolean): Promise<void> {
+    if (typeof safe !== "boolean") return Promise.reject(new Error("Invalid review rating"))
+    return this.increment({ ...empty(), safe: safe ? 1 : 0, unsafe: safe ? 0 : 1, ratingsSince: Date.now() })
+  }
+
+  private increment(increment: LifetimeTotals): Promise<void> {
     this.pending = this.pending.catch(() => {}).then(async () => {
       // A later successful write includes earlier increments if persistence failed.
       this.local = add(this.local, increment)
@@ -64,7 +84,7 @@ export class LifetimeUsage {
       const temporary = path.join(this.directory, `${this.id}.${randomUUID()}.tmp`)
       try {
         const file = await open(temporary, "wx", 0o600)
-        try { await file.writeFile(JSON.stringify({ version: 2, ...this.local })); await file.sync() }
+        try { await file.writeFile(JSON.stringify({ version: 3, ...this.local })); await file.sync() }
         finally { await file.close() }
         await rename(temporary, path.join(this.directory, `${this.id}.json`))
         const directory = await open(this.directory, constants.O_RDONLY | constants.O_DIRECTORY)
@@ -83,7 +103,7 @@ export class LifetimeUsage {
     signal?.throwIfAborted()
     let total = empty()
     // Never copy legacy totals into local snapshots: concurrent/restarted instances would duplicate history.
-    const directories = new Set([this.directory, ...(this.legacyDirectory ? [this.legacyDirectory] : [])].map((directory) => path.resolve(directory)))
+    const directories = new Set([this.directory, ...this.legacyDirectories].map((directory) => path.resolve(directory)))
     for (const directory of directories) total = add(total, await this.readDirectory(directory, signal))
     signal?.throwIfAborted()
     return total
@@ -116,10 +136,12 @@ export class LifetimeUsage {
         }
         if (size > 1024) throw new Error("Invalid lifetime usage snapshot")
         const value = JSON.parse(bytes.subarray(0, size).toString("utf8"))
-        if (value?.version !== 1 && value?.version !== 2) throw new Error("Unsupported lifetime usage snapshot")
+        if (value?.version !== 1 && value?.version !== 2 && value?.version !== 3) throw new Error("Unsupported lifetime usage snapshot")
         total = add(total, validate({ requests: value.requests, input: value.input, output: value.output,
           tokenRequests: value.version === 1 ? value.requests : value.tokenRequests,
-          priced: value.priced, cost: value.cost, since: value.since }))
+          priced: value.priced, cost: value.cost, since: value.since,
+          safe: value.version === 3 ? value.safe : 0, unsafe: value.version === 3 ? value.unsafe : 0,
+          ratingsSince: value.version === 3 ? value.ratingsSince : null }))
       } finally { await file.close() }
       signal?.throwIfAborted()
     }
@@ -135,11 +157,12 @@ export function lifetimeCost(totals: LifetimeTotals): string {
 }
 
 export function lifetimeReport(totals: LifetimeTotals): string {
-  return [lifetimeCost(totals), uiText.lifetime.requests(totals.requests),
+  return [lifetimeCost(totals), uiText.lifetime.ratings(totals.safe, totals.unsafe), uiText.lifetime.requests(totals.requests),
     totals.tokenRequests ? uiText.lifetime.tokens(totals.input, totals.output, totals.tokenRequests < totals.requests) : uiText.lifetime.tokensUnavailable,
     uiText.lifetime.tokenCoverage(totals.tokenRequests, totals.requests),
     uiText.lifetime.pricingCoverage(totals.priced, totals.requests),
     ...(totals.since === null ? [] : [uiText.lifetime.since(new Date(totals.since).toISOString().slice(0, 10))]),
-    "", uiText.lifetime.explanation,
+    ...(totals.ratingsSince === null ? [] : [uiText.lifetime.ratingsSince(new Date(totals.ratingsSince).toISOString().slice(0, 10))]),
+    "", uiText.lifetime.explanation, "", uiText.lifetime.ratingsExplanation,
   ].join("\n")
 }

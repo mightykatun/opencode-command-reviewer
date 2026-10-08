@@ -24,7 +24,7 @@ export class NotificationPolicy {
   private banners = new Set<Banner>()
   private stopped = false
   private lastApprovalSound = -Infinity
-  constructor(private config: NotificationConfig, private auto: boolean, private delay: number,
+  constructor(private config: NotificationConfig, private auto: boolean,
     private backend: NotificationBackend, private clock: NotificationClock = notificationClock) {}
 
   private remember(key: string) {
@@ -107,8 +107,7 @@ export class NotificationPolicy {
       if (entry.phase !== "automatic") {
         this.withdraw(entry.banner)
         entry.phase = "automatic"
-        entry.banner = state === "countdown" && this.delay > 0
-          ? this.show("attention", uiText.notifications.countdown(view.autoApproval!.status === "countdown" ? view.autoApproval!.seconds : this.delay), entry.target) : undefined
+        entry.banner = undefined
       }
       return
     }

@@ -92,6 +92,12 @@ The rating remains provisional until the full response is validated. A format re
 clears the preview and restores the loading indicator. Auto-approval
 starts only after the full response is validated and rendered.
 
+Transient connection failures and HTTP 408/429/500/502/503/504 responses get up to
+two internal retries within `timeoutMs`, honoring server cooldowns. A stream that
+has already delivered assessment text is not restarted. This is separate from
+`formatRetries`; no additional setting is needed. Retried requests can incur
+additional provider charges, and unreported usage remains unknown.
+
 During an auto-approval countdown, click the countdown to allow once immediately,
 or Cancel to leave the request manual. Hiding or covering the panel also cancels
 that request's countdown. Cancel before using native Allow always or rejection
@@ -110,6 +116,12 @@ costs use reported charges; other endpoints use available catalog estimates.
 Received usage counts even if a review fails or is interrupted. Unreported charges
 are missing from the totals.
 
+Lifetime statistics also show **Safe** and **Unsafe** review counts. Each completed,
+validated review counts once, even without usage data. Previews, retries and failed
+or interrupted analyses do not count. Re-enabling a conversation can produce a new
+review, which counts again. The totals persist across restarts; earlier ratings
+were not recorded and cannot be reconstructed.
+
 Reviews send the pending request, latest user prompt, project context, and relevant
 file snapshots, diffs, or tool arguments to your endpoint before approval. Shell
 file snapshots can follow symlinks outside the project. Missing evidence is noted
@@ -117,21 +129,19 @@ in the report; ratings are advice based on the supplied evidence.
 
 ### Desktop notifications
 
-Transient banners have an **Opencode** heading and a small status icon: green
-checkmark for approvals, orange exclamation mark for attention/countdowns, red X
+Transient banners have an **Opencode (Session name)** heading and a small status icon: green
+checkmark for approvals, orange exclamation mark for attention, red X
 for errors, and a neutral code mark for completed responses. GNOME controls the
-heading's font weight. The event
-message and conversation title appear beneath it, even while the terminal is focused.
-An explicit separator keeps them distinct on desktops that flatten banner text:
+heading's font weight. The event message appears beneath it, even while the
+terminal is focused:
 
 - **Session needs attention:** questions and manual permissions. Reviewed requests
   wait for a final validated assessment; failures, canceled automation, and a Safe
   review blocked from starting its countdown also notify. Unreviewed requests
   notify immediately, including when conversation review is disabled.
-- **Reviewer will approve permission in X s:** one announcement when a positive
-  countdown starts, using the attention sound. Confirmed automatic approval then
-  sends **Reviewer approved a permission** with the approval sound. Zero delay
-  sends only the confirmed approval notification. Approval sounds are limited to
+- **Reviewer approved a permission:** sent with the approval sound after confirmed
+  automatic approval, for both positive and zero delays. The countdown is silent.
+  Approval sounds are limited to
   one every two seconds; every eligible banner is retained for delivery.
 - **Session error:** an unrecovered session/provider failure, not a review failure.
 - **Session ended:** a completed root-agent response, not a question/permission

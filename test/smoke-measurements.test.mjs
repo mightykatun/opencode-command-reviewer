@@ -91,6 +91,21 @@ test("payload audit preserves exact correction history and reports cumulative ca
   assert.throws(() => audit.request("POST", JSON.stringify(second)), /duplicate\/speculative POST/)
 })
 
+test("payload audit admits only explicitly planned, byte-identical transport retries", () => {
+  const audit = reviewerAudit(), body = initial()
+  audit.request("POST", JSON.stringify(body)).transportRetry()
+  audit.request("POST", JSON.stringify(body)).response("PRIVATE-BAD-RESPONSE", true)
+  const correction = corrected(body)
+  audit.request("POST", JSON.stringify(correction)).transportRetry()
+  audit.request("POST", JSON.stringify(correction)).response("PRIVATE-GOOD-RESPONSE")
+  audit.verify(["mcp"], 4)
+  assert.doesNotMatch(JSON.stringify(audit.snapshot()), /PRIVATE/)
+  assert.throws(() => audit.request("POST", JSON.stringify(correction)), /duplicate\/speculative POST/)
+  const changed = reviewerAudit()
+  changed.request("POST", JSON.stringify(body)).transportRetry()
+  assert.throws(() => changed.request("POST", JSON.stringify(corrected(body))), /entire POST byte-for-byte/)
+})
+
 test("payload audit rejects altered correction evidence/history, category prefix drift and unplanned counts", () => {
   for (const change of [
     (body) => { body.messages[1].content = body.messages[1].content.replace("PRIVATE-EVIDENCE", "CHANGED") },

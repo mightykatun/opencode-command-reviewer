@@ -11,11 +11,11 @@ const view = (id = "a", status: View["status"] = "analyzing", safe = true): View
   request: { id, sessionID: "root", permission: "bash", patterns: ["command"], always: [], metadata: {} },
   status, ...(status === "complete" ? { assessment: { safe, desc: "Fixture" } } : {}),
 })
-function fixture(auto = false, delay = 15, notify = true, sound = true) {
+function fixture(auto = false, notify = true, sound = true) {
   let now = 0
   const timers = new Set<{ at: number; callback: () => void }>()
   const messages: NotificationMessage[] = [], closed: string[] = []
-  const policy = new NotificationPolicy({ notify, notifySound: sound }, auto, delay, {
+  const policy = new NotificationPolicy({ notify, notifySound: sound }, auto, {
     async show(message, signal) {
       assert.equal(signal.aborted, false)
       messages.push(message)
@@ -76,19 +76,19 @@ for (const status of ["unrelated", "unidentified", "unavailable", "suspended"] a
   })
 }
 
-test("safe render grace checks current state, countdown announces once, cancellation renews attention", async () => {
+test("safe render grace checks current state, silent countdown withdraws attention, cancellation renews it", async () => {
   const f = fixture(true); f.add(view("a", "complete"))
   await f.advance(999); assert.equal(f.messages.length, 0)
   await f.advance(1); assert.equal(f.messages[0]?.kind, "attention")
   const countdown: View = { ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 15 } }
   f.policy.snapshot([countdown]); await settle()
-  assert.equal(f.messages[1]?.title, "Reviewer will approve permission in 15 s")
+  assert.equal(f.messages.length, 1)
   assert.equal(f.closed.length, 1)
   f.policy.snapshot([{ ...countdown, autoApproval: { status: "countdown", seconds: 14 } }]); await settle()
-  assert.equal(f.messages.length, 2)
+  assert.equal(f.messages.length, 1)
   f.policy.snapshot([{ ...countdown, autoApproval: { status: "cancelled" } }]); await settle()
-  assert.equal(f.messages[2]?.kind, "attention"); assert.equal(f.closed.length, 2)
-  f.policy.resolved("permission", "a"); assert.equal(f.closed.length, 3)
+  assert.equal(f.messages[1]?.kind, "attention"); assert.equal(f.closed.length, 1)
+  f.policy.resolved("permission", "a"); assert.equal(f.closed.length, 2)
   f.policy.dispose()
 })
 
@@ -96,9 +96,9 @@ test("normal final rendering and request resolution cancel the grace timer", asy
   const f = fixture(true); f.add(view("a", "complete"))
   f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 15 } }])
   await f.advance(1000)
-  assert.deepEqual(f.messages.map(m => [m.kind, m.title]), [["attention", "Reviewer will approve permission in 15 s"]])
+  assert.deepEqual(f.messages, [])
   f.policy.snapshot([]); await f.advance(2000)
-  assert.equal(f.messages.length, 1); f.policy.dispose()
+  assert.equal(f.messages.length, 0); f.policy.dispose()
 })
 
 test("uncertain writes wait for reconciliation, and confirmed pending failure notifies only once", async () => {
@@ -112,7 +112,7 @@ test("uncertain writes wait for reconciliation, and confirmed pending failure no
 })
 
 test("zero-delay success requires its explicit fact, not countdown or request disappearance", async () => {
-  const f = fixture(true, 0); f.add(view("a", "complete"))
+  const f = fixture(true); f.add(view("a", "complete"))
   f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 0 } }])
   await settle(); assert.equal(f.messages.length, 0)
   f.policy.snapshot([]); f.policy.approved(view().request, target); await settle()
@@ -121,20 +121,27 @@ test("zero-delay success requires its explicit fact, not countdown or request di
   f.policy.dispose()
 })
 
-test("positive countdown plays attention, then confirmed success plays approval", async () => {
-  const f = fixture(true, 15); f.add(view("a", "complete"))
+test("positive countdown stays silent through submission and only confirmed success plays approval", async () => {
+  const f = fixture(true); f.add(view("a", "complete"))
   f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 15 } }])
-  await settle()
+  await f.advance(1000)
+  f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 14 } }])
+  await f.advance(14000)
+  for (const status of ["checking", "allowing"] as const) {
+    f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status } }])
+    await settle()
+  }
+  assert.equal(f.messages.length, 0, "no banner or sound before acknowledgement")
   f.policy.approved(view().request, target); f.policy.snapshot([]); await settle()
+  f.policy.approved(view().request, target); await settle()
   assert.deepEqual(f.messages.map(m => [m.kind, m.title, m.sound]), [
-    ["attention", "Reviewer will approve permission in 15 s", true],
     ["approved", "Reviewer approved a permission", true],
   ])
   f.policy.dispose()
 })
 
 test("every reviewer banner is delivered but its audio is rate limited without suppressing attention", async () => {
-  const f = fixture(true, 0)
+  const f = fixture(true)
   for (const id of ["a", "b"]) f.policy.approved(view(id).request, target)
   f.policy.question("q", target, true); await settle()
   assert.deepEqual(f.messages.map(m => [m.kind, m.sound]), [["approved", true], ["approved", false], ["attention", true]])
@@ -143,17 +150,17 @@ test("every reviewer banner is delivered but its audio is rate limited without s
 })
 
 test("turn outcomes deduplicate across error/idle; disable, mute, disposal and late handles are isolated", async () => {
-  const f = fixture(false, 15, true, false)
+  const f = fixture(false, true, false)
   f.policy.turn("error", "turn", target); f.policy.turn("ended", "turn", target)
   f.policy.turn("ended", "other", target); await settle()
   assert.deepEqual(f.messages.map(m => [m.title, m.sound]), [["Session error", false], ["Session ended", false]])
   f.policy.dispose(); f.policy.question("late", target, true); await settle(); assert.equal(f.messages.length, 2)
-  const disabled = fixture(false, 15, false)
+  const disabled = fixture(false, false)
   disabled.policy.question("new", target, true); disabled.policy.turn("error", "turn", target)
   await settle(); assert.equal(disabled.messages.length, 0); disabled.policy.dispose()
   let release!: (value: { close(): void }) => void
   let closed = 0
-  const policy = new NotificationPolicy({ notify: true, notifySound: true }, false, 15, {
+  const policy = new NotificationPolicy({ notify: true, notifySound: true }, false, {
     show: () => new Promise(resolve => { release = resolve }), dispose() {},
   })
   policy.question("q", target, true); await settle(); policy.resolved("question", "q")

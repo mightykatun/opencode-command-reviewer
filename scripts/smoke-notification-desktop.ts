@@ -52,7 +52,6 @@ if (process.argv.includes("--all")) {
   }, processes)
   const cases = [
     { kind: "attention", title: "Session needs attention" },
-    { kind: "attention", title: "Reviewer will approve permission in 5 s" },
     { kind: "approved", title: "Reviewer approved a permission" },
     { kind: "error", title: "Session error" },
     { kind: "ended", title: "Session ended" },
@@ -68,14 +67,13 @@ if (process.argv.includes("--all")) {
       while (playbacks.length === before && Date.now() < end) await sleep(50)
       assert.equal(playbacks.length, before + 1, `${item.title} must reach its sound player`)
       assert.equal(await playbacks[before], 0, `${item.title} sound playback must succeed`)
-      // Preserve the announced countdown interval and give each other banner
-      // time to be read without replacing or overlapping the following test.
-      await sleep(item.title.includes("in 5 s") ? 400 : 1500)
+      // Give each banner time to be read before the following test.
+      await sleep(1500)
       handle?.close()
     }
     await Promise.all(measurements)
     assert.equal(measurements.length, cases.length)
-    console.log("PASS: all five notification messages and their normalized sounds were delivered; every sound player exited successfully.")
+    console.log("PASS: all four notification messages and their normalized sounds were delivered; every sound player exited successfully.")
   } finally { await backend.dispose() }
 } else if (process.argv.includes("--sounds")) {
   const audio = new NotificationAudio(processes, new URL("../sounds/", import.meta.url).pathname)

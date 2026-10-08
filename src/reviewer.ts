@@ -2,10 +2,11 @@ import type { Config } from "./config.js"
 import type { Assessment, ReviewEvidence, ReviewProgress, ReviewResult } from "./types.js"
 import { BUILTIN_PROMPTS, CONTRACT, correctionPrompt, type PromptSet } from "./prompts.js"
 import { usageAttempt, sumUsage, type PricingLookup, type Usage } from "./usage.js"
-import { reviewStage } from "./deadline.js"
+import { remainingTime, reviewStage, withDeadline } from "./deadline.js"
 import { SSEParser } from "./sse.js"
 import { AssessmentFormatError, StreamingAssessment } from "./streaming-assessment.js"
 import { diagnosticAttempt, type DiagnosticObserver } from "./diagnostics.js"
+import { httpFailure, networkFailure, TransportRetries } from "./transport-retry.js"
 export { withDeadline } from "./deadline.js"
 export type { ReviewProgress } from "./types.js"
 
@@ -55,9 +56,9 @@ async function readBody(response: Response, signal: AbortSignal, consume: (bytes
       reviewStage(signal, "Reviewer response body")
       let part: ReadableStreamReadResult<Uint8Array>
       try { part = await abortable(reader.read(), signal) }
-      catch {
+      catch (error) {
         signal.throwIfAborted()
-        throw new Error("Reviewer response read failed")
+        throw networkFailure(error, "Reviewer response read failed")
       }
       signal.throwIfAborted()
       if (part.done) break
@@ -167,6 +168,15 @@ export async function review(
   onProgress?: (progress: ReviewProgress) => void,
   onDiagnostics?: DiagnosticObserver,
 ): Promise<ReviewResult> {
+  // Production already shares a deadline with evidence collection. Direct
+  // callers get the same bound, including all internal backoff and POSTs.
+  if (remainingTime(signal) === Infinity) {
+    let worker: Promise<ReviewResult> | undefined
+    try {
+      return await withDeadline(signal, config.timeoutMs, (bounded) =>
+        worker = review(evidence, config, bounded, fetcher, environment, prompts, pricing, onUsage, onProgress, onDiagnostics))
+    } finally { await worker?.catch(() => {}) }
+  }
   const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)
   if (config.apiKeyEnv && !key) throw new Error(`API key environment variable ${config.apiKeyEnv} is unset or empty`)
   const prompt = prompts[evidence.kind]
@@ -175,7 +185,9 @@ export async function review(
     { role: "user", content: JSON.stringify(evidence) },
   ]
   let usage: Usage | undefined
-  for (let attempt = 0; attempt <= config.formatRetries; attempt++) {
+  let corrections = 0
+  const retries = new TransportRetries()
+  for (let attempt = 0; ; attempt++) {
     signal.throwIfAborted()
     const progress = (phase: ReviewProgress["phase"], preview?: Partial<Assessment>) => {
       if (signal.aborted) return
@@ -184,6 +196,10 @@ export async function review(
     }
     progress(attempt ? "retrying" : "evaluating")
     const accounting = usageAttempt(config.baseURL, config.model, pricing, onUsage)
+    const requestAbort = new AbortController()
+    let contentStarted = false
+    let failed = false
+    let failure: unknown
     try {
       reviewStage(signal, "Reviewer response")
       let response: Response
@@ -191,26 +207,27 @@ export async function review(
       try {
         const body = JSON.stringify({ model: config.model, messages, stream: config.stream,
           ...(config.stream ? { stream_options: { include_usage: true } } : {}) })
+        reviewStage(signal, "Reviewer response")
         diagnose = onDiagnostics ? diagnosticAttempt(onDiagnostics, attempt) : undefined
         response = await abortable(fetcher(`${config.baseURL}/chat/completions`, {
-          method: "POST", redirect: "error", signal,
+          method: "POST", redirect: "error", signal: AbortSignal.any([signal, requestAbort.signal]),
           headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
           body,
         }), signal, cancelBody)
         diagnose?.("headers")
-      } catch {
+      } catch (error) {
         signal.throwIfAborted()
-        throw new Error("Reviewer network request failed")
+        throw networkFailure(error, "Reviewer network request failed")
       }
       if (!response.ok) {
         cancelBody(response)
-        throw new Error(`Reviewer HTTP ${response.status}`)
+        throw httpFailure(response)
       }
       let assessment: StreamingAssessment
       if (config.stream) assessment = await streamedAssessment(response, signal, accounting, (preview) => {
         if (typeof preview?.safe === "boolean") diagnose?.("first-rating")
         progress("streaming", preview)
-      }, diagnose ? () => diagnose("first-content") : undefined)
+      }, () => { contentStarted = true; diagnose?.("first-content") })
       else {
         let envelope: unknown
         try { envelope = JSON.parse(await responseText(response, signal)) }
@@ -232,33 +249,39 @@ export async function review(
           || (choice.finish_reason !== undefined && choice.finish_reason !== "stop")) {
           throw new Error("Reviewer API did not return a text assessment")
         }
-        if (message.content) diagnose?.("first-content")
+        if (message.content) { contentStarted = true; diagnose?.("first-content") }
         assessment = new StreamingAssessment()
         assessment.push(message.content)
         if (diagnose && typeof assessment.preview()?.safe === "boolean") diagnose("first-rating")
       }
       reviewStage(signal, "Assessment validation")
       const currentUsage = accounting.current()
-      usage = attempt === 0 ? currentUsage : sumUsage(usage, currentUsage)
+      const reportUsage = attempt === 0 ? currentUsage : sumUsage(usage, currentUsage)
       try {
         let result: Assessment
         try { result = assessment.finish() } finally { diagnose?.("final-validation") }
         if (config.stream) progress("streaming", result)
         signal.throwIfAborted()
-        return { ...result, ...(usage ? { usage } : {}) }
+        return { ...result, ...(reportUsage ? { usage: reportUsage } : {}) }
       }
       catch (error) {
         if (!(error instanceof AssessmentFormatError)) throw error
-        if (attempt === config.formatRetries) throw new Error("Reviewer response format invalid after configured attempts")
+        if (corrections++ === config.formatRetries) throw new Error("Reviewer response format invalid after configured attempts")
         messages.push(
           { role: "assistant", content: assessment.content },
           { role: "user", content: correctionPrompt(error.message) },
         )
       }
+    } catch (error) {
+      requestAbort.abort()
+      if (contentStarted) throw error
+      failed = true
+      failure = error
     } finally {
       // Disposal must await aborted review workers before flushing their queued accounting writes.
-      accounting.finalize()
+      const currentUsage = accounting.finalize()
+      usage = attempt === 0 ? currentUsage : sumUsage(usage, currentUsage)
     }
+    if (failed && !await retries.wait(failure, signal)) throw failure
   }
-  throw new Error("Reviewer exhausted attempts")
 }

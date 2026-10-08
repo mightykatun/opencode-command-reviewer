@@ -62,6 +62,159 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   }
 })
 
+test("transient HTTP failures recover with byte-identical POSTs and independent format correction", async t => {
+  const bad = '{"safe":"yes","desc":"Needs correction."}'
+  const { config, requests } = await endpoint(t, (index, res) => {
+    if (index === 0 || index === 2) { res.writeHead(index === 0 ? 429 : 503, { "Retry-After": "0" }); res.end("PRIVATE"); return }
+    res.end(envelope(index === 1 ? bad : '{"safe":true,"desc":"Recovered."}'))
+  })
+  const progress: ReviewProgress[] = []
+  const result = await review(evidence, config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, undefined, p => { progress.push(p) })
+  assert.deepEqual(result, { safe: true, desc: "Recovered." })
+  assert.equal(requests.length, 4)
+  assert.deepEqual(requests[0]!.body, requests[1]!.body)
+  assert.deepEqual(requests[2]!.body, requests[3]!.body)
+  assert.equal(requests[2]!.body.messages.length, 4)
+  assert.equal(requests[2]!.body.messages[2].content, bad)
+  assert.doesNotMatch(JSON.stringify(requests), /PRIVATE|HTTP 429|HTTP 503/)
+  assert.deepEqual(progress.map(p => [p.attempt, p.phase]), [[0, "evaluating"], [1, "retrying"], [2, "retrying"], [3, "retrying"]])
+})
+
+test("transient HTTP status allowlist has a two-retry cap even with format retries disabled", async t => {
+  await Promise.all([408, 429, 500, 502, 503, 504].map(async status => {
+    const { config, requests } = await endpoint(t, (_, res) => { res.writeHead(status); res.end("PRIVATE") })
+    await assert.rejects(review(evidence, { ...config, formatRetries: 0 }, signal()), { message: `Reviewer HTTP ${status}` })
+    assert.equal(requests.length, 3)
+    assert.ok(requests.every(request => JSON.stringify(request.body) === JSON.stringify(requests[0]!.body)))
+  }))
+})
+
+test("real connection resets before headers recover without changing evidence or authentication", async t => {
+  const { config, requests } = await endpoint(t, (index, res) => {
+    if (index === 0) { res.destroy(); return }
+    res.end(envelope('{"safe":false,"desc":"Recovered connection."}'))
+  })
+  const result = await review(evidence, { ...config, apiKey: "fixture-secret" }, signal())
+  assert.equal(result.safe, false)
+  assert.equal(requests.length, 2)
+  assert.deepEqual(requests[0], requests[1])
+  assert.equal(requests[1]!.authorization, "Bearer fixture-secret")
+})
+
+test("format correction cannot replenish the transport retry budget", async () => {
+  let calls = 0
+  const config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture", formatRetries: 10 })
+  await assert.rejects(review(evidence, config, signal(), async () => {
+    if (++calls === 2) return new Response(envelope('{"safe":"yes","desc":"Invalid."}'))
+    return new Response(null, { status: 503 })
+  }), /HTTP 503/)
+  assert.equal(calls, 4, "one format correction plus two total transport retries")
+})
+
+test("a disconnected non-streaming body restarts the exact POST rather than joining partial envelopes", async () => {
+  let calls = 0, reads = 0
+  const bodies: string[] = []
+  const config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture" })
+  const result = await review(evidence, config, signal(), async (_, init) => {
+    bodies.push(init!.body as string)
+    if (++calls > 1) return new Response(envelope('{"safe":false,"desc":"Fresh response."}'))
+    return new Response(new ReadableStream({ pull(writer) {
+      if (reads++ === 0) writer.enqueue(Buffer.from('{"choices":['))
+      else writer.error(Object.assign(new Error("PRIVATE"), { code: "UND_ERR_SOCKET" }))
+    } }))
+  })
+  assert.deepEqual(result, { safe: false, desc: "Fresh response." })
+  assert.equal(calls, 2)
+  assert.equal(bodies[0], bodies[1])
+})
+
+test("retry attempts have distinct diagnostic ordinals and cannot outlive the original deadline", async () => {
+  const abort = new AbortController(), config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture", timeoutMs: 1000 })
+  const dispatches: number[] = []
+  let calls = 0, secondAborted = false
+  const start = performance.now()
+  await assert.rejects(review(evidence, config, abort.signal, async (_, init) => {
+    if (++calls === 1) return new Response(null, { status: 503 })
+    init!.signal!.addEventListener("abort", () => { secondAborted = true }, { once: true })
+    return new Promise<Response>(() => {})
+  }, {}, BUILTIN_PROMPTS, undefined, undefined, undefined, e => {
+    if (e.phase === "dispatch") dispatches.push(e.attempt!)
+  }), /timed out/)
+  assert.equal(calls, 2)
+  assert.equal(secondAborted, true)
+  assert.deepEqual(dispatches, [0, 1])
+  assert.ok(performance.now() - start < 1800, "the second request must not get a new full timeout")
+})
+
+test("backoff cancellation and insufficient review time never dispatch another POST", async t => {
+  const abort = new AbortController(), reason = new Error("native resolution")
+  let calls = 0
+  const fetcher: typeof fetch = async () => { calls++; return new Response(null, { status: 503 }) }
+  const config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture" })
+  const pending = review(evidence, config, abort.signal, fetcher)
+  await sleep(10)
+  abort.abort(reason)
+  await assert.rejects(pending, error => error === reason)
+  assert.equal(calls, 1)
+  calls = 0
+  await assert.rejects(review(evidence, { ...config, timeoutMs: 200 }, signal(), fetcher), /HTTP 503/)
+  assert.equal(calls, 1)
+  const { config: real, requests } = await endpoint(t, (_, res) => {
+    res.writeHead(429, { "Retry-After": "5" }); res.end("PRIVATE")
+  })
+  await assert.rejects(review(evidence, { ...real, timeoutMs: 1000 }, signal()), /HTTP 429/)
+  assert.equal(requests.length, 1)
+})
+
+test("failed POSTs finalize received-only usage before backoff without inventing complete report totals", async () => {
+  const config = parseConfig({ baseURL: "https://openrouter.ai/api/v1", model: "fixture", stream: true })
+  const observed: Usage[] = [], requests: string[] = []
+  let aborted = false
+  const fetcher: typeof fetch = async (_, init) => {
+    requests.push(init!.body as string)
+    if (requests.length === 1) {
+      init!.signal!.addEventListener("abort", () => { aborted = true }, { once: true })
+      let read = 0
+      return new Response(new ReadableStream({ pull(writer) {
+        if (read++ === 0) writer.enqueue(Buffer.from(event({ choices: [], usage: { cost: 0.01 } })))
+        else writer.error(Object.assign(new Error("PRIVATE"), { code: "ECONNRESET" }))
+      } }), { headers: { "Content-Type": "text/event-stream" } })
+    }
+    assert.equal(aborted, true)
+    assert.deepEqual(observed, [{ cost: 0.01 }], "accounting settles before the next request")
+    return streamText(event(chunk('{"safe":true,"desc":"Recovered."}', "stop"))
+      + event({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 2, cost: 0.02 } }) + done)
+  }
+  const result = await review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined, u => { observed.push(u) })
+  assert.deepEqual(result.usage, { cost: 0.03 }, "only cost covers both POSTs")
+  assert.deepEqual(requests[0], requests[1])
+  assert.equal(observed.length, 2)
+
+  let calls = 0
+  const recovered = await review(evidence, { ...config, stream: false }, signal(), async () => {
+    if (++calls === 1) return new Response(null, { status: 503 })
+    return Response.json({ choices: [{ message: { content: '{"safe":true,"desc":"Recovered."}' } }], usage: { cost: 0.02 } })
+  }, {}, BUILTIN_PROMPTS, undefined, u => { observed.push(u) })
+  assert.equal(recovered.usage, undefined, "an unreported failed attempt is not free")
+  assert.equal(observed.length, 3, "the successful POST still contributes to lifetime")
+})
+
+test("streamed assessment content prevents transport retries even before a complete rating", async () => {
+  for (const text of ['{"safe":', '{"safe":true,', '{"desc":"partial']) {
+    let calls = 0, read = 0
+    const previews: ReviewProgress[] = []
+    await assert.rejects(review(evidence, streamConfig(), signal(), async () => {
+      calls++
+      return new Response(new ReadableStream({ pull(writer) {
+        if (read++ === 0) writer.enqueue(Buffer.from(event(chunk(text))))
+        else writer.error(Object.assign(new Error("PRIVATE"), { code: "ECONNRESET" }))
+      } }), { headers: { "Content-Type": "text/event-stream" } })
+    }, {}, BUILTIN_PROMPTS, undefined, undefined, p => { previews.push(p) }), { message: "Reviewer response read failed" })
+    assert.equal(calls, 1)
+    assert.ok(previews.every(p => p.attempt === 0))
+  }
+})
+
 test("review switches are independent strict booleans with enabled defaults", () => {
   const options = { baseURL: "http://localhost/v1", model: "m" }
   for (const reviewBash of [true, false]) for (const reviewEdits of [true, false]) {
@@ -905,7 +1058,7 @@ test("aborting pending reads ignores fetcher signal cooperation and hanging canc
         if (atEOF) { writer.close(); controller.abort() }
       },
       cancel() { cancelCalls++; return new Promise(() => {}) },
-    })
+    }, { highWaterMark: 0 }) // Pull only when the dispatched request's reader asks for data.
     const response = new Response(body, { headers: { "Content-Type": stream ? "text/event-stream" : "application/json" } })
     const promise = review(evidence, { ...streamConfig(), stream }, controller.signal, async () => { calls++; return response }, {}, BUILTIN_PROMPTS,
       undefined, (usage) => observed.push(usage))
@@ -994,8 +1147,8 @@ test("abort at EOF after decoded terminal usage finalizes once and never returns
   assert.equal(progress.filter((value) => value.preview?.desc === "x").length, 1, "only a provisional report was emitted")
 })
 
-test("stream MIME mismatch and HTTP errors cancel without waiting for cleanup or making another POST", { timeout: 3000 }, async () => {
-  for (const [status, contentType, expected] of [[200, "application/json", /expected an SSE/], [503, "text/event-stream", /HTTP 503/]] as const) {
+test("stream MIME mismatch and terminal HTTP errors cancel without waiting for cleanup or making another POST", { timeout: 3000 }, async () => {
+  for (const [status, contentType, expected] of [[200, "application/json", /expected an SSE/], [401, "text/event-stream", /HTTP 401/]] as const) {
     let canceled = false, calls = 0
     const body = new ReadableStream({ cancel() { canceled = true; return new Promise(() => {}) } })
     const response = new Response(body, { status, headers: { "Content-Type": contentType } })
@@ -1057,7 +1210,7 @@ test("complete SSE reviews discard stale estimates from report and lifetime but 
     assert.equal(calls, 1)
     const totals = await new LifetimeUsage(directory).totals()
     assert.deepEqual({ ...totals, since: null }, { requests: 1, tokenRequests: 1, input: 100, output,
-      priced: reported ? 1 : 0, cost: reported ? 0.000102 : 0, since: null })
+      priced: reported ? 1 : 0, cost: reported ? 0.000102 : 0, since: null, safe: 0, unsafe: 0, ratingsSince: null })
     assert.equal(lifetimeCost(totals), reported ? "lifetime: $0.0001" : "lifetime: cost unavailable")
   })
 })

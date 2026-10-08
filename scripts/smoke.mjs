@@ -17,6 +17,8 @@ const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
 const scenario = process.argv[2] ?? "correction"
 const measureReuse = process.argv.includes("--measure-reuse")
 const notifications = process.argv.includes("--notifications")
+const networkRetry = process.argv.includes("--network-retry")
+if (networkRetry) assert.equal(scenario, "auto-shell", "network recovery uses the auto-shell fixture")
 if (measureReuse) assert.equal(scenario, "external", "reuse baseline uses the two-stage external fixture")
 assert.ok(["correction", "cancel", "error", "stalled-file", "external", "edit", "write", "patch", "edit-cancel", "edit-config-error", "edit-disabled", "bash-disabled", "external-disabled", "auto-shell", "auto-cancel", "auto-scroll", "auto-edit", "auto-external", "auto-immediate", "auto-zero", "auto-unsafe", "auto-error", "auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow", "auto-manual", "auto-initially-hidden"].includes(scenario))
 const auto = scenario.startsWith("auto-")
@@ -200,7 +202,14 @@ const handleRequest = async (req, res) => {
         await assert.rejects(access(path.join(commandDirectory, "executed-marker")), "review request must precede native execution")
         if (isEdit) await assertEditsUnchanged()
       }
-      if (scenario === "error" || scenario === "auto-error") { res.writeHead(503); res.end("fixture outage"); record("review-error"); return }
+      if (scenario === "error" || scenario === "auto-error") { res.writeHead(401); res.end("fixture authentication failure"); record("review-error"); return }
+      if (networkRetry && reviewerCalls <= 2) {
+        observation.transportRetry()
+        res.writeHead(reviewerCalls === 1 ? 429 : 503, { "Retry-After": "1" })
+        res.end("PRIVATE transient fixture failure")
+        record(`transient-response-${reviewerCalls}`)
+        return
+      }
       const reply = () => {
         res.writeHead(200, { "Content-Type": "application/json" })
         const content = correction && reviewerCalls === 1
@@ -373,6 +382,7 @@ try {
     if (knownPricing) assert.match(sidebarText, correction ? /cost: \$0\.0011/ : /cost: \$0\.0005/)
     else assert.doesNotMatch(sidebarText, /cost:\s*\$/, "unknown pricing must not invent a cost")
     await until((s) => s.includes(knownPricing ? "lifetime: $" : "lifetime: cost unavailable"), 5000)
+    await until((s) => s.includes(scenario === "patch" ? "Safe: 0 · Unsafe: 1" : "Safe: 1 · Unsafe: 0"), 5000)
     const lifetimeAnsi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
     assert.equal(styleAt(lifetimeAnsi, "lifetime:").fg, styleAt(lifetimeAnsi, "fullscreen").fg)
     if (knownPricing) {
@@ -424,7 +434,8 @@ try {
         "assessment must be painted before the full countdown is visible")
       await unchanged()
       const ansi = await save(stage)
-      if (scenario === "auto-shell") await assertUsage()
+      if (scenario === "auto-shell" && !networkRetry) await assertUsage()
+      if (networkRetry) assert.doesNotMatch(capture(), /token: \d+ in \d+ out|lifetime:/, "unreported failed POSTs leave report-wide usage unknown")
       assert.equal(styleAt(ansi, "✓ Safe").fg, "127,216,143")
       assert.equal(styleAt(ansi, "✓ Safe").bold, true)
       for (const property of ["fg", "bg"]) {
@@ -460,7 +471,7 @@ try {
       assert.equal(styleAt(ansi, expected).fg, scenario === "auto-unsafe" ? "224,108,117" : "245,167,66")
       assert.equal(styleAt(ansi, expected).bold, true, "status icon and text must be bold")
       if (scenario === "auto-error") {
-        assert.match(screen, /Reviewer HTTP 503/)
+        assert.match(screen, /Reviewer HTTP 401/)
         assert.doesNotMatch(screen, /fixture outage|✓ Safe|✗ Unsafe/)
       }
       await pendingFor(autoDelay * 1000 + 500, (s) => { assert.ok(s.includes(expected)); noFooter(s) })
@@ -611,7 +622,7 @@ try {
         assert.equal(await readFile(path.join(commandDirectory, "executed-marker"), "utf8"), "2")
         const executions = (await readFile(path.join(commandDirectory, "execution-log"), "utf8")).trim().split("\n")
         assert.equal(executions.length, 1, "native tool must execute exactly once, including after the original deadline")
-        assert.ok(Number(executions[0]) >= events.find((event) => event.event === "review-response-1").at,
+        assert.ok(Number(executions[0]) >= events.find((event) => event.event === `review-response-${networkRetry ? 3 : 1}`).at,
           "even zero delay requires a completed reviewer response before native execution")
       }
     }
@@ -623,7 +634,11 @@ try {
       && call.body.messages.some((message) => message.role === "tool" && message.tool_call_id === "call_fixture")), 10000)
     if (canceled || manualResult) await unchanged()
     assert.ok(!events.some((event) => event.event.startsWith("fixture-error:")), "fixture HTTP handler must not fail")
-    assert.equal(reviewerCalls, scenario === "auto-external" ? 2 : 1)
+    assert.equal(reviewerCalls, networkRetry ? 3 : scenario === "auto-external" ? 2 : 1)
+    if (networkRetry) for (let attempt = 1; attempt <= 2; attempt++) {
+      assert.ok(events.find(e => e.event === `review-request-${attempt + 1}`).at - events.find(e => e.event === `transient-response-${attempt}`).at >= 950,
+        "real host must honor the provider cooldown before its next POST")
+    }
     for (const review of reviews()) {
       assert.match(review.body.messages[0].content, /Take extra care/)
       assert.doesNotMatch(JSON.stringify(review.body), /autoApprove|countdown|automatic approval/)
@@ -689,7 +704,7 @@ try {
       } else if (heldReview || scenario === "error" || configFailure) {
         assert.doesNotMatch(sidebarText, /✓ Safe|✗ Unsafe/, "pending or failed reviews must not fabricate a rating")
       }
-      if (scenario === "error") assert.match(sidebarText, /Reviewer HTTP 503/)
+      if (scenario === "error") assert.match(sidebarText, /Reviewer HTTP 401/)
       if (configFailure) assert.match(sidebarText, /Contract prompt overrides/)
       if (scenario === "correction") {
         assert.ok(screen.includes("Output: prints the count."), "formatted list should be visible")
@@ -973,6 +988,7 @@ try {
         assert.match(screen, /token: 1000 in 40 out/)
         assert.match(screen, /Token counts available: 2\/2 requests/)
         assert.match(screen, /Pricing available: 2\/2 requests/)
+        assert.match(screen, /Safe: 1 · Unsafe: 0/, "one final rating survives restart despite two format attempts")
         assert.doesNotMatch(screen, /Permission analysis/)
       }
       await showLifetime()
@@ -990,7 +1006,7 @@ try {
     await writeFile(path.join(root, `.runtime/${scenario}-requests.json`), JSON.stringify(calls, null, 2))
     console.log(`PASS ${scenario}: native approval, exact evidence, advisory behavior, panel cleanup${scenario === "cancel" ? ", >6s held response, observed HTTP cancellation, released late response and clean sidebar remount at 80x24" : scenario === "correction" ? ", long-analysis wheel/drag, live scrollbar theme and native fullscreen layering" : ""}. Isolated files: ${temp}`)
   }
-  audit.verify(plan.reviewKinds, plan.attemptsPerReview)
+  audit.verify(plan.reviewKinds, plan.attemptsPerReview + (networkRetry ? 2 : 0))
   assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)
   if (measureReuse) assertReviewerReuse(metrics.snapshot())
   if (notificationRecords) {
@@ -1001,20 +1017,20 @@ try {
     const banners = records.filter(record => record.event === "notification")
     assert.ok(banners.length, "the real host must emit a notification")
     const countdowns = banners.filter(record => record.title.startsWith("Reviewer will approve permission"))
+    assert.equal(countdowns.length, 0, "auto-approval countdowns must not send notifications")
     const approvals = banners.filter(record => record.title === "Reviewer approved a permission")
     const attention = banners.filter(record => record.title === "Session needs attention")
     if (["auto-shell", "auto-edit", "auto-external", "auto-scroll"].includes(scenario)) {
-      assert.equal(countdowns.length, plan.reviewKinds.length)
       assert.equal(approvals.length, plan.reviewKinds.length)
       assert.equal(attention.length, 0)
+      assert.ok(!records.some(record => record.event === "sound" && record.kind === "attention"), "successful auto-approval must not play attention audio")
       assert.ok(banners.some(record => record.title === "Session ended"))
     } else if (scenario === "auto-zero") {
       assert.equal(countdowns.length, 0); assert.equal(approvals.length, 1); assert.equal(attention.length, 0)
     } else if (["auto-unsafe", "auto-error", "error", "bash-disabled", "edit-disabled", "external-disabled", "correction"].includes(scenario)) {
       assert.ok(attention.length >= 1); assert.equal(countdowns.length, 0); assert.equal(approvals.length, 0)
     } else if (["auto-cancel", "auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow"].includes(scenario)) {
-      assert.equal(countdowns.length, 1); assert.equal(attention.length, 1); assert.equal(approvals.length, 0)
-      assert.ok(records.some(record => record.event === "withdraw" && record.id === countdowns[0].id))
+      assert.equal(attention.length, 1); assert.equal(approvals.length, 0)
     }
     assertNotificationAudio(assert, records)
     await writeFile(path.join(root, `.runtime/${scenario}-notifications.json`), JSON.stringify(records, null, 2))

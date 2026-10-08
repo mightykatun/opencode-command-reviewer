@@ -89,7 +89,7 @@ export function usageAttempt(baseURL: string, requestedModel: string, pricing?: 
   }
 }
 
-/** Report components must cover the entire correction chain, independently of lifetime recording. */
+/** Report components must cover every POST, including transport recovery and corrections. */
 export function sumUsage(previous: Usage | undefined, next: Usage | undefined): Usage | undefined {
   if (!previous || !next) return
   const result: Usage = {}

@@ -5,7 +5,8 @@ import { LifetimeRefresh } from "../src/lifetime-refresh.js"
 import type { LifetimeTotals } from "../src/lifetime.js"
 
 const totals = (requests: number): LifetimeTotals => ({ requests, tokenRequests: requests, input: requests * 10,
-  output: requests * 2, priced: requests, cost: requests * 0.01, since: requests ? 1700000000000 : null })
+  output: requests * 2, priced: requests, cost: requests * 0.01, since: requests ? 1700000000000 : null,
+  safe: 0, unsafe: 0, ratingsSince: null })
 
 function deferred<T>() {
   let resolve!: (value: T) => void

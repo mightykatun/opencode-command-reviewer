@@ -9,7 +9,7 @@ import { uiText } from "./ui-text.js"
 /** Independent accounting UI: no session writes and no dependency on review visibility. */
 export function lifetimeTracker(api: TuiPluginApi) {
   const directory = path.join(api.state.path.state, "opencode-reviewer")
-  const store = new LifetimeUsage(path.join(directory, "usage-v2"), path.join(directory, "usage-v1"))
+  const store = new LifetimeUsage(path.join(directory, "usage-v3"), path.join(directory, "usage-v2"), path.join(directory, "usage-v1"))
   const [totals, setTotals] = createSignal<LifetimeTotals>()
   const [unavailable, setUnavailable] = createSignal(false)
   const refresh = new LifetimeRefresh((signal) => store.totals(signal), (value) => {
@@ -33,10 +33,14 @@ export function lifetimeTracker(api: TuiPluginApi) {
   return {
     // The controller must settle aborted review workers before this final queue drain.
     flush: () => store.flush().catch(() => {}),
-    text: () => unavailable() ? uiText.lifetime.inlineUnavailable : totals()?.requests ? lifetimeCost(totals()!) : undefined,
+    text: () => unavailable() ? uiText.lifetime.inlineUnavailable : totals()?.requests
+      ? [lifetimeCost(totals()!), uiText.lifetime.ratings(totals()!.safe, totals()!.unsafe)].join("\n") : undefined,
     record: (usage: Usage) => {
       // Finalizers still enqueue writes after the refresh coordinator is stopped.
       void store.record(usage).then(() => refresh.refresh(), () => refresh.failed())
+    },
+    recordRating: (safe: boolean) => {
+      void store.recordRating(safe).then(() => refresh.refresh(), () => refresh.failed())
     },
   }
 }

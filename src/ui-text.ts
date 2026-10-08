@@ -60,6 +60,9 @@ export const uiText = {
     tokenCoverage: (available: number, total: number) => `Token counts available: ${available}/${total} requests`,
     pricingCoverage: (available: number, total: number) => `Pricing available: ${available}/${total} requests`,
     since: (date: string) => `Recorded since: ${date}`,
+    ratings: (safe: number, unsafe: number) => `Safe: ${safe} · Unsafe: ${unsafe}`,
+    ratingsSince: (date: string) => `Ratings recorded since: ${date}`,
+    ratingsExplanation: "Ratings count completed, validated reviews, including those without usage data. Previews, retries and failed or interrupted analyses do not count. A fresh review after re-enabling counts again. Earlier ratings were not recorded and cannot be recovered.",
     explanation: "Received usage only, including interrupted or unsuccessful reviews. Unreported charges remain unknown. Costs combine endpoint-reported amounts and catalog estimates; legacy history retains its original estimates. Earlier unrecorded usage cannot be recovered.",
   },
   notifications: {
@@ -68,7 +71,6 @@ export const uiText = {
     openSession: "Open session",
     fallbackSession: "OpenCode session",
     attention: "Session needs attention",
-    countdown: (seconds: number) => `Reviewer will approve permission in ${seconds} s`,
     approved: "Reviewer approved a permission",
     error: "Session error",
     ended: "Session ended",

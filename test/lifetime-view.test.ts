@@ -10,7 +10,8 @@ import { lifetimeTracker } from "../src/lifetime-view.js"
 import { usageAttempt } from "../src/usage.js"
 
 const totals = (requests: number): LifetimeTotals => ({ requests, tokenRequests: requests, input: requests * 10,
-  output: requests * 2, priced: requests, cost: requests * 0.01, since: 1700000000000 })
+  output: requests * 2, priced: requests, cost: requests * 0.01, since: 1700000000000,
+  safe: requests, unsafe: 0, ratingsSince: requests ? 1700000000000 : null })
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -20,7 +21,7 @@ function deferred<T>() {
 
 async function fixture(t: TestContext) {
   const state = await mkdtemp(path.join(tmpdir(), "review-lifetime-ui-"))
-  const directory = path.join(state, "opencode-reviewer", "usage-v2")
+  const directory = path.join(state, "opencode-reviewer", "usage-v3")
   const originalTotals = LifetimeUsage.prototype.totals
   const calls: { signal: AbortSignal; value: ReturnType<typeof deferred<LifetimeTotals>>; cleanup: ReturnType<typeof deferred<void>> }[] = []
   let actual = 0, maximum = 0, replacements = 0, open = false, unregistered = 0
@@ -69,14 +70,14 @@ test("palette refresh updates tracker state without replacing or reopening a dis
   assert.equal(f.counts().replacements, 0)
   f.finish(0, totals(1))
   await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0100")
+  assert.equal(f.tracker.text(), "lifetime: $0.0100\nSafe: 1 · Unsafe: 0")
   f.command.run()
   await settle()
   assert.equal(f.counts().replacements, 1)
   f.dismiss()
   f.finish(1, totals(2))
   await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0200")
+  assert.equal(f.tracker.text(), "lifetime: $0.0200\nSafe: 2 · Unsafe: 0")
   assert.equal(f.counts().replacements, 1)
   assert.equal(f.counts().open, false)
 })
@@ -104,7 +105,23 @@ test("write failure invalidates older queued totals and a later successful recor
   assert.equal(f.counts().reads, 2)
   f.finish(1, saved)
   await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.3000")
+  assert.equal(f.tracker.text(), "lifetime: $0.3000\nSafe: 0 · Unsafe: 0")
+})
+
+test("rating-only records persist and refresh independently of request usage", async t => {
+  const f = await fixture(t)
+  f.tracker.recordRating(true); f.tracker.recordRating(false)
+  await f.tracker.flush(); await settle()
+  const saved = await f.saved()
+  assert.equal(saved.requests, 0)
+  assert.equal(saved.safe, 1); assert.equal(saved.unsafe, 1)
+  f.finish(0, totals(0)); await settle()
+  f.finish(1, saved); await settle()
+  assert.equal(f.tracker.text(), undefined, "rating-only history stays in the palette without standalone inline usage")
+  f.tracker.record({ cost: 0.1 })
+  await f.tracker.flush(); await settle()
+  f.finish(2, await f.saved()); await settle()
+  assert.equal(f.tracker.text(), "lifetime: $0.1000\nSafe: 1 · Unsafe: 1")
 })
 
 test("disposal finalizers record and flush while timed-out totals cleanup remains outstanding", async (t) => {

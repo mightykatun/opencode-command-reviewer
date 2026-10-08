@@ -62,7 +62,7 @@ export class Controller {
   constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
     private options: Options = { reviewBash: true, reviewEdits: true },
     private approval?: Approval, private time: ApprovalClock = clock, private modes?: SessionModeGate,
-    private approvalObserver?: ApprovalObserver) {}
+    private approvalObserver?: ApprovalObserver, private ratingObserver?: (safe: boolean) => unknown) {}
   get revision() { return this.version }
   get views() { return [...this.entries.values()].map((entry) => entry.view) }
   private publish() { if (!this.stopped) this.changed(this.views) }
@@ -326,6 +326,11 @@ export class Controller {
       if (active()) {
         entry.view = assessment ? { ...entry.view, status: "complete", assessment, progress: undefined }
           : { ...entry.view, status: "unrelated", progress: undefined }
+        // Count final accepted reviews, not previews, transport attempts or UI
+        // publications. Accounting failures cannot affect review or approval.
+        if (assessment) {
+          try { void Promise.resolve(this.ratingObserver?.(assessment.safe)).catch(() => {}) } catch {}
+        }
         this.publish()
       }
     }, (error: unknown) => {
