@@ -46,7 +46,7 @@ OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-revie
 ```
 
 Only `baseURL` and `model` are required. Use any OpenAI-compatible Chat Completions
-endpoint; `/chat/completions` is appended to the base URL. Choose a model available
+endpoint: `/chat/completions` is appended to the base URL. Choose a model available
 at that endpoint.
 
 Replace `apiKey`, or remove it and set the variable named by `apiKeyEnv` before
@@ -58,7 +58,7 @@ The remaining values above are the defaults. Restart OpenCode after changing
 configuration. Reviews run when OpenCode asks for permission, so set the relevant
 rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 
-## Options
+## Options reference
 
 | Option | Behavior |
 | --- | --- |
@@ -81,6 +81,7 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 | `instructions` | Absolute directory containing overrides for the [prompt templates](https://github.com/mightykatun/opencode-reviewer/tree/main/prompts). Missing templates use the built-ins. |
 
 My LLMs insist on writing a bunch of useless text to my README, so I collapsed them here in case anyone wants to inflict themselves (or more likely their agent) the pain of reading it.
+
 <details>
 <summary>Usage</summary>
 The sidebar shows Safe, Unsafe, or Analysis unavailable. Explanations support
