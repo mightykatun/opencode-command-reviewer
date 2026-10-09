@@ -120,6 +120,9 @@ export class NotificationHost {
   }
   private selectBlockers() {
     if (this.stopped) return
+    this.policy.pending(this.blockers())
+  }
+  private blockers() {
     const pending = new Map<string, PendingInteraction>()
     const add = (kind: "permission" | "question", id: string, sessionID: string) => {
       if (!this.closed.has(`${kind}:${id}`) && !this.deletedSessions.has(sessionID)) pending.set(`${kind}:${id}`, { kind, id, sessionID })
@@ -132,7 +135,7 @@ export class NotificationHost {
       for (const request of this.questionSnapshot) add("question", request.id, request.sessionID)
       for (const [id, request] of this.questions) add("question", id, request.sessionID)
     }
-    this.policy.pending(notificationBlockers(new Set(this.roots.keys()), pending.values(), id => this.api.state.session.get(id)))
+    return notificationBlockers(new Set(this.roots.keys()), pending.values(), id => this.api.state.session.get(id))
   }
   private rootOf(id: string): string | undefined {
     const seen = new Set<string>()
@@ -228,7 +231,7 @@ export class NotificationHost {
     for (const request of this.permissions.values()) if (request.target) {
       request.target.title = this.api.state.session.get(request.target.root)?.title ?? uiText.notifications.fallbackSession
     }
-    this.policy.snapshot(views)
+    this.policy.snapshot(views, this.blockers())
     for (const [id, request] of this.permissions) this.admit("permission", id, request)
     const pending = new Set(views.map(v => v.request.id))
     for (const [id] of this.permissions) if (!pending.has(id)) this.resolved("permission", id)

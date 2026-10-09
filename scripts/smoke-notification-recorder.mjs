@@ -68,7 +68,7 @@ const tui = withNotificationProcesses(() => ({
 export default { id: plugin.id, tui: async (api, options) => {
   for (const type of ["permission.asked", "permission.replied", "question.asked", "question.replied", "question.rejected", "session.idle", "session.error"])
     api.event.on(type, event => record({ event: type, request: event.properties.requestID ?? event.properties.id,
-      error: event.properties.error?.name }))
+      session: event.properties.sessionID, reply: event.properties.reply, error: event.properties.error?.name }))
   api.lifecycle.onDispose(() => writes)
   return tui(api, options)
 } }

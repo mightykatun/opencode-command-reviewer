@@ -343,7 +343,12 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Keep TUI/controller wiring narrow and notifications off approval critical paths.
 - Track visited roots and descendants, with root titles only. Event births establish
   eligibility; startup snapshots/backlogs do not replay. Final validated assessments
-  gate attention, and final Safe reviews get one second to start their countdown.
+  gate permission attention. No elapsed grace period proves manual action is needed:
+  completed Safe requests with automatic approval enabled stay silent while waiting
+  for queue position, rendering or countdown. Only explicit canceled/manual status,
+  auto disabled, final Unsafe or terminal no-report outcomes qualify. Failed approval
+  requires confirmation that the permission remains pending, including after mode
+  suspension during an uncertain write. Never change approval eligibility for notifications.
   Manual-wait episodes deduplicate but can renew after canceled automation.
 - Dedicated `unsafe` notifications require a completed validated Unsafe assessment;
   `question` notifications use a purple question mark (default host accent #9d7cd8).
@@ -355,7 +360,12 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   `notification-order.ts` mirrors pinned native ordering: permissions before questions,
   then code-unit session/request order across roots and direct children. Baseline,
   disabled and silent requests still block; deeper descendants have no native root
-  input prompt and only get initial notifications. Handoff waits a full interval.
+  input prompt and only get initial question notifications. Initial permission
+  attention/Unsafe delivery also requires this queue position. Publish review outcomes
+  and queue selection atomically; handoff re-evaluates the current view, never a saved
+  notification decision. Losing position or eligibility aborts pending initial/reminder
+  delivery. Newly actionable manual permissions get their initial notification, then
+  reminders wait a full interval. Question reminder handoff also waits a full interval.
   `NotificationHost` polls the public pending-question list every two seconds under
   a five-second bound, retaining actual read ownership through late settlement.
   Revision guards reject event-raced snapshots; snapshots never create notification
@@ -401,6 +411,15 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   reminders, `auto-shell`/`auto-zero` check suppression, and `auto-cancel` checks renewal.
   All delivery effects remain isolated fixture process I/O. No real desktop focus
   or audible playback is inferred from these fixtures.
+- `node scripts/smoke-notification-queue.mjs main` covers three concurrent native bash
+  permissions whose Safe reports finish together before sequential automatic approvals.
+  `children` uses two real native task/subagent calls with overlapping child permissions.
+  Both reproduced false attention from the former one-second Safe fallback before the
+  eligibility fix. `mixed --stream` holds provisional reports (including Unsafe), then
+  checks a Safe automatic permission followed by queued Unsafe and failed-review manual
+  requests. `advisory` and `disabled` cover manual Safe reports and no-report queues.
+  `--stream` also works with `main`/`children`. Fixtures use only harmless isolated printf
+  commands and record artifacts under `.runtime/notification-queue-*.json`.
   `npx tsx scripts/smoke-notification-desktop.ts --sounds` exercises actual local
   playback. `--click` waits ten seconds before banners for manual cross-workspace
   and terminal-tab acceptance; `--critical` is a diagnostic-only test override.

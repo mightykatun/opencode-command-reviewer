@@ -199,9 +199,11 @@ heading's font weight. The event message appears beneath it, even while the
 terminal is focused:
 
 - **Session needs attention:** manual permissions. Reviewed requests
-  stay silent during identification and report generation; failures, canceled automation, and a Safe
-  review blocked from starting its countdown also notify. Unreviewed requests
-  notify immediately, including when conversation review is disabled.
+  stay silent during identification, report generation and retries. Final Safe
+  reports notify when auto-approval is disabled or canceled, or after failed approval
+  is confirmed to remain pending. Waiting for rendering, queue position or an
+  automatic countdown to start does not trigger attention. Disabled/unsupported
+  reviews and terminal analysis failures can notify without a report.
 - **Unsafe permission needs human approval:** a completed, validated Unsafe review,
   with its own sound. Provisional streamed ratings never notify.
 - **Agent has a question:** a pending agent question, with its own sound.
@@ -212,6 +214,14 @@ terminal is focused:
 - **Session error:** an unrecovered session/provider failure, not a review failure.
 - **Session ended:** a completed root-agent response, not a question/permission
   pause or an explicit user interruption.
+
+Permission attention and Unsafe notifications, including their reminders, apply
+only to the current native permission blocker in each visited root conversation.
+Requests queued behind it stay silent and are re-evaluated from their current
+review/approval state when they become actionable. A sequence that proceeds
+through automatic approval stays free of attention notifications. Losing the
+actionable position, restarting analysis or entering automatic approval cancels
+pending attention delivery and reminders.
 
 Each type's `banner` and `sound` can be controlled independently. For example,
 `notifications.approved.banner: false` keeps approval sounds without banners;
@@ -229,8 +239,8 @@ interaction per root conversation repeats: permissions precede questions, with
 the host's session/request ordering. Queued interactions wait; when the blocker
 changes, its replacement waits a full interval. Independent visited conversations
 can each remind. The supported host presents input for roots and direct children;
-deeper descendants still receive initial notifications but cannot become a native
-root-input reminder target.
+deeper descendants cannot become a native root-input permission notification or
+reminder target. Their questions can still receive initial question notifications.
 
 Answering/dismissing a question in OpenCode, resolving a permission, deleting its
 session or closing the plugin stops its reminders. Closing/clicking a desktop

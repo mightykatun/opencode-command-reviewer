@@ -255,3 +255,20 @@ test("question deadline expiry retains the actual read slot through late settlem
   await f.host.dispose(); release([]); await settle()
   assert.equal(f.banners.length, 1); assert.equal(f.timers.size, 0)
 })
+
+test("host publishes queue and review outcomes atomically across a snapshot-only handoff", async () => {
+  const f = fixture(undefined, { staleReminderSeconds: 1 })
+  f.host.visit("root"); await settle()
+  const a = request("a"), b = request("b")
+  f.emit("permission.asked", a); f.emit("permission.asked", b)
+  f.host.snapshot([{ request: a, status: "analyzing" }, { request: b, status: "complete", assessment: { safe: false, desc: "old report" } }])
+  await f.advance(5000); assert.equal(f.banners.length, 0)
+  // Reconciliation removes a as a new mode revision starts b's replacement review.
+  f.host.snapshot([{ request: b, status: "identifying", autoApproval: { status: "cancelled" } }])
+  await f.advance(5000); assert.equal(f.banners.length, 0)
+  f.host.snapshot([{ request: b, status: "complete", assessment: { safe: true, desc: "replacement" }, autoApproval: { status: "cancelled" } }])
+  await settle(); assert.deepEqual(f.banners.map(m => m.title), ["Session needs attention"])
+  f.host.snapshot([{ request: b, status: "analyzing", autoApproval: { status: "cancelled" } }])
+  await f.advance(5000); assert.equal(f.banners.length, 1)
+  await f.host.dispose()
+})

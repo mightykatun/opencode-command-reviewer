@@ -85,23 +85,24 @@ for (const status of ["unrelated", "unidentified", "unavailable", "suspended"] a
   })
 }
 
-test("safe render grace checks current state, silent countdown withdraws attention, cancellation renews it", async () => {
+test("Safe automatic requests wait silently for rendering and countdown; cancellation establishes manual attention", async () => {
   const f = fixture(true); f.add(view("a", "complete"))
   await f.advance(999); assert.equal(f.messages.length, 0)
-  await f.advance(1); assert.equal(f.messages[0]?.kind, "attention")
+  await f.advance(60000); assert.equal(f.messages.length, 0)
+  assert.equal(f.timers.size, 0, "no grace period can infer manual action")
   const countdown: View = { ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 15 } }
   f.policy.snapshot([countdown]); await settle()
-  assert.equal(f.messages.length, 1)
-  assert.equal(f.closed.length, 1)
+  assert.equal(f.messages.length, 0)
+  assert.equal(f.closed.length, 0)
   f.policy.snapshot([{ ...countdown, autoApproval: { status: "countdown", seconds: 14 } }]); await settle()
-  assert.equal(f.messages.length, 1)
+  assert.equal(f.messages.length, 0)
   f.policy.snapshot([{ ...countdown, autoApproval: { status: "cancelled" } }]); await settle()
-  assert.equal(f.messages[1]?.kind, "attention"); assert.equal(f.closed.length, 1)
-  f.policy.resolved("permission", "a"); assert.equal(f.closed.length, 2)
+  assert.equal(f.messages[0]?.kind, "attention"); assert.equal(f.closed.length, 0)
+  f.policy.resolved("permission", "a"); assert.equal(f.closed.length, 1)
   f.policy.dispose()
 })
 
-test("normal final rendering and request resolution cancel the grace timer", async () => {
+test("normal final rendering and request resolution never create a notification timer", async () => {
   const f = fixture(true); f.add(view("a", "complete"))
   f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 15 } }])
   await f.advance(1000)
@@ -238,11 +239,12 @@ test("only the selected blocker repeats per root, and queue handoff waits a full
   f.policy.question("q", target, true)
   f.policy.question("other", { ...target, root: "other", sessionID: "other" }, true)
   f.policy.pending(new Map([["root", { kind: "permission", id: "a" }], ["other", { kind: "question", id: "other" }]]))
-  await settle(); assert.equal(f.messages.length, 4)
+  await settle(); assert.equal(f.messages.length, 3, "queued Unsafe permission has no initial notification")
   await f.advance(10000)
-  assert.deepEqual(f.messages.slice(4).map(m => [m.kind, m.sessionID]), [["attention", "root"], ["question", "other"]])
+  assert.deepEqual(f.messages.slice(3).map(m => [m.kind, m.sessionID]), [["attention", "root"], ["question", "other"]])
   f.policy.resolved("permission", "a")
   f.policy.pending(new Map([["root", { kind: "permission", id: "b" }]]))
+  await settle(); assert.equal(f.messages[5]?.title, "Unsafe permission needs human approval", "newly actionable request gets its initial notification")
   await f.advance(9999); assert.equal(f.messages.length, 6)
   await f.advance(1); assert.equal(f.messages[6]?.kind, "unsafe")
   f.policy.pending(new Map([["root", { kind: "permission", id: "baseline" }]]))
@@ -255,16 +257,16 @@ test("only the selected blocker repeats per root, and queue handoff waits a full
 test("automatic approval, uncertain writes and disposal cancel pending reminders", async () => {
   const f = fixture(true, true, true, { staleReminderSeconds: 1 })
   f.add(view("a", "complete")); await f.advance(1000)
-  assert.equal(f.messages.length, 1)
+  assert.equal(f.messages.length, 0)
   for (const status of ["countdown", "checking", "allowing", "failed"] as const) {
     f.policy.snapshot([{ ...view("a", "complete"), autoApproval: status === "countdown" ? { status, seconds: 15 } : { status } }])
-    await f.advance(2000); assert.equal(f.messages.length, 1)
+    await f.advance(2000); assert.equal(f.messages.length, 0)
   }
   f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "failed" }, approvalPendingConfirmed: true }])
-  await settle(); assert.equal(f.messages.length, 2)
-  await f.advance(1000); assert.equal(f.messages.length, 3)
+  await settle(); assert.equal(f.messages.length, 1)
+  await f.advance(1000); assert.equal(f.messages.length, 2)
   await f.policy.dispose(); assert.equal(f.timers.size, 0)
-  await f.advance(10000); assert.equal(f.messages.length, 3)
+  await f.advance(10000); assert.equal(f.messages.length, 2)
 })
 
 for (const kind of ["attention", "unsafe", "question", "approved", "error", "ended"] as const) {
@@ -331,5 +333,74 @@ test("a stalled event loop emits one reminder without catching up missed interva
   await f.advance(65000); assert.equal(f.messages.length, 2)
   await f.advance(9999); assert.equal(f.messages.length, 2)
   await f.advance(1); assert.equal(f.messages.length, 3)
+  await f.policy.dispose()
+})
+
+for (const [name, pending] of [
+  ["Unsafe", view("b", "complete", false)],
+  ["canceled Safe", { ...view("b", "complete"), autoApproval: { status: "cancelled" } }],
+  ["confirmed failed approval", { ...view("b", "complete"), autoApproval: { status: "failed" }, approvalPendingConfirmed: true }],
+  ...(["unrelated", "unidentified", "unavailable", "suspended"] as const).map(status => [status, view("b", status)] as const),
+] satisfies (readonly [string, View])[]) {
+  test(`queued ${name} defers initial notification and reminders until actionable`, async () => {
+    const f = fixture(true, true, true, { staleReminderSeconds: 1 })
+    f.add(view("a")); f.policy.snapshot([view("a"), pending]); f.policy.permission(pending.request, target, true)
+    await f.advance(60000); assert.equal(f.messages.length, 0)
+    f.policy.snapshot([pending], new Map([["root", { kind: "permission", id: "b" }]]))
+    await settle()
+    assert.equal(f.messages.length, 1)
+    assert.equal(f.messages[0]?.kind, name === "Unsafe" ? "unsafe" : "attention")
+    f.policy.snapshot([pending]); await settle(); assert.equal(f.messages.length, 1)
+    await f.advance(999); assert.equal(f.messages.length, 1)
+    await f.advance(1); assert.equal(f.messages.length, 2)
+    f.policy.pending(new Map([["root", { kind: "permission", id: "earlier" }]]))
+    await f.advance(10000); assert.equal(f.messages.length, 2)
+    await f.policy.dispose()
+  })
+}
+
+test("queue handoff uses the current retry/stream state, not an earlier queued Unsafe report", async () => {
+  const f = fixture(true, true, true, { staleReminderSeconds: 1 })
+  const b = view("b", "complete", false)
+  f.add(view("a")); f.policy.snapshot([view("a"), b]); f.policy.permission(b.request, target, true)
+  await settle(); assert.equal(f.messages.length, 0)
+  const analyzing: View = { ...view("b"), autoApproval: { status: "cancelled" } }
+  f.policy.snapshot([analyzing], new Map([["root", { kind: "permission", id: "b" }]]))
+  for (const progress of [
+    { attempt: 0, phase: "evaluating" },
+    { attempt: 0, phase: "streaming", preview: { safe: false } },
+    { attempt: 1, phase: "retrying" },
+    { attempt: 1, phase: "streaming", preview: { safe: true } },
+  ] as const) {
+    f.policy.snapshot([{ ...analyzing, progress }]); await f.advance(5000)
+    assert.equal(f.messages.length, 0, progress.phase)
+  }
+  f.policy.snapshot([{ ...view("b", "complete"), autoApproval: { status: "cancelled" } }]); await settle()
+  assert.deepEqual(f.messages.map(m => m.title), ["Session needs attention"])
+  f.policy.snapshot([view("b", "identifying")]); await f.advance(5000)
+  assert.equal(f.messages.length, 1, "new evaluation suppresses previous manual reminders")
+  await f.policy.dispose()
+})
+
+test("queue preemption cancels initial delivery before dispatch, not only reminders", async () => {
+  const f = fixture(false)
+  f.add(view("b", "complete", false))
+  f.policy.pending(new Map([["root", { kind: "permission", id: "a" }]]))
+  await settle(); assert.equal(f.messages.length, 0)
+  f.policy.snapshot([view("b", "complete")])
+  f.policy.pending(new Map([["root", { kind: "permission", id: "b" }]]))
+  await settle(); assert.deepEqual(f.messages.map(m => m.title), ["Session needs attention"])
+  await f.policy.dispose()
+})
+
+test("uncertain failed approval does not notify even after becoming actionable until pending is confirmed", async () => {
+  const f = fixture(true)
+  const failed: View = { ...view("b", "complete"), autoApproval: { status: "failed" } }
+  f.add(view("a")); f.policy.snapshot([view("a"), failed]); f.policy.permission(failed.request, target, true)
+  f.policy.snapshot([failed], new Map([["root", { kind: "permission", id: "b" }]]))
+  await f.advance(120000); assert.equal(f.messages.length, 0)
+  f.policy.snapshot([{ ...failed, approvalPendingConfirmed: true }]); await settle()
+  assert.equal(f.messages.length, 1)
+  f.policy.snapshot([]); await f.advance(120000); assert.equal(f.messages.length, 1)
   await f.policy.dispose()
 })

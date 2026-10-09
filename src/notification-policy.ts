@@ -11,12 +11,28 @@ interface Banner { abort: AbortController; handle?: NotificationHandle; target: 
 interface Pending {
   identity: NotificationInteraction
   target: Target
-  phase: "waiting" | "attention" | "automatic"
+  phase: "waiting" | "attention"
   banner?: Banner
-  grace?: () => void
   message?: NotificationMessage
   blocking?: boolean
   reminder?: () => void
+}
+
+/** Absence of a countdown is not evidence of manual-only approval. A completed
+ * Safe request can still be waiting for its native queue position or rendering. */
+function permissionAttention(view: View, auto: boolean): "attention" | "unsafe" | undefined {
+  if (view.status === "identifying" || view.status === "analyzing") return
+  const state = view.autoApproval?.status
+  if (state === "countdown" || state === "checking" || state === "allowing") return
+  if (state === "failed" && !view.approvalPendingConfirmed) return
+  if (view.status === "complete") {
+    if (!view.assessment) return
+    if (!view.assessment.safe) return "unsafe"
+    if (!auto || state === "cancelled" || state === "failed") return "attention"
+    return
+  }
+  // These are terminal no-report states, not an evaluation in progress.
+  if (["unrelated", "unidentified", "unavailable", "suspended"].includes(view.status)) return "attention"
 }
 
 /** Event policy owns no host reads, desktop processes, permission writes or models. */
@@ -44,8 +60,6 @@ export class NotificationPolicy {
     const entry: Pending = { identity: { kind: "permission", id: request.id }, target, phase: "waiting" }
     this.permissions.set(request.id, entry)
     this.select(entry)
-    const view = this.views.get(request.id)
-    if (view) this.update(view)
   }
   question(id: string, target: Target, fresh: boolean) {
     if (this.stopped || !this.config.notify || !this.remember(`question:${id}`) || !fresh) return
@@ -65,6 +79,15 @@ export class NotificationPolicy {
   private select(entry: Pending) {
     const next = this.blockers.get(entry.target.root)
     const blocking = next?.kind === entry.identity.kind && next.id === entry.identity.id
+    if (entry.identity.kind === "permission") {
+      entry.blocking = blocking
+      // Re-evaluate the latest outcome even on queue-only publications. Never
+      // replay an assessment captured when this request first became pending.
+      const view = this.views.get(entry.identity.id)
+      if (view) this.update(view)
+      else this.wait(entry)
+      return
+    }
     if (entry.blocking === blocking) return
     entry.blocking = blocking
     this.stopReminder(entry)
@@ -143,7 +166,6 @@ export class NotificationPolicy {
     return banner
   }
   private attention(entry: Pending, kind: "attention" | "unsafe" | "question" = "attention") {
-    entry.grace?.(); entry.grace = undefined
     if (entry.phase === "attention" && entry.message?.kind === kind) return
     this.stopReminder(entry)
     this.withdraw(entry.banner)
@@ -152,50 +174,29 @@ export class NotificationPolicy {
     entry.banner = entry.message ? this.dispatch(entry.message, entry.target) : undefined
     this.remind(entry)
   }
-  private wait(entry: Pending, phase: "waiting" | "automatic" = "waiting") {
-    entry.grace?.(); entry.grace = undefined
+  private wait(entry: Pending) {
     this.stopReminder(entry)
     this.withdraw(entry.banner)
-    entry.banner = undefined; entry.message = undefined; entry.phase = phase
+    entry.banner = undefined; entry.message = undefined; entry.phase = "waiting"
   }
-  snapshot(views: readonly View[]) {
+  snapshot(views: readonly View[], blockers: ReadonlyMap<string, NotificationInteraction> = this.blockers) {
     if (this.stopped) return
+    // Queue identity and outcomes must change together. Otherwise handing off
+    // the queue could briefly notify from an older completed/manual snapshot.
     this.views = new Map(views.map((view) => [view.request.id, view]))
-    for (const [id] of this.permissions) {
-      const view = this.views.get(id)
-      if (view) this.update(view)
+    this.blockers = new Map(blockers)
+    for (const [id, entry] of this.permissions) {
+      if (this.views.has(id)) this.select(entry)
       else this.resolved("permission", id)
     }
+    for (const entry of this.questions.values()) this.select(entry)
   }
   private update(view: View) {
     const entry = this.permissions.get(view.request.id)
     if (!entry) return
-    const state = view.autoApproval?.status
-    if (state === "countdown" || state === "checking" || state === "allowing") {
-      this.wait(entry, "automatic")
-      return
-    }
-    // A canceled automation tombstone can coexist with a fresh analysis after
-    // re-enable. It must not send generic attention ahead of that report.
-    if (view.status === "identifying" || view.status === "analyzing") { this.wait(entry); return }
-    if (state === "failed") {
-      if (view.approvalPendingConfirmed) this.attention(entry, view.status === "complete" && view.assessment?.safe === false ? "unsafe" : "attention")
-      else this.wait(entry)
-      return
-    }
-    if (view.status === "complete" && view.assessment?.safe === false) { this.attention(entry, "unsafe"); return }
-    if (state === "cancelled" || ["unrelated", "unidentified", "unavailable", "suspended"].includes(view.status)) {
-      this.attention(entry); return
-    }
-    if (view.status !== "complete" || !view.assessment) return
-    if (!this.auto || !view.assessment.safe) { this.attention(entry); return }
-    if (entry.phase !== "waiting" || entry.grace) return
-    entry.grace = this.clock.after(1000, () => {
-      entry.grace = undefined
-      if (this.permissions.get(view.request.id) !== entry || this.stopped) return
-      const current = this.views.get(view.request.id)
-      if (current?.status === "complete" && current.assessment?.safe && !current.autoApproval) this.attention(entry)
-    })
+    const kind = entry.blocking ? permissionAttention(view, this.auto) : undefined
+    if (kind) this.attention(entry, kind)
+    else this.wait(entry)
   }
   approved(request: PermissionRequest, target?: Target) {
     if (!this.remember(`approved:${request.id}`)) return
@@ -205,7 +206,6 @@ export class NotificationPolicy {
   resolved(kind: "permission" | "question", id: string) {
     const entries = kind === "permission" ? this.permissions : this.questions
     const entry = entries.get(id)
-    entry?.grace?.()
     if (entry) this.stopReminder(entry)
     this.withdraw(entry?.banner)
     entries.delete(id)
@@ -221,7 +221,7 @@ export class NotificationPolicy {
   }
   dispose() {
     this.stopped = true
-    for (const entry of [...this.permissions.values(), ...this.questions.values()]) { entry.grace?.(); this.stopReminder(entry) }
+    for (const entry of [...this.permissions.values(), ...this.questions.values()]) this.stopReminder(entry)
     for (const banner of this.banners) this.withdraw(banner)
     this.permissions.clear(); this.questions.clear(); this.views.clear(); this.seen.clear(); this.blockers.clear()
     return withDeadline(new AbortController().signal, 5000, async () => { await this.backend.dispose() }).catch(() => {})

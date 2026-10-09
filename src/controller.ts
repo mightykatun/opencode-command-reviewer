@@ -105,7 +105,13 @@ export class Controller {
     entry.approvalAbort?.abort()
     entry.abort.abort()
     entry.suspension = reason
-    entry.view = { request: entry.view.request, status: "suspended" }
+    entry.view = { request: entry.view.request, status: "suspended",
+      // Suspension hides the report, but cannot turn an uncertain/dispatched
+      // approval into a confirmed manual wait. Read-only reconciliation still
+      // owns that confirmation, and the existing tombstone still forbids retry.
+      ...(state === "failed" || state === "allowing" ? { autoApproval: { status: "failed" as const },
+        ...(state === "failed" && entry.view.approvalPendingConfirmed ? { approvalPendingConfirmed: true } : {}) } : {}),
+    }
   }
 
   /** Called only after the assessment has actually been rendered, or to hide it. */
