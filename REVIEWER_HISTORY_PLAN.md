@@ -1,7 +1,7 @@
 # Reviewer history: implementation handoff
 
-Status: implementation in progress; Phases 0 and 1 passed, Phase 2 implemented;
-lifetime replacement and history UI remain later phases.
+Status: implementation in progress; Phases 0 and 1 passed, Phases 2 and 3 implemented.
+History UI remains Phase 4; later history interaction and maintenance phases remain open.
 
 Prepared on 2026-10-09 against repository commit
 `983e888d0bb7f31e4169b30ceb436046c1003a52`, package version `0.7.0`,
@@ -698,7 +698,7 @@ as an unbounded backdoor around the approved limit.
 - One actual worker operation must retain ownership through its real settlement;
   a caller timeout does not authorize starting unlimited replacement work.
 - Coalesce refreshes to one actual read and at most one follow-up, preserving the
-  `LifetimeRefresh` stale-result/write-failure protections.
+   stale-result/write-failure protections now shared by `HistoryRefresh`.
 - Schedule saves, interactive reads, polling and maintenance fairly. A failed write
   waiting for its next retry must not block all readable committed history.
 - Kill/restart a failed worker only with known ownership/exit handling. Replay
@@ -801,8 +801,8 @@ before connecting the TUI.
 ### Phase 2: reviewer/controller lifecycle integration
 
 - [x] Correlated reviewer/controller events, in-memory candidate coordination and
-  TUI lifecycle wiring implemented. Legacy lifetime callbacks remain active for
-  this integration phase; Phase 3 removes them when replacing its persistence.
+  TUI lifecycle wiring implemented. Legacy lifetime callbacks were retained during
+  Phase 2 and have now been removed from active wiring by Phase 3.
 - Native `once` attribution is conservative: the public keymap trace does not
   carry the selected option/request identity. Neither it nor absence of a local
   dispatch proves a manual reply. Confirmed footer/automatic acknowledgements and
@@ -838,14 +838,25 @@ deadline, or cause a permission write.
 
 ### Phase 3: lifetime storage replacement
 
-- Refactor `src/lifetime.ts` to retain pure metric validation/presentation helpers
-  where useful, replacing per-instance snapshot persistence with aggregate access.
-- Adapt `src/lifetime-view.tsx` and `src/lifetime-refresh.ts` to the new store.
-- Use one event path for history/accounting correlation, avoiding duplicate legacy
-  `recordRating` or `recordAutoApproval` invocations.
-- Start fresh and exclude legacy files. Update relevant tests and seeded runtime
-  fixtures, which currently create/read usage snapshots directly.
-- Keep the existing lifetime dialog and live inline strings, formatting and metrics.
+- [x] `src/lifetime.ts` retains pure metric validation, weighted aggregation and
+  exact presentation helpers. Removed the per-instance snapshot writer/scanner.
+- [x] `src/lifetime-view.tsx` reads `HistoryStore` precomputed totals through
+  `HistoryRefresh`; removed the redundant `lifetime-refresh.ts`. Local commits and
+  palette open refresh immediately; shared totals poll every two seconds. Read
+  cleanup retains actual ownership; write failures invalidate stale reads; abort
+  stops polling/publication and late results never replace dismissed dialogs.
+- [x] `src/tui.tsx` constructs the store before the tracker and uses only the
+  correlated history lifecycle/POST events for writes. Legacy usage/rating/retry/
+  auto-approval callbacks are disconnected; no replacement increment events.
+- [x] Fresh zero totals, restart/resume, two actual worker clients, duplicate
+  correlation replay, independent received usage and weighted metrics are tested.
+  Legacy `usage-v1` through `usage-v4` stay untouched and excluded.
+- [x] Shared isolated `scripts/smoke-lifetime.mjs` seeds production SQL events via
+  the Node adapter with consistent review/POST identities. All three existing
+  fixture families verify large legacy seeds remain unchanged and receive no writes.
+  Storage-error injection now targets the new database. Real-host reads use Bun.
+- [x] Existing lifetime labels, formatting and inline eligibility are preserved.
+  Stats fixtures verify recorded-only totals and no new partial-history warning.
 
 ### Phase 4: history UI and command state
 
@@ -989,7 +1000,7 @@ model tests. No implementation test above was run merely to create this plan.
 - [ ] Only the history layer receives the new approval-occlusion exception.
 - [ ] No pending body persistence or inferred/retried approval occurs.
 - [ ] Transactional event replay cannot duplicate aggregate contributions.
-- [ ] Analytics opens from precomputed totals, starts fresh, and preserves current metric meaning.
+- [x] Analytics opens from precomputed totals, starts fresh, and preserves current metric meaning.
 - [ ] Retention, root/child deletion, offline cleanup and anti-resurrection work.
 - [ ] Worker/queue/read work is bounded and does not stall the TUI/approval path.
 - [ ] Disposal finishes within the real host cleanup budget under storage failure.
@@ -1053,18 +1064,58 @@ Phase 2 verification (2026-10-09, working tree after `f8ee971`):
   per-scenario capture files. These are integration proofs, not live-model tests.
 - Phase 3 persistence/presentation replacement and history UI were not implemented.
 
-Local references are relative to this repository and were reviewed at the baseline
-commit identified at the top of this document:
+Phase 3 verification (2026-10-09, uncommitted working tree after `bfdf74f`):
+
+- `npm run check` passed: typecheck, 715 TypeScript tests, 74 pure helper tests,
+  and build. Obsolete snapshot/migration and duplicate refresh tests were replaced
+  with pure metric tests, real-worker fresh/resumed/shared accounting tests and
+  tracker tests against the common `HistoryRefresh` ownership/health contract.
+- `npm run check:package` passed: reproducible bundle SHA-256
+  `9e4831acc65e2ea81ac5903e0f50fb3d84c44346e9d928c0376bf7c620ecd850`,
+  exactly five archive files, 653,278 bytes unpacked.
+- These exact real-host runs passed, with at most two concurrent hosts:
+
+  ```sh
+  node scripts/smoke.mjs correction --seed-lifetime
+  node scripts/smoke.mjs edit
+  node scripts/smoke.mjs auto-shell --notifications
+  node scripts/smoke-permissions.mjs mcp --auto --correction --stream --stats
+  node scripts/smoke-permissions.mjs mcp --auto --stats --no-usage
+  node scripts/smoke-permissions.mjs mcp --auto --correction --stats --missing-usage
+  node scripts/smoke-permissions.mjs mcp --auto --stats --unpriced
+  node scripts/smoke-permissions.mjs mcp --auto --stats --storage-error
+  node scripts/smoke-permissions.mjs external-edit --auto --stream --stats
+  node scripts/smoke-streaming.mjs complete --stats
+  node scripts/smoke-streaming.mjs truncated --static --stats
+  ```
+
+- `edit` verifies rendered lifetime metrics before and after an actual host restart,
+  including unchanged timing means and no additional reviewer POST. Stats fixtures
+  inspect current SQL totals as well as rendered labels, check received-only counts,
+  and exclude the 999-request/rating/cost legacy seeds in all four old directories.
+- Captures and measurements are in the existing `.runtime/` per-scenario files,
+  including `edit-lifetime-{dialog,restarted}.txt`, `permission-*-lifetime-dialog.txt`,
+  and `streaming-*-lifetime-dialog.txt`. This establishes local fixture integration,
+  not live-provider behavior or a full runtime matrix.
+- Initial checks exposed and fixed fixture-only issues: a static SQL helper import
+  broke dependency-free sparse `--plan` execution, and correction scrolling stopped
+  at the lifetime cost before its final rating row. Dynamic imports after planning
+  and scrolling through the rating row fixed both; affected checks/runs passed.
+  The new test setup also corrected private directory mode and UUID fixture identity.
+  No unresolved verification failure remains from the Phase 3 runs above.
+- Phase 4 UI/commands and later history-only approval-cover behavior are not implemented.
+
+Local references below reflect the current implementation, including Phase 3:
 
 - [Controller lifecycle and visibility](src/controller.ts): `presented`, `eligible`,
   accepted-review observer, `replied`, `reconcile`, `dispose`, `visibleReview`.
-- [TUI wiring and report rendering](src/tui.tsx): current reply event discards reply
-  kind; public sidebar mount token; final Markdown and hit-test gating; cleanup.
-- [Lifetime persistence and formatting](src/lifetime.ts): usage-v4 per-instance
-  snapshots, directory scan, metric invariants and exact display formatters.
+- [TUI wiring and report rendering](src/tui.tsx): full reply events reach history;
+  public sidebar mount token; final Markdown and hit-test gating; bounded cleanup.
+- [Lifetime metric helpers](src/lifetime.ts): pure invariants, weighted aggregation
+  and exact display formatters; no filesystem persistence or legacy reads.
 - [Lifetime view](src/lifetime-view.tsx) and
-  [refresh coordinator](src/lifetime-refresh.ts): open refresh, observer paths,
-  stale-result protection and actual transaction ownership.
+  [refresh coordinator](src/history-refresh.ts): totals queries, commit/failure
+  subscriptions, open refresh, shared polling and actual transaction ownership.
 - [Reviewer transport](src/reviewer.ts) and [usage parsing](src/usage.ts): per-POST
   finalization and report-wide component coverage.
 - [Ancestry/mode gate](src/session-mode.ts): depth/time/cache bounds and scope key.

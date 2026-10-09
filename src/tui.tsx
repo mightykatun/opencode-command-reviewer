@@ -203,7 +203,8 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
     config = parsed
   } catch (error) { configError = error instanceof Error ? error.message : uiText.review.invalidConfiguration }
   api.lifecycle.signal.throwIfAborted()
-  const lifetime = lifetimeTracker(api)
+  const historyStore = new HistoryStore(api.state.path.state)
+  const lifetime = lifetimeTracker(api, historyStore)
   const [views, setViews] = createSignal<View[]>([])
   const [sidebar, setSidebar] = createSignal<{ sessionID: string; token: symbol }>()
   const hostTrace = observer ? new DiagnosticTrace(observer, 0) : undefined
@@ -212,7 +213,6 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const reader = contextReader(api, hostTrace)
   const modes = new SessionModes(new SessionModeStore(path.join(api.state.path.state, "opencode-reviewer", "session-mode-v1"),
     api.state.path.directory), async (id, signal) => api.state.session.get(id) ?? reader.session(id, signal))
-  const historyStore = new HistoryStore(api.state.path.state)
   const history = new HistoryCoordinator(api.state.path.directory, historyStore, (id, signal) => modes.root(id, signal))
   let notifications: NotificationHost | undefined
   if (notificationConfig?.notify) {
@@ -238,7 +238,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
         if (!evidence) return null
         signal.throwIfAborted()
         const result = review(evidence, config!, signal, undefined, undefined, prompts,
-          (model) => modelPricing(api.state.provider, config!.baseURL, model), lifetime.record, onProgress, trace?.forward, lifetime.recordRetry,
+          (model) => modelPricing(api.state.provider, config!.baseURL, model), undefined, onProgress, trace?.forward, undefined,
           history.observation(request, evidence.kind, config!, execution))
         worker = result
         return result
@@ -265,9 +265,8 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
     once: (request, signal) => measured(traces?.get(request), "approval-reply", () => approval.once(request, signal)),
   } : approval), visibleID: () => visibleApproval() }, undefined, modes, fact => {
     history.approval(fact)
-    if (fact.type === "confirmed" && fact.automatic) lifetime.recordAutoApproval()
     notifications?.fact(fact)
-  }, lifetime.recordRating, history.lifecycle)
+  }, undefined, history.lifecycle)
 
   api.event.on("permission.asked", (event) => controller.asked(event.properties))
   api.event.on("permission.replied", (event) => {
@@ -304,10 +303,10 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
     unregisterMode()
     const reviewCleanup = controller.dispose()
     setSidebar(undefined)
-    const legacy = Promise.allSettled([notificationCleanup, modes.flush(), reviewCleanup.then(() => lifetime.flush())])
+    const cleanupTasks = Promise.allSettled([notificationCleanup, modes.flush(), reviewCleanup])
     const storage = drainHistory(historyStore, reviewCleanup, abortAt)
     let timer: ReturnType<typeof setTimeout> | undefined
-    await Promise.all([storage, Promise.race([legacy, new Promise(resolve => {
+    await Promise.all([storage, Promise.race([cleanupTasks, new Promise(resolve => {
       timer = setTimeout(resolve, Math.max(0, abortAt + 3500 - performance.now()))
     })])])
     clearTimeout(timer)

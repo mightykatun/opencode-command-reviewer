@@ -8,6 +8,7 @@ import { tmpdir } from "node:os"
 import { pathToFileURL } from "node:url"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime, smokeMetrics } from "./smoke-runtime.mjs"
+import { seedLifetime, readLifetime, assertLegacyUntouched } from "./smoke-lifetime.mjs"
 
 const scenario = process.argv[2] ?? "complete"
 assert.ok(["complete", "retry", "truncated", "nonstream", "cancel", "manual", "disable", "hidden", "dialog", "narrow", "fullscreen", "error"].includes(scenario))
@@ -21,6 +22,7 @@ const host = process.env.OPENCODE_BIN ?? "opencode"
 const hostVersion = execFileSync(host, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
 assert.equal(hostVersion, "1.18.35")
 const temp = await mkdtemp(path.join(tmpdir(), "reviewer-streaming-"))
+await seedLifetime(temp)
 const project = path.join(temp, "project")
 await mkdir(project)
 await mkdir(path.join(temp, "config"))
@@ -413,6 +415,24 @@ try {
     assert.doesNotMatch(JSON.stringify(call.body.messages), /STREAM START|CORRECTED START|Permission analysis|reviewer-disable|reviewer-enable/)
   }
   await validateDiagnostics()
+  if (process.argv.includes("--stats")) {
+    assert.ok(["complete", "retry", "truncated", "nonstream"].includes(scenario), "stats fixture requires a completed automatic review")
+    await palette("Reviewer: Lifetime usage")
+    await until(s => s.includes("Reviewer lifetime usage") && s.includes("Auto-approved: 1 (100.0%)"))
+    assert.match(screen, /Reviews: 1/)
+    assert.match(screen, /Safe: 1 \(100\.0%\)/)
+    assert.ok(screen.includes(`Retries: ${reviews.length - 1}`))
+    assert.ok(screen.includes(`Tokens: ${40 * reviews.length} in ${20 * reviews.length} out`))
+    assert.doesNotMatch(screen, /partial history/)
+    const totals = readLifetime(temp)
+    assert.equal(totals.requests, reviews.length)
+    assert.equal(totals.safe, 1); assert.equal(totals.activity.reviews, 1)
+    assert.equal(totals.activity.retries, reviews.length - 1)
+    assert.equal(totals.activity.autoApproved, 1)
+    await save("lifetime-dialog")
+    send("Escape")
+  }
+  await assertLegacyUntouched(temp)
   outcome = "passed"
   console.log(`PASS ${name}: delayed rating/text/terminal phases, final-only approval, ${scenario} lifecycle${staticAnimations ? ", static scanner labels" : ""}; ${reviews.length} review request(s). Isolated files: ${temp}`)
 } catch (error) {

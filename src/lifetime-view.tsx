@@ -1,25 +1,25 @@
-import path from "node:path"
 import { createSignal } from "solid-js"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { LifetimeUsage, lifetimeCost, lifetimeReport, type LifetimeTotals } from "./lifetime.js"
-import { LifetimeRefresh } from "./lifetime-refresh.js"
-import type { Usage } from "./usage.js"
+import { lifetimeCost, lifetimeReport, type LifetimeTotals } from "./lifetime.js"
+import { HistoryRefresh } from "./history-refresh.js"
+import type { HistoryStore } from "./history-store.js"
 import { uiText } from "./ui-text.js"
-import type { ReviewTiming } from "./types.js"
 
 /** Independent accounting UI: no session writes and no dependency on review visibility. */
-export function lifetimeTracker(api: TuiPluginApi) {
-  const directory = path.join(api.state.path.state, "opencode-reviewer")
-  const store = new LifetimeUsage(path.join(directory, "usage-v4"), path.join(directory, "usage-v3"), path.join(directory, "usage-v2"), path.join(directory, "usage-v1"))
+export function lifetimeTracker(api: TuiPluginApi, store: Pick<HistoryStore, "query" | "onCommit" | "onWriteFailure">) {
   const [totals, setTotals] = createSignal<LifetimeTotals>()
   const [unavailable, setUnavailable] = createSignal(false)
-  const refresh = new LifetimeRefresh((signal) => store.totals(signal), (value) => {
-    if (value) { setTotals(value); setUnavailable(false) }
+  const refresh = new HistoryRefresh(store, { type: "totals" }, (value) => {
+    if (value && "totals" in value) { setTotals(value.totals); setUnavailable(false) }
     else setUnavailable(true)
-  }, api.lifecycle.signal)
+  })
+  const stop = () => refresh.dispose()
+  api.lifecycle.signal.addEventListener("abort", stop, { once: true })
+  if (api.lifecycle.signal.aborted) stop()
   const unregister = api.keymap.registerLayer({ commands: [{
     name: "opencode-reviewer.lifetime", namespace: "palette", title: uiText.commands.lifetime, category: uiText.commands.category,
     run: () => {
+      if (api.lifecycle.signal.aborted) return
       refresh.refresh()
       api.ui.dialog.replace(() => <api.ui.DialogAlert title={uiText.lifetime.title}
         message={unavailable() ? uiText.lifetime.unavailable
@@ -28,22 +28,11 @@ export function lifetimeTracker(api: TuiPluginApi) {
   }] })
   api.lifecycle.onDispose(() => {
     refresh.dispose()
+    api.lifecycle.signal.removeEventListener("abort", stop)
     unregister()
   })
-  refresh.refresh()
   return {
-    // The controller must settle aborted review workers before this final queue drain.
-    flush: () => store.flush().catch(() => {}),
     text: () => unavailable() ? uiText.lifetime.inlineUnavailable : totals()?.requests
       ? [lifetimeCost(totals()!), uiText.lifetime.ratings(totals()!.safe, totals()!.unsafe)].join("\n") : undefined,
-    record: (usage: Usage) => {
-      // Finalizers still enqueue writes after the refresh coordinator is stopped.
-      void store.record(usage).then(() => refresh.refresh(), () => refresh.failed())
-    },
-    recordRating: (safe: boolean, timing?: ReviewTiming) => {
-      void store.recordRating(safe, timing).then(() => refresh.refresh(), () => refresh.failed())
-    },
-    recordRetry: () => { void store.recordRetry().then(() => refresh.refresh(), () => refresh.failed()) },
-    recordAutoApproval: () => { void store.recordAutoApproval().then(() => refresh.refresh(), () => refresh.failed()) },
   }
 }

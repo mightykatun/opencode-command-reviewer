@@ -546,10 +546,10 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 
 ## Usage and lifetime accounting
 
-- Phase 2 history storage is wired through `history-coordinator.ts`, reviewer
-  attempt observers and controller lifecycle/approval facts. The legacy lifetime
-  tracker and its presentation remain active until Phase 3; the new correlated
-  store is independent and never imports legacy snapshots. `HistoryStore.admit`
+- History storage and active lifetime accounting share `history-coordinator.ts`,
+  reviewer attempt observers and controller lifecycle/approval facts. Phase 3
+  replaces the legacy lifetime persistence: the tracker reads only the store's
+  precomputed totals, with no legacy observer writes or snapshot imports. `HistoryStore.admit`
   accepts the strict events in `history-records.ts`; only `permissionResolved`
   carries report text. `permissionOutcome` updates a previously resolved outcome
   without resending text. The worker
@@ -569,7 +569,16 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   the existing real-host approval fixture and verifies its production database.
   Other scenarios are `auto-immediate` (manual footer), `auto-manual` (unattributed
   native once) and `auto-cancel` (cancellation followed by explicit rejection).
-  History UI and lifetime presentation replacement remain later phases.
+  History UI remains Phase 4. The existing lifetime presentation now uses this store.
+  `scripts/smoke-lifetime.mjs` seeds isolated fixtures through production SQL events
+  using the Node adapter, with consistent review/POST identity. It also places
+  large legacy seeds in all four old directories and verifies they remain untouched
+  and excluded, with no new legacy snapshots. The host uses the Bun adapter.
+  Lifetime regressions include `npx tsx --test test/lifetime*.test.ts`,
+  `node scripts/smoke.mjs correction --seed-lifetime`, `node scripts/smoke.mjs edit`
+  (including host restart), and `node scripts/smoke-streaming.mjs complete --stats`
+  or `truncated --static --stats`. Permission stats fixtures also cover `--no-usage`,
+  `--correction --missing-usage`, `--unpriced` and `--storage-error`.
 - Capture category from actual evidence and scope from the invocation host and
   `modes.root`, never a target directory or a history-browsing mode load. Each
   execution and POST has a separate UUID. Keep the latest completed candidate
@@ -611,20 +620,22 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Inline lifetime belongs only in this completed valid-request-usage block, never
   alone while loading, failed or missing all report usage. The lifetime palette
   command remains independent. Unknown costs are not free; label partial coverage.
-- `LifetimeUsage` writes version 4 per-instance atomic snapshots under
-  `opencode-reviewer/usage-v4/` in the public state directory. Read legacy
-  `opencode-reviewer/usage-v1/`, `usage-v2/` and `usage-v3/` alongside them without copying/rewriting snapshots
-  or reinterpreting original estimates. Keep separate request, token-coverage and
-  pricing counts, final Safe/Unsafe review counts, numeric totals and timestamps only; reads are capped at 1 KiB
-  per snapshot. No checkout or native session-accounting writes.
+- Lifetime totals come exclusively from `HistoryStore.query({ type: "totals" })`,
+  the transactional precomputed aggregate in `history-v1.sqlite`. First initialization
+  starts at zero; later instances resume and share these totals across host scopes.
+  Leave `usage-v1/` through `usage-v4/` untouched and excluded. Never scan/import them,
+  dual-write snapshots or reconstruct totals from detailed review/attempt rows.
+  `lifetime.ts` retains pure validation, weighted aggregation and exact presentation
+  helpers. Received-request, token/pricing coverage, accepted ratings and activity
+  remain separate. No checkout or native session-accounting writes.
 - Count ratings at controller acceptance of each completed, validated review,
   independently of received usage. Previews, transport/format attempts, errors,
   stale/aborted results and repeated display updates never count. A fresh accepted
-  review after re-enable counts again. The observer receives only a boolean and numeric durations;
-  exceptions/rejected promises cannot affect review or approval. Persist rating
-  counts and their own earliest timestamp with usage through the same serialized
-  atomic writer. Older snapshots contribute no ratings; explain the missing
-  historical coverage. Display counts alongside inline lifetime cost only in the
+  review after re-enable counts again. Correlated lifecycle events carry accepted
+  identity and timing; exceptions/rejected promises cannot affect review or approval.
+  Persist counts and their earliest timestamp transactionally through those events,
+  never separate legacy increment callbacks. Old snapshots contribute nothing.
+  Display counts alongside inline lifetime cost only in the
   existing completed-report usage block, and always in the lifetime palette.
 - The compact lifetime dialog shows Reviews, Retries, Tokens, Cost, Safe, Unsafe,
   Auto-approved and average time to the full report and rating. Reviews means
@@ -637,18 +648,22 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   evidence/retries to final controller acceptance and the accepted attempt's first
   parsed rating. Clear the rating timestamp on format/transport retry. Non-streaming
   ratings use completion time. Exclude rendering and countdown time. Persist only
-  sample counts and online means; combine instance means by sample weight. Never
-  store timing arrays or individual observations. Legacy snapshots contribute no
-  fabricated activity metrics; mark partial history, preserve received-only token/
-  pricing coverage and show unavailable averages before the first measured review.
+  sample counts and online means in the aggregate; combine means by sample weight.
+  Detailed accepted-review timing fields are separately retained by history storage.
+  Never store timing arrays. Legacy snapshots contribute no metrics or partial-history
+  warning. Preserve received-only token/pricing coverage and show unavailable averages
+  before the first measured review.
 - Accounting and persistence failures cannot change review outcomes. Abort and
-  await actual review workers/finalizers before flushing queued lifetime writes on
-  disposal. Failed storage reports unavailable without silently resetting history.
-  Refresh totals on local usage and palette open. `lifetime-refresh.ts` coalesces
-  work to one actual scan plus one follow-up, retaining ownership through timeout
-  and cleanup; write failures invalidate older read results. Never replace a dismissed dialog
-  after async reads. Explain received-only accounting, unknown unreported charges,
-  mixed reported/estimated cost and unrecoverable earlier unrecorded usage.
+  await actual review workers/finalizers within the existing history drain deadline
+  on disposal. Failed saves/reads report unavailable without resetting totals;
+  recovery shows committed totals without a new warning, including after overflow.
+  `lifetime-view.tsx` uses `HistoryRefresh`: local commits and palette open request
+  immediate reads, with two-second shared polling. Coalesce to one actual query and
+  one follow-up, retaining `HistoryRead.settled` ownership through timeout/cleanup.
+  Write failures invalidate older results. Stop publication/polling on lifecycle
+  abort; async results never replace or resurrect a dismissed dialog. Inline lifetime
+  still requires the existing completed, valid report-usage block. Preserve exact
+  labels, formatting, received-only coverage and mixed reported/estimated costs.
 
 ## Diagnostics and measurements
 

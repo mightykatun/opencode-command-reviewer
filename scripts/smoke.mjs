@@ -120,6 +120,7 @@ function assertScrollbarTheme(ansi) {
   return { panel, muted }
 }
 const temp = await mkdtemp(path.join(tmpdir(), "opencode-reviewer-"))
+const { seedLifetime, readLifetime, assertLegacyUntouched } = await import("./smoke-lifetime.mjs")
 // Load the built plugin away from the checkout to catch unbundled source assets.
 const pluginFile = path.join(temp, "reviewer.mjs")
 await copyFile(path.join(root, "dist/tui.js"), pluginFile)
@@ -130,12 +131,7 @@ execFileSync("git", ["init", "--quiet", project])
 const commandDirectory = isExternal ? path.join(temp, "outside") : project
 if (commandDirectory !== project) await mkdir(commandDirectory)
 await mkdir(path.join(temp, "config"))
-if (process.argv.includes("--seed-lifetime")) {
-  const ledger = path.join(temp, "state/opencode/opencode-reviewer/usage-v1")
-  await mkdir(ledger, { recursive: true })
-  await writeFile(path.join(ledger, "00000000-0000-0000-0000-000000000001.json"), JSON.stringify({ version: 1,
-    requests: 1, input: 10, output: 2, priced: 1, cost: 0.01, since: 1 }))
-}
+await seedLifetime(temp, { usage: process.argv.includes("--seed-lifetime") ? { input: 10, output: 2, cost: 0.01 } : undefined })
 const source = 'from pathlib import Path\nfruits = ["apple", "pear"]\nprint(len(fruits))\nPath("executed-marker").write_text(str(len(fruits)))\n'
   + (auto ? 'import time\nwith Path("execution-log").open("a") as log:\n    log.write(str(time.time_ns() // 1000000) + "\\n")\n' : "")
 await writeFile(path.join(commandDirectory, "fruits.py"), source)
@@ -373,7 +369,7 @@ try {
   const assertUsage = async () => {
     const input = correction ? 1000 : 500, output = correction ? 40 : 20
     if (scenario === "correction" || scenario === "auto-scroll") {
-      for (let i = 0; i < 30 && !capture().includes("lifetime:"); i++) { mouse(65, 140, 20); await sleep(40) }
+      for (let i = 0; i < 30 && !capture().includes("1 ✓ 0 ✗"); i++) { mouse(65, 140, 20); await sleep(40) }
     }
     await until((s) => s.includes(`token: ${input} in ${output} out`), 5000)
     const ansi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
@@ -1042,6 +1038,15 @@ try {
     assertNotificationAudio(assert, records)
     await writeFile(path.join(root, `.runtime/${scenario}-notifications.json`), JSON.stringify(records, null, 2))
     console.log(`PASS ${scenario} notifications: ${banners.map(record => record.title).join("; ")}; bundled normalized audio observed.`)
+  }
+  await assertLegacyUntouched(temp)
+  if (["correction", "auto-shell"].includes(scenario)) {
+    await until(() => readLifetime(temp).activity.reviews === 1 &&
+      (scenario !== "auto-shell" || readLifetime(temp).activity.autoApproved === 1), 5000)
+    const totals = readLifetime(temp)
+    assert.equal(totals.safe, 1); assert.equal(totals.unsafe, 0)
+    assert.equal(totals.activity.retries, correction ? 1 : networkRetry ? 2 : 0)
+    assert.equal(totals.requests, (correction ? 2 : 1) + (process.argv.includes("--seed-lifetime") ? 1 : 0))
   }
   outcome = "passed"
 } catch (error) {

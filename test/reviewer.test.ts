@@ -25,7 +25,10 @@ import { BUILTIN_PROMPTS, CONTRACT, CORRECTION, loadPrompts } from "../src/promp
 import { collectEditEvidence } from "../src/evidence.js"
 import type { Evidence, ReviewEvidence, ReviewProgress } from "../src/types.js"
 import { usageText, type Usage } from "../src/usage.js"
-import { LifetimeUsage, lifetimeCost } from "../src/lifetime.js"
+import { lifetimeCost } from "../src/lifetime.js"
+import { DatabaseSync } from "node:sqlite"
+import { HistorySQL, type HistoryTotals } from "../src/history-schema.js"
+import { encodeEvent } from "../src/history-records.js"
 
 const evidence: Evidence = {
   kind: "shell",
@@ -1323,10 +1326,9 @@ test("real HTTP streaming retains the response model for generic usage-only pric
 
 test("complete SSE reviews discard stale estimates from report and lifetime but preserve independently reported cost", async (t) => {
   for (const reported of [false, true]) for (const output of [1, 100]) await t.test(`${reported ? "reported" : "estimated"}, final output ${output}`, async (t) => {
-    const directory = await mkdtemp(path.join(tmpdir(), "review-stale-estimate-"))
-    const store = new LifetimeUsage(directory)
-    const observed: Usage[] = [], writes: Promise<void>[] = []
-    t.after(async () => { await Promise.allSettled(writes); await rm(directory, { recursive: true, force: true }) })
+    const store = new HistorySQL(new DatabaseSync(":memory:"))
+    const observed: Usage[] = []
+    t.after(() => store.close())
     const initial = { prompt_tokens: 100, completion_tokens: 1, ...(reported ? { cost: 0.000102 } : {}) }
     const latest = { prompt_tokens: 100, completion_tokens: output, prompt_tokens_details: { cached_tokens: 101 } }
     const wire = event({ ...chunk('{"safe":true,"desc":"Bounded effects."}', "stop"), usage: initial })
@@ -1336,16 +1338,18 @@ test("complete SSE reviews discard stale estimates from report and lifetime but 
     const result = await review(evidence, config, signal(), async () => { calls++; return streamText(wire) }, {}, BUILTIN_PROMPTS,
       () => ({ input: 1, output: 2, cache: { read: 0, write: 0 } }), (usage) => {
         observed.push(usage)
-        writes.push(store.record(usage))
-      })
-    await Promise.all(writes)
-    await store.flush()
+      }, undefined, undefined, undefined, { review: "00000000-0000-4000-8000-000000000001", observe: event => {
+        if (event.type !== "finalized") return
+        store.apply("writer", 1, encodeEvent({ type: "attemptFinalized", at: 1, attempt: event.attempt, usage: event.usage,
+          context: { scope: "/fixture", root: "root", session: "root", permission: "permission", review: event.review,
+            category: "bash", configuredModel: config.model, provider: config.baseURL } }))
+      } })
     const expected = { input: 100, output, ...(reported ? { cost: 0.000102 } : {}) }
     assert.deepEqual(result, { safe: true, desc: "Bounded effects.", usage: expected })
     assert.equal(usageText(result.usage!), `token: 100 in ${output} out${reported ? "\ncost: $0.0001" : ""}`)
     assert.deepEqual(observed, [expected], "one final accounting observation, not cumulative-frame increments")
     assert.equal(calls, 1)
-    const totals = await new LifetimeUsage(directory).totals()
+    const totals = (store.query({ type: "totals" }) as HistoryTotals).totals
     const { activity, ...usageTotals } = totals
     assert.equal(activity.usageRequests, 1)
     assert.equal(activity.reviews, 0)

@@ -18,6 +18,7 @@ const auto = flag("auto"), disabled = flag("disabled"), correction = flag("corre
 const plan = permissionStagePlan(scenario, { auto, disabled, correction, held: flag("held"), cancel: flag("cancel"),
   unsafe: flag("unsafe"), error: flag("error"), nativeBashEnabled: flag("native-bash-enabled") })
 if (flag("plan")) { console.log(JSON.stringify(plan, null, 2)); process.exit(0) }
+const { seedLifetime, readLifetime, assertLegacyUntouched } = await import("./smoke-lifetime.mjs")
 const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
 const hostVersion = execFileSync(hostBinary, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
 const stream = flag("stream")
@@ -57,10 +58,7 @@ export default {
 }
 `)
 
-const ledger = path.join(temp, "state/opencode/opencode-reviewer/usage-v1")
-await mkdir(ledger, { recursive: true })
-await writeFile(path.join(ledger, "00000000-0000-0000-0000-000000000001.json"), flag("storage-error") ? "{" : JSON.stringify({ version: 1,
-  requests: 1, input: 100, output: 20, priced: 1, cost: 0.01, since: 1 }))
+await seedLifetime(temp, { usage: { input: 100, output: 20, cost: 0.01 }, storageError: flag("storage-error") })
 
 const requests = [], rpc = [], perRequest = new Map()
 const fixtureErrors = [], terminalAttempts = []
@@ -335,14 +333,21 @@ try {
     tmux("send-keys", "-t", "smoke", "Enter")
     await until((s) => s.includes("Reviewer lifetime usage") && s.includes(flag("storage-error") ? "Lifetime usage unavailable" : `Auto-approved: ${approved} (`), 5000)
     if (!flag("storage-error")) {
-      // The v1 seed contributes one priced/token-counted request and $0.01.
+      // The SQL seed contributes one received POST and $0.01; legacy 999 seeds are excluded.
       // Missing usage contributes nothing; unpriced usage retains its token counts.
       const total = 1 + recorded, priced = 1 + (flag("unpriced") ? 0 : recorded)
       const cost = (0.01 + (flag("unpriced") ? 0 : recorded * (stream ? 0.000115 : 0.00014))).toFixed(4)
       assert.equal(screen.match(/Tokens: \d+ in \d+ out(?: \(partial coverage\))?/)?.[0], `Tokens: ${100 * total} in ${20 * total} out`)
       assert.equal(screen.match(/Cost: \$\d+\.\d{4}(?: \(partial pricing\))?/)?.[0], `Cost: $${cost}${priced < total ? " (partial pricing)" : ""}`)
       const retries = [...perRequest.values()].reduce((sum, attempts) => sum + attempts - 1, 0)
-      assert.match(screen, new RegExp(`Retries: ${retries} \\(partial history\\)`), "old usage does not invent old retry totals")
+      assert.equal(screen.match(/Retries: \d+(?: \(partial history\))?/)?.[0], `Retries: ${retries}`)
+      assert.doesNotMatch(screen, /partial history/)
+      const saved = readLifetime(temp)
+      assert.equal(saved.requests, total)
+      assert.equal(saved.activity.usageRequests, total)
+      assert.equal(saved.activity.retries, retries)
+      assert.equal(saved.activity.autoApproved, approved)
+      assert.equal(saved.cost.toFixed(4), cost)
       if (!flag("cancel")) {
         assert.equal(screen.match(/Reviews: \d+/)?.[0], `Reviews: ${rated}`)
         const percentage = count => rated ? `${(count / rated * 100).toFixed(1)}%` : "n/a"
@@ -363,6 +368,7 @@ try {
     tmux("send-keys", "-t", "smoke", "Escape")
   }
   await save("resolved")
+  await assertLegacyUntouched(temp)
   assert.deepEqual(fixtureErrors, [], "fixture transport and pre-terminal assertions must succeed")
   audit.verify(plan.reviewKinds, plan.attemptsPerReview)
   assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)

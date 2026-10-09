@@ -1,186 +1,124 @@
 import { test, type TestContext } from "node:test"
 import assert from "node:assert/strict"
-import { mkdir, mkdtemp, rm, writeFile, unlink } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import path from "node:path"
 import { setImmediate as settle } from "node:timers/promises"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { LifetimeUsage, type LifetimeTotals } from "../src/lifetime.js"
+import { empty, type LifetimeTotals } from "../src/lifetime.js"
 import { lifetimeTracker } from "../src/lifetime-view.js"
-import { usageAttempt } from "../src/usage.js"
+import type { HistoryRead } from "../src/history-store.js"
+import type { HistoryResult } from "../src/history-schema.js"
 
-const totals = (requests: number): LifetimeTotals => ({ requests, tokenRequests: requests, input: requests * 10,
-  output: requests * 2, priced: requests, cost: requests * 0.01, since: 1700000000000,
-  safe: requests, unsafe: 0, ratingsSince: requests ? 1700000000000 : null,
-  activity: { reviews: 0, usageRequests: 0, retries: 0, autoApproved: 0, timedReviews: 0, meanFullReportMs: 0, meanRatingMs: 0, since: null } })
-
+const totals = (requests: number): LifetimeTotals => ({ ...empty(), requests, tokenRequests: requests, input: requests * 10,
+  output: requests * 2, priced: requests, cost: requests * 0.01, since: requests ? 1 : null,
+  safe: requests, ratingsSince: requests ? 1 : null,
+  activity: { ...empty().activity, reviews: requests, usageRequests: requests, since: requests ? 1 : null } })
 function deferred<T>() {
-  let resolve!: (value: T) => void
-  const promise = new Promise<T>((yes) => { resolve = yes })
-  return { promise, resolve }
+  let resolve!: (value: T) => void, reject!: (error: Error) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
 }
-
 async function fixture(t: TestContext) {
-  const state = await mkdtemp(path.join(tmpdir(), "review-lifetime-ui-"))
-  const directory = path.join(state, "opencode-reviewer", "usage-v4")
-  const originalTotals = LifetimeUsage.prototype.totals
-  const calls: { signal: AbortSignal; value: ReturnType<typeof deferred<LifetimeTotals>>; cleanup: ReturnType<typeof deferred<void>> }[] = []
+  const calls: { signal: AbortSignal; value: ReturnType<typeof deferred<HistoryResult>>; cleanup: ReturnType<typeof deferred<void>> }[] = []
+  const commits = new Set<() => unknown>(), failures = new Set<() => unknown>()
   let actual = 0, maximum = 0, replacements = 0, open = false, unregistered = 0
-  t.mock.method(LifetimeUsage.prototype, "totals", async (signal: AbortSignal) => {
-    actual++
-    maximum = Math.max(maximum, actual)
-    const call = { signal, value: deferred<LifetimeTotals>(), cleanup: deferred<void>() }
-    calls.push(call)
-    try { return await call.value.promise }
-    finally { await call.cleanup.promise; actual-- }
-  })
-  const parent = new AbortController()
-  const disposers: (() => void)[] = []
+  const store = {
+    query: (query: unknown, signal?: AbortSignal): HistoryRead => {
+      assert.deepEqual(query, { type: "totals" })
+      actual++; maximum = Math.max(maximum, actual)
+      const call = { signal: signal!, value: deferred<HistoryResult>(), cleanup: deferred<void>() }
+      calls.push(call)
+      const read: HistoryRead = call.value.promise
+      read.settled = call.cleanup.promise.then(() => { actual-- })
+      return read
+    },
+    onCommit: (fn: () => unknown) => { commits.add(fn); return () => { commits.delete(fn) } },
+    onWriteFailure: (fn: () => unknown) => { failures.add(fn); return () => { failures.delete(fn) } },
+  }
+  const parent = new AbortController(), disposers: (() => void)[] = []
   let command!: { run: () => void }
   const api = {
-    state: { path: { state } },
     lifecycle: { signal: parent.signal, onDispose: (run: () => void) => { disposers.push(run) } },
     keymap: { registerLayer: (layer: { commands: { run: () => void }[] }) => {
-      command = layer.commands[0]!
-      return () => { unregistered++ }
+      command = layer.commands[0]!; return () => { unregistered++ }
     } },
-    // Keep the render callback unopened: async refreshes must never replace a
-    // dismissed host dialog, independently of JSX or host rendering mechanics.
+    // Do not evaluate JSX: a refresh must never replace a dismissed host dialog.
     ui: { dialog: { replace: () => { replacements++; open = true } } },
   } as unknown as TuiPluginApi
-  const tracker = lifetimeTracker(api)
+  const tracker = lifetimeTracker(api, store)
   const dispose = () => { parent.abort(); for (const run of disposers.splice(0)) run() }
-  const finish = (index: number, value = totals(index + 1)) => { calls[index]!.value.resolve(value); calls[index]!.cleanup.resolve() }
-  const saved = () => originalTotals.call(new LifetimeUsage(directory))
+  const finish = (index: number, value = totals(index + 1)) => {
+    calls[index]!.value.resolve({ revision: index, totals: value }); calls[index]!.cleanup.resolve()
+  }
   t.after(async () => {
     dispose()
-    for (const call of calls) { call.value.resolve(totals(0)); call.cleanup.resolve() }
+    for (let i = 0; i < calls.length; i++) finish(i)
     await settle()
-    await tracker.flush()
-    await rm(state, { recursive: true, force: true })
-    assert.equal(actual, 0)
-    assert.ok(maximum <= 1)
+    assert.equal(actual, 0); assert.ok(maximum <= 1)
+    assert.equal(commits.size, 0); assert.equal(failures.size, 0)
   })
   await settle()
-  return { tracker, calls, directory, command, dispose, finish, saved,
+  return { tracker, calls, command, dispose, finish, abort: () => parent.abort(),
+    commit: () => { for (const fn of commits) fn() }, fail: () => { for (const fn of failures) fn() },
     dismiss: () => { open = false }, counts: () => ({ actual, maximum, reads: calls.length, replacements, open, unregistered }) }
 }
 
-test("palette refresh updates tracker state without replacing or reopening a dismissed dialog", async (t) => {
+test("palette fetches committed totals without replacing or resurrecting a dismissed dialog", async t => {
   const f = await fixture(t)
-  assert.equal(f.counts().replacements, 0)
-  f.finish(0, totals(1))
-  await settle()
+  f.finish(0, totals(1)); await settle()
   assert.equal(f.tracker.text(), "lifetime: $0.0100\n1 ✓ 0 ✗")
-  f.command.run()
-  await settle()
-  assert.equal(f.counts().replacements, 1)
-  f.dismiss()
-  f.finish(1, totals(2))
-  await settle()
+  f.command.run(); f.dismiss(); f.finish(1, totals(2)); await settle()
   assert.equal(f.tracker.text(), "lifetime: $0.0200\n2 ✓ 0 ✗")
-  assert.equal(f.counts().replacements, 1)
-  assert.equal(f.counts().open, false)
+  assert.equal(f.counts().replacements, 1); assert.equal(f.counts().open, false)
 })
 
-test("write failure invalidates older queued totals and a later successful record recovers all increments", async (t) => {
+test("write failure invalidates active and queued snapshots; a local commit immediately recovers without warning", async t => {
   const f = await fixture(t)
-  await mkdir(path.dirname(f.directory), { recursive: true })
-  await writeFile(f.directory, "blocked lifetime directory")
-  f.command.run()
-  f.tracker.record({ cost: 0.1 })
-  await f.tracker.flush()
-  await settle()
+  f.command.run(); f.fail()
   assert.equal(f.tracker.text(), "lifetime: usage unavailable")
-  f.finish(0, totals(99))
-  await settle()
+  f.finish(0, totals(99)); await settle()
+  assert.equal(f.counts().reads, 1)
   assert.equal(f.tracker.text(), "lifetime: usage unavailable")
-  assert.equal(f.counts().reads, 1, "a queued refresh older than the failed write stays invalidated")
-  await unlink(f.directory)
-  f.tracker.record({ cost: 0.2 })
-  await f.tracker.flush()
-  await settle()
-  const saved = await f.saved()
-  assert.equal(saved.requests, 2)
-  assert.ok(Math.abs(saved.cost - 0.3) < 1e-12)
+  f.commit(); assert.equal(f.counts().reads, 2)
+  f.finish(1, totals(2)); await settle()
+  assert.equal(f.tracker.text(), "lifetime: $0.0200\n2 ✓ 0 ✗")
+})
+
+test("two-second polling refreshes shared totals without invalidating a slow healthy read", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] })
+  const f = await fixture(t)
+  t.mock.timers.tick(2000); await settle()
+  assert.equal(f.counts().reads, 1)
+  f.finish(0, totals(1)); await settle()
+  assert.equal(f.tracker.text(), "lifetime: $0.0100\n1 ✓ 0 ✗")
   assert.equal(f.counts().reads, 2)
-  f.finish(1, saved)
-  await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.3000\n0 ✓ 0 ✗")
+  f.finish(1, totals(2)); await settle()
+  t.mock.timers.tick(1999); assert.equal(f.counts().reads, 2)
+  t.mock.timers.tick(1); assert.equal(f.counts().reads, 3)
+  f.finish(2, totals(3)); await settle()
+  assert.equal(f.tracker.text(), "lifetime: $0.0300\n3 ✓ 0 ✗")
 })
 
-test("rating-only records persist and refresh independently of request usage", async t => {
+test("expired reads retain actual cleanup ownership through storms and disposal", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] })
   const f = await fixture(t)
-  f.tracker.recordRating(true); f.tracker.recordRating(false)
-  await f.tracker.flush(); await settle()
-  const saved = await f.saved()
-  assert.equal(saved.requests, 0)
-  assert.equal(saved.safe, 1); assert.equal(saved.unsafe, 1)
-  f.finish(0, totals(0)); await settle()
-  f.finish(1, saved); await settle()
-  assert.equal(f.tracker.text(), undefined, "rating-only history stays in the palette without standalone inline usage")
-  f.tracker.record({ cost: 0.1 })
-  await f.tracker.flush(); await settle()
-  f.finish(2, await f.saved()); await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.1000\n1 ✓ 1 ✗")
-})
-
-test("activity counters persist without usage and recover together after a failed write", async t => {
-  const f = await fixture(t)
-  await mkdir(path.dirname(f.directory), { recursive: true })
-  await writeFile(f.directory, "blocked")
-  f.tracker.recordRetry(); f.tracker.recordAutoApproval()
-  await f.tracker.flush(); await settle()
+  f.calls[0]!.value.reject(Error("bounded read expired")); await settle()
   assert.equal(f.tracker.text(), "lifetime: usage unavailable")
-  await unlink(f.directory)
-  f.tracker.recordRating(true, { fullReportMs: 2000, ratingMs: 800 })
-  await f.tracker.flush(); await settle()
-  const totals = await f.saved()
-  assert.equal(totals.requests, 0)
-  assert.equal(totals.activity.retries, 1); assert.equal(totals.activity.autoApproved, 1)
-  assert.equal(totals.activity.meanFullReportMs, 2000); assert.equal(totals.activity.meanRatingMs, 800)
+  for (let i = 0; i < 100; i++) { f.commit(); f.command.run() }
+  t.mock.timers.tick(10000); await settle()
+  assert.equal(f.counts().reads, 1); assert.equal(f.counts().actual, 1)
+  f.calls[0]!.cleanup.resolve(); await settle()
+  assert.equal(f.counts().reads, 2)
+  f.abort(); f.dismiss()
+  const published = f.tracker.text(), replacements = f.counts().replacements
+  f.finish(1, totals(99)); await settle()
+  f.command.run(); t.mock.timers.tick(10000); await settle()
+  assert.equal(f.tracker.text(), published); assert.equal(f.counts().replacements, replacements)
+  assert.equal(f.counts().reads, 2)
 })
 
-test("disposal finalizers record and flush while timed-out totals cleanup remains outstanding", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] })
+test("rating-only totals remain available to the dialog without standalone inline usage", async t => {
   const f = await fixture(t)
-  f.tracker.record({ cost: 0.1 })
-  await f.tracker.flush()
-  await settle()
-  for (let i = 0; i < 100; i++) f.command.run()
-  t.mock.timers.tick(5000)
-  await settle()
-  assert.equal(f.tracker.text(), "lifetime: usage unavailable")
-  assert.equal(f.counts().actual, 1)
-
-  const finishWorker = deferred<void>()
-  const workerAbort = new AbortController()
-  const worker = (async () => {
-    const attempt = usageAttempt("https://openrouter.ai/api/v1", "fixture", undefined, f.tracker.record)
-    try {
-      attempt.observe({ usage: { cost: 0.2 } })
-      attempt.observe({ usage: { cost: 0.2 } })
-      await finishWorker.promise
-      workerAbort.signal.throwIfAborted()
-    } finally { attempt.finalize(); attempt.finalize() }
-  })()
-  const rejected = assert.rejects(worker, { name: "AbortError" })
-  f.dispose()
-  workerAbort.abort()
-  finishWorker.resolve()
-  await rejected
-  await f.tracker.flush()
-  const saved = await f.saved()
-  assert.equal(saved.requests, 2)
-  assert.equal(saved.tokenRequests, 0)
-  assert.ok(Math.abs(saved.cost - 0.3) < 1e-12)
-  assert.equal(f.counts().actual, 1, "write flush is independent of stalled read cleanup")
-  assert.equal(f.counts().reads, 1)
-  assert.equal(f.counts().unregistered, 1)
-  const published = f.tracker.text()
-  f.finish(0, totals(99))
-  await settle()
-  assert.equal(f.counts().actual, 0)
-  assert.equal(f.counts().reads, 1)
-  assert.equal(f.tracker.text(), published)
+  f.finish(0, { ...totals(0), safe: 1, unsafe: 1, ratingsSince: 1 }); await settle()
+  assert.equal(f.tracker.text(), undefined)
+  f.commit(); f.finish(1, { ...totals(1), unsafe: 1 }); await settle()
+  assert.equal(f.tracker.text(), "lifetime: $0.0100\n1 ✓ 1 ✗")
 })

@@ -1,10 +1,4 @@
-import { constants } from "node:fs"
-import { mkdir, open, readdir, rename, unlink } from "node:fs/promises"
-import { randomUUID } from "node:crypto"
-import path from "node:path"
-import type { Usage } from "./usage.js"
 import { uiText } from "./ui-text.js"
-import type { ReviewTiming } from "./types.js"
 
 export interface LifetimeActivity {
   reviews: number
@@ -36,7 +30,6 @@ const empty = (): LifetimeTotals => ({ requests: 0, tokenRequests: 0, input: 0, 
   safe: 0, unsafe: 0, ratingsSince: null, activity: emptyActivity() })
 const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0
 const amount = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0
-const snapshotName = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.json$/
 
 export function validate(value: LifetimeTotals): LifetimeTotals {
   if (!value || ![value.requests, value.tokenRequests, value.input, value.output, value.priced, value.safe, value.unsafe, value.safe + value.unsafe].every(count)
@@ -87,124 +80,6 @@ export function add(left: LifetimeTotals, right: LifetimeTotals): LifetimeTotals
 }
 
 export { empty }
-
-/** One compact atomic snapshot per plugin instance: no shared read/modify/write race. */
-export class LifetimeUsage {
-  private readonly id = randomUUID()
-  private local = empty()
-  private pending = Promise.resolve()
-  private readonly legacyDirectories: string[]
-  constructor(readonly directory: string, ...legacyDirectories: string[]) {
-    if (![directory, ...legacyDirectories].every(value => path.isAbsolute(value))) {
-      throw new Error("Lifetime usage directory must be absolute")
-    }
-    this.legacyDirectories = legacyDirectories
-  }
-
-  record(usage: Usage): Promise<void> {
-    const tokens = count(usage.input) && count(usage.output)
-    if ((!tokens && (usage.input !== undefined || usage.output !== undefined || usage.cost === undefined))
-      || (usage.cost !== undefined && !amount(usage.cost))) {
-      return Promise.reject(new Error("Invalid request usage"))
-    }
-    return this.increment({ ...empty(), requests: 1, tokenRequests: tokens ? 1 : 0, input: usage.input ?? 0, output: usage.output ?? 0,
-      priced: usage.cost === undefined ? 0 : 1, cost: usage.cost ?? 0, since: Date.now(),
-      activity: { ...emptyActivity(), usageRequests: 1, since: Date.now() } })
-  }
-
-  /** One accepted final review, independent of POST count or received usage. */
-  recordRating(safe: boolean, timing?: ReviewTiming): Promise<void> {
-    if (typeof safe !== "boolean") return Promise.reject(new Error("Invalid review rating"))
-    if (timing && (![timing.fullReportMs, timing.ratingMs].every(amount) || timing.ratingMs > timing.fullReportMs)) {
-      return Promise.reject(new Error("Invalid review timing"))
-    }
-    return this.increment({ ...empty(), safe: safe ? 1 : 0, unsafe: safe ? 0 : 1, ratingsSince: Date.now(),
-      activity: { ...emptyActivity(), reviews: 1, since: Date.now(), timedReviews: timing ? 1 : 0,
-        meanFullReportMs: timing?.fullReportMs ?? 0, meanRatingMs: timing?.ratingMs ?? 0 } })
-  }
-
-  recordRetry(): Promise<void> {
-    return this.increment({ ...empty(), activity: { ...emptyActivity(), retries: 1, since: Date.now() } })
-  }
-
-  recordAutoApproval(): Promise<void> {
-    return this.increment({ ...empty(), activity: { ...emptyActivity(), autoApproved: 1, since: Date.now() } })
-  }
-
-  private increment(increment: LifetimeTotals): Promise<void> {
-    this.pending = this.pending.catch(() => {}).then(async () => {
-      // A later successful write includes earlier increments if persistence failed.
-      this.local = add(this.local, increment)
-      await mkdir(this.directory, { recursive: true, mode: 0o700 })
-      const temporary = path.join(this.directory, `${this.id}.${randomUUID()}.tmp`)
-      try {
-        const file = await open(temporary, "wx", 0o600)
-        try { await file.writeFile(JSON.stringify({ version: 4, ...this.local })); await file.sync() }
-        finally { await file.close() }
-        await rename(temporary, path.join(this.directory, `${this.id}.json`))
-        const directory = await open(this.directory, constants.O_RDONLY | constants.O_DIRECTORY)
-        try { await directory.sync() } finally { await directory.close() }
-      } finally { await unlink(temporary).catch(() => {}) }
-    })
-    return this.pending
-  }
-
-  /** Call after active review workers have finalized; this drains only writes already queued. */
-  flush(): Promise<void> { return this.pending }
-
-  async totals(signal?: AbortSignal): Promise<LifetimeTotals> {
-    signal?.throwIfAborted()
-    await this.flush()
-    signal?.throwIfAborted()
-    let total = empty()
-    // Never copy legacy totals into local snapshots: concurrent/restarted instances would duplicate history.
-    const directories = new Set([this.directory, ...this.legacyDirectories].map((directory) => path.resolve(directory)))
-    for (const directory of directories) total = add(total, await this.readDirectory(directory, signal))
-    signal?.throwIfAborted()
-    return total
-  }
-
-  private async readDirectory(directory: string, signal?: AbortSignal): Promise<LifetimeTotals> {
-    signal?.throwIfAborted()
-    const names = await readdir(directory).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return []
-      throw error
-    })
-    signal?.throwIfAborted()
-    let total = empty()
-    for (const name of names.filter((name) => snapshotName.test(name))) {
-      signal?.throwIfAborted()
-      const file = await open(path.join(directory, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-      try {
-        signal?.throwIfAborted()
-        const stat = await file.stat()
-        signal?.throwIfAborted()
-        if (!stat.isFile() || stat.size > 1024) throw new Error("Invalid lifetime usage snapshot")
-        const bytes = Buffer.alloc(1025)
-        let size = 0
-        while (size < bytes.length) {
-          signal?.throwIfAborted()
-          const read = await file.read(bytes, size, bytes.length - size, size)
-          signal?.throwIfAborted()
-          if (!read.bytesRead) break
-          size += read.bytesRead
-        }
-        if (size > 1024) throw new Error("Invalid lifetime usage snapshot")
-        const value = JSON.parse(bytes.subarray(0, size).toString("utf8"))
-        if (![1, 2, 3, 4].includes(value?.version)) throw new Error("Unsupported lifetime usage snapshot")
-        total = add(total, validate({ requests: value.requests, input: value.input, output: value.output,
-          tokenRequests: value.version === 1 ? value.requests : value.tokenRequests,
-          priced: value.priced, cost: value.cost, since: value.since,
-          safe: value.version >= 3 ? value.safe : 0, unsafe: value.version >= 3 ? value.unsafe : 0,
-          ratingsSince: value.version >= 3 ? value.ratingsSince : null,
-          activity: value.version === 4 ? value.activity : emptyActivity() }))
-      } finally { await file.close() }
-      signal?.throwIfAborted()
-    }
-    signal?.throwIfAborted()
-    return total
-  }
-}
 
 export function lifetimeCost(totals: LifetimeTotals): string {
   if (!totals.requests) return uiText.lifetime.empty
