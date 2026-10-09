@@ -1,11 +1,14 @@
 import { uiText } from "./ui-text.js"
 
-export type NotificationKind = "attention" | "approved" | "error" | "ended"
+export const notificationKinds = ["attention", "unsafe", "question", "approved", "error", "ended"] as const
+export type NotificationKind = typeof notificationKinds[number]
+export interface NotificationInteraction { kind: "permission" | "question"; id: string }
 export interface NotificationMessage {
   kind: NotificationKind
   title: string
   body: string
   sessionID: string
+  banner: boolean
   sound: boolean
 }
 export interface NotificationHandle { close(): void | Promise<void>; closed?: Promise<void> }

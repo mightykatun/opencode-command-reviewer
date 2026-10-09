@@ -194,7 +194,8 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   let notificationConfig: ReturnType<typeof parseNotificationConfig> | undefined
   try { notificationConfig = parseNotificationConfig(options) } catch { /* Invalid desktop options disable only notifications. */ }
   try {
-    const parsed = parseConfig(notificationConfig ? options : { ...options, notify: false, notifySound: false, notificationSoundDirectory: undefined })
+    const parsed = parseConfig(notificationConfig ? options : { ...options, notify: false, notifySound: false,
+      notificationSoundDirectory: undefined, staleReminderSeconds: 0, notifications: undefined })
     reviewOptions = parsed
     prompts = await withDeadline(api.lifecycle.signal, parsed.timeoutMs, (signal) => loadPrompts(parsed.instructions, signal), "Prompt loading")
     config = parsed
@@ -227,7 +228,11 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
       const backend = notificationBackend ? notificationBackend(click, notificationConfig) : new LinuxNotifications(notificationConfig, click)
       notifications = new NotificationHost(api,
         new NotificationPolicy(notificationConfig, reviewOptions?.autoApprove === true, backend),
-        (id, signal) => modes.root(id, signal))
+        (id, signal) => modes.root(id, signal), async signal => {
+          const result = await api.client.question.list({ directory: api.state.path.directory }, { signal, throwOnError: true })
+          if (!result.data) throw new Error("Pending questions unavailable")
+          return result.data
+        })
     } catch { /* Desktop initialization cannot change review behavior. */ }
   }
   const files = new FileAccess(fileIO)

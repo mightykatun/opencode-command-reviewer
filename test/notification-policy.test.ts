@@ -11,29 +11,38 @@ const view = (id = "a", status: View["status"] = "analyzing", safe = true): View
   request: { id, sessionID: "root", permission: "bash", patterns: ["command"], always: [], metadata: {} },
   status, ...(status === "complete" ? { assessment: { safe, desc: "Fixture" } } : {}),
 })
-function fixture(auto = false, notify = true, sound = true) {
+function fixture(auto = false, notify = true, sound = true, options: Record<string, unknown> = {}) {
   let now = 0
   const timers = new Set<{ at: number; callback: () => void }>()
   const messages: NotificationMessage[] = [], closed: string[] = []
-  const policy = new NotificationPolicy({ notify, notifySound: sound }, auto, {
+  const dismissals: (() => void)[] = []
+  const policy = new NotificationPolicy(parseNotificationConfig({ notify, notifySound: sound, ...options }), auto, {
     async show(message, signal) {
       assert.equal(signal.aborted, false)
       messages.push(message)
-      return { close: () => { closed.push(message.title) } }
+      const closedPromise = new Promise<void>(resolve => { dismissals.push(resolve) })
+      return { close: () => { closed.push(message.title) }, closed: closedPromise }
     }, dispose() {},
   }, { now: () => now, after(ms, callback) {
     const timer = { at: now + ms, callback }; timers.add(timer)
     return () => { timers.delete(timer) }
   } })
-  return { policy, messages, closed, async advance(ms: number) {
+  return { policy, messages, closed, timers, dismissals, async advance(ms: number) {
     now += ms
     for (const timer of [...timers]) if (timer.at <= now && timers.delete(timer)) timer.callback()
     await settle()
-  }, add(v = view()) { policy.snapshot([v]); policy.permission(v.request, target, true) } }
+  }, add(v = view()) {
+    policy.pending(new Map([[target.root, { kind: "permission", id: v.request.id }]]))
+    policy.snapshot([v]); policy.permission(v.request, target, true)
+  } }
 }
 
 test("notification settings are independently strict, default on, and use absolute sound paths", () => {
-  assert.deepEqual(parseNotificationConfig(), { notify: true, notifySound: true, notificationSoundDirectory: undefined })
+  assert.deepEqual(parseNotificationConfig(), { notify: true, notifySound: true, notificationSoundDirectory: undefined,
+    staleReminderSeconds: 60, notifications: {
+      attention: { banner: true, sound: true }, unsafe: { banner: true, sound: true }, question: { banner: true, sound: true },
+      approved: { banner: true, sound: true }, error: { banner: true, sound: true }, ended: { banner: true, sound: true },
+    } })
   for (const name of ["notify", "notifySound"]) for (const value of [null, "true", 0, [], {}]) {
     assert.throws(() => parseNotificationConfig({ [name]: value }), new RegExp(`${name} must be a boolean`))
   }
@@ -48,7 +57,7 @@ test("questions notify immediately, baseline and repeated asks stay silent, reso
   f.policy.question("old", target, false); f.policy.question("old", target, true)
   f.policy.question("new", target, true); f.policy.question("new", target, true)
   await settle()
-  assert.deepEqual(f.messages.map(m => m.title), ["Session needs attention"])
+  assert.deepEqual(f.messages.map(m => m.title), ["Agent has a question"])
   f.policy.resolved("question", "new")
   assert.equal(f.closed.length, 1)
   f.policy.dispose()
@@ -144,7 +153,7 @@ test("every reviewer banner is delivered but its audio is rate limited without s
   const f = fixture(true)
   for (const id of ["a", "b"]) f.policy.approved(view(id).request, target)
   f.policy.question("q", target, true); await settle()
-  assert.deepEqual(f.messages.map(m => [m.kind, m.sound]), [["approved", true], ["approved", false], ["attention", true]])
+  assert.deepEqual(f.messages.map(m => [m.kind, m.sound]), [["approved", true], ["approved", false], ["question", true]])
   await f.advance(2000); f.policy.approved(view("c").request, target); await settle()
   assert.equal(f.messages[3]?.sound, true); f.policy.dispose()
 })
@@ -160,9 +169,167 @@ test("turn outcomes deduplicate across error/idle; disable, mute, disposal and l
   await settle(); assert.equal(disabled.messages.length, 0); disabled.policy.dispose()
   let release!: (value: { close(): void }) => void
   let closed = 0
-  const policy = new NotificationPolicy({ notify: true, notifySound: true }, false, {
+  const policy = new NotificationPolicy(parseNotificationConfig(), false, {
     show: () => new Promise(resolve => { release = resolve }), dispose() {},
   })
   policy.question("q", target, true); await settle(); policy.resolved("question", "q")
   release({ close() { closed++ } }); await settle(); assert.equal(closed, 1); policy.dispose()
+})
+
+test("notification controls reject malformed schemas and default omitted entries independently", () => {
+  for (const notifications of [null, [], true, "all", { unknown: {} }, { unsafe: null }, { question: [] },
+    { attention: { banner: 1 } }, { error: { sound: null } }, { ended: { typo: false } },
+    JSON.parse('{"__proto__":{"banner":true}}'), new Date()]) assert.throws(() => parseNotificationConfig({ notifications }))
+  for (const staleReminderSeconds of [null, -1, 0.5, "60", Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => parseNotificationConfig({ staleReminderSeconds }))
+  }
+  assert.equal(parseNotificationConfig({ staleReminderSeconds: 0 }).staleReminderSeconds, 0)
+  assert.equal(parseNotificationConfig({ staleReminderSeconds: Number.MAX_SAFE_INTEGER }).staleReminderSeconds, Number.MAX_SAFE_INTEGER)
+  const config = parseNotificationConfig({ notifications: { unsafe: { banner: false }, question: { sound: false } } })
+  assert.deepEqual(config.notifications.unsafe, { banner: false, sound: true })
+  assert.deepEqual(config.notifications.question, { banner: true, sound: false })
+  assert.deepEqual(config.notifications.attention, { banner: true, sound: true })
+})
+
+test("Unsafe is final-only, replaces an earlier fallback, and never follows a preliminary canceled-review alert", async () => {
+  const f = fixture(true)
+  f.add({ ...view(), autoApproval: { status: "cancelled" } })
+  f.policy.snapshot([{ ...view(), autoApproval: { status: "cancelled" },
+    progress: { attempt: 0, phase: "streaming", preview: { safe: false } } }])
+  await settle(); assert.equal(f.messages.length, 0)
+  f.policy.snapshot([view("a", "unavailable")]); await settle()
+  assert.equal(f.messages[0]?.kind, "attention")
+  f.policy.snapshot([view("a", "identifying")]); await settle()
+  await f.advance(60000); assert.equal(f.messages.length, 1, "fresh review must suppress stale generic reminders")
+  f.policy.snapshot([view("a", "complete", false)]); await settle()
+  assert.deepEqual(f.messages.map(m => m.title), ["Session needs attention", "Unsafe permission needs human approval"])
+  await f.advance(59999); assert.equal(f.messages.length, 2)
+  await f.advance(1); assert.equal(f.messages[2]?.title, "Unsafe permission needs human approval (Reminder)")
+  assert.equal(f.messages[2]?.kind, "unsafe")
+  await f.policy.dispose()
+})
+
+for (const kind of ["attention", "unsafe", "question"] as const) {
+  test(`${kind} reminders reuse presentation, survive banner dismissal, replace old banners and stop on resolution`, async () => {
+    const f = fixture()
+    if (kind === "question") {
+      f.policy.pending(new Map([["root", { kind: "question", id: "q" }]]))
+      f.policy.question("q", target, true)
+    } else f.add(view("a", "complete", kind !== "unsafe"))
+    await settle()
+    const initial = f.messages[0]!
+    f.dismissals[0]!(); await settle()
+    await f.advance(59999); assert.equal(f.messages.length, 1)
+    await f.advance(1); assert.deepEqual(f.messages[1], { ...initial, title: `${initial.title} (Reminder)` })
+    await f.advance(60000); assert.deepEqual(f.messages[2], f.messages[1], "suffix must not accumulate")
+    assert.ok(f.closed.includes(`${initial.title} (Reminder)`))
+    f.policy.resolved(kind === "question" ? "question" : "permission", kind === "question" ? "q" : "a")
+    await f.advance(120000); assert.equal(f.messages.length, 3)
+    assert.equal(f.timers.size, 0)
+    await f.policy.dispose()
+  })
+}
+
+test("only the selected blocker repeats per root, and queue handoff waits a full interval", async () => {
+  const f = fixture(false, true, true, { staleReminderSeconds: 10 })
+  const a = view("a", "complete"), b = view("b", "complete", false)
+  f.policy.snapshot([a, b])
+  for (const v of [a, b]) f.policy.permission(v.request, target, true)
+  f.policy.question("q", target, true)
+  f.policy.question("other", { ...target, root: "other", sessionID: "other" }, true)
+  f.policy.pending(new Map([["root", { kind: "permission", id: "a" }], ["other", { kind: "question", id: "other" }]]))
+  await settle(); assert.equal(f.messages.length, 4)
+  await f.advance(10000)
+  assert.deepEqual(f.messages.slice(4).map(m => [m.kind, m.sessionID]), [["attention", "root"], ["question", "other"]])
+  f.policy.resolved("permission", "a")
+  f.policy.pending(new Map([["root", { kind: "permission", id: "b" }]]))
+  await f.advance(9999); assert.equal(f.messages.length, 6)
+  await f.advance(1); assert.equal(f.messages[6]?.kind, "unsafe")
+  f.policy.pending(new Map([["root", { kind: "permission", id: "baseline" }]]))
+  await f.advance(10000); assert.equal(f.messages.length, 7, "a silent baseline blocker must not promote a later request")
+  f.policy.deleted("root"); f.policy.deleted("other")
+  assert.equal(f.timers.size, 0)
+  await f.policy.dispose()
+})
+
+test("automatic approval, uncertain writes and disposal cancel pending reminders", async () => {
+  const f = fixture(true, true, true, { staleReminderSeconds: 1 })
+  f.add(view("a", "complete")); await f.advance(1000)
+  assert.equal(f.messages.length, 1)
+  for (const status of ["countdown", "checking", "allowing", "failed"] as const) {
+    f.policy.snapshot([{ ...view("a", "complete"), autoApproval: status === "countdown" ? { status, seconds: 15 } : { status } }])
+    await f.advance(2000); assert.equal(f.messages.length, 1)
+  }
+  f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "failed" }, approvalPendingConfirmed: true }])
+  await settle(); assert.equal(f.messages.length, 2)
+  await f.advance(1000); assert.equal(f.messages.length, 3)
+  await f.policy.dispose(); assert.equal(f.timers.size, 0)
+  await f.advance(10000); assert.equal(f.messages.length, 3)
+})
+
+for (const kind of ["attention", "unsafe", "question", "approved", "error", "ended"] as const) {
+  for (const [banner, sound] of [[true, false], [false, true], [false, false]] as const) {
+    test(`${kind}: banner=${banner}, sound=${sound}, reminders inherit effective controls`, async () => {
+      const f = fixture(false, true, true, { staleReminderSeconds: 1, notifications: { [kind]: { banner, sound } } })
+      if (kind === "question") {
+        f.policy.pending(new Map([["root", { kind: "question", id: "q" }]])); f.policy.question("q", target, true)
+      } else if (kind === "attention" || kind === "unsafe") f.add(view("a", "complete", kind !== "unsafe"))
+      else if (kind === "approved") f.policy.approved(view().request, target)
+      else f.policy.turn(kind, "turn", target)
+      await settle()
+      const enabled = banner || sound
+      assert.equal(f.messages.length, enabled ? 1 : 0)
+      if (enabled) assert.deepEqual([f.messages[0]?.banner, f.messages[0]?.sound], [banner, sound])
+      await f.advance(1000)
+      assert.equal(f.messages.length, enabled ? (["attention", "unsafe", "question"].includes(kind) ? 2 : 1) : 0)
+      for (const m of f.messages) assert.deepEqual([m.banner, m.sound], [banner, sound])
+      await f.policy.dispose()
+    })
+  }
+}
+
+test("master switches and zero interval cannot be overridden; very long intervals never overflow", async () => {
+  const muted = fixture(false, true, false, { notifications: { question: { banner: false, sound: true } } })
+  muted.policy.pending(new Map([["root", { kind: "question", id: "q" }]])); muted.policy.question("q", target, true)
+  await muted.advance(60000); assert.equal(muted.messages.length, 0); assert.equal(muted.timers.size, 0); await muted.policy.dispose()
+  for (const staleReminderSeconds of [0, Number.MAX_SAFE_INTEGER]) {
+    const f = fixture(false, true, true, { staleReminderSeconds }); f.add(view("a", "complete"))
+    await settle()
+    await f.advance(2147483647); assert.equal(f.messages.length, 1)
+    for (const timer of f.timers) assert.ok(timer.at > 2147483647)
+    await f.policy.dispose(); assert.equal(f.timers.size, 0)
+  }
+})
+
+test("failed desktop delivery retains interaction reminders without retrying the initial delivery", async () => {
+  let callback: (() => void) | undefined, calls = 0, now = 0
+  const policy = new NotificationPolicy(parseNotificationConfig({ staleReminderSeconds: 1 }), false, {
+    async show() { calls++; throw new Error("desktop unavailable") }, dispose() {},
+  }, { now: () => now, after(ms, cb) { if (ms === 1000) callback = cb; return () => {} } })
+  policy.pending(new Map([["root", { kind: "question", id: "q" }]])); policy.question("q", target, true)
+  await settle(); assert.equal(calls, 1)
+  now = 1000; callback!(); await settle(); assert.equal(calls, 2)
+  policy.resolved("question", "q"); now = 2000; callback!(); await settle(); assert.equal(calls, 2)
+  await policy.dispose()
+})
+
+test("losing the blocker invalidates a due reminder before its deferred backend dispatch", async () => {
+  const f = fixture(false, true, true, { staleReminderSeconds: 1 })
+  f.add(view("a", "complete", false)); await settle()
+  // Move the clock without awaiting the dispatch microtask by using a later
+  // same-turn timer, just like an event that changes native queue ownership.
+  f.timers.add({ at: 1000, callback: () => f.policy.pending(new Map([["root", { kind: "permission", id: "earlier" }]])) })
+  await f.advance(1000)
+  assert.deepEqual(f.messages.map(m => m.title), ["Unsafe permission needs human approval"])
+  await f.advance(1000); assert.equal(f.messages.length, 1)
+  await f.policy.dispose()
+})
+
+test("a stalled event loop emits one reminder without catching up missed intervals", async () => {
+  const f = fixture(false, true, true, { staleReminderSeconds: 10 })
+  f.add(view("a", "complete", false)); await settle()
+  await f.advance(65000); assert.equal(f.messages.length, 2)
+  await f.advance(9999); assert.equal(f.messages.length, 2)
+  await f.advance(1); assert.equal(f.messages.length, 3)
+  await f.policy.dispose()
 })

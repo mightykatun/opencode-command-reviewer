@@ -8,6 +8,7 @@ test("status PNGs have centered colored glyphs, smooth edges and balanced transp
   for (const [kind, rgb] of [
     ["approved", [46, 204, 113]], ["attention", [245, 158, 11]],
     ["error", [239, 68, 68]], ["ended", [160, 160, 160]],
+    ["unsafe", [239, 68, 68]], ["question", [157, 124, 216]],
   ] as const) {
     const png = smallNotificationIcon(kind)
     assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a")
@@ -33,5 +34,5 @@ test("status PNGs have centered colored glyphs, smooth edges and balanced transp
     assert.ok(Math.abs((Math.min(...ys) + Math.max(...ys) + 1) / 2 - 24) <= 0.5)
     shapes.add(JSON.stringify(positions))
   }
-  assert.equal(shapes.size, 4)
+  assert.equal(shapes.size, 5, "Unsafe shares the attention exclamation shape, with its own red color")
 })

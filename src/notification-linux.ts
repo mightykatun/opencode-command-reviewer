@@ -18,7 +18,7 @@ export class LinuxNotifications implements NotificationBackend {
   private start(...args: Parameters<NotificationProcesses["start"]>): NotificationProcess | undefined {
     try { return this.processes.start(...args) } catch { return undefined }
   }
-  constructor(config: NotificationConfig, private click: (sessionID: string) => void,
+  constructor(config: Pick<NotificationConfig, "notificationSoundDirectory" | "notify" | "notifySound">, private click: (sessionID: string) => void,
     private processes: NotificationProcesses = new OwnedNotificationProcesses(),
     private identity: TerminalIdentity | null = gnomeTerminalIdentity() ?? null,
     private platform: string = process.platform) {
@@ -27,6 +27,13 @@ export class LinuxNotifications implements NotificationBackend {
   async show(message: NotificationMessage, parent: AbortSignal) {
     if (this.stopped || parent.aborted || this.platform !== "linux") return
     const preparation = AbortSignal.any([parent, this.abort.signal])
+    if (!message.banner) {
+      if (!message.sound) return
+      const local = new AbortController()
+      const signal = AbortSignal.any([preparation, local.signal])
+      const closed = this.audio.play(message.kind, signal)
+      return { close: () => local.abort(), closed }
+    }
     const [icon, soundReady] = await Promise.all([
       this.icon.file(preparation, message.kind),
       message.sound ? this.audio.ready(message.kind, preparation) : false,

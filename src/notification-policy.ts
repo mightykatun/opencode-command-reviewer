@@ -3,16 +3,20 @@ import { uiText } from "./ui-text.js"
 import type { View } from "./controller.js"
 import type { NotificationConfig } from "./notification-config.js"
 import { notificationClock, notificationText, type NotificationBackend, type NotificationClock,
-  type NotificationHandle, type NotificationKind } from "./notification-types.js"
+  type NotificationHandle, type NotificationKind, type NotificationMessage, type NotificationInteraction } from "./notification-types.js"
 import { withDeadline } from "./deadline.js"
 
 interface Target { root: string; sessionID: string; title: string }
-interface Banner { abort: AbortController; handle?: NotificationHandle; target: Target; expire?: () => void }
+interface Banner { abort: AbortController; handle?: NotificationHandle; target: Target; expire?: () => void; reminder: boolean }
 interface Pending {
+  identity: NotificationInteraction
   target: Target
   phase: "waiting" | "attention" | "automatic"
   banner?: Banner
   grace?: () => void
+  message?: NotificationMessage
+  blocking?: boolean
+  reminder?: () => void
 }
 
 /** Event policy owns no host reads, desktop processes, permission writes or models. */
@@ -21,6 +25,7 @@ export class NotificationPolicy {
   private questions = new Map<string, Pending>()
   private seen = new Set<string>()
   private views = new Map<string, View>()
+  private blockers = new Map<string, NotificationInteraction>()
   private banners = new Set<Banner>()
   private stopped = false
   private lastApprovalSound = -Infinity
@@ -36,16 +41,60 @@ export class NotificationPolicy {
   permission(request: PermissionRequest, target: Target, fresh: boolean) {
     if (this.stopped || !this.config.notify || !this.remember(`permission:${request.id}`) || !fresh) return
     if (this.permissions.size >= 1024) return
-    this.permissions.set(request.id, { target, phase: "waiting" })
+    const entry: Pending = { identity: { kind: "permission", id: request.id }, target, phase: "waiting" }
+    this.permissions.set(request.id, entry)
+    this.select(entry)
     const view = this.views.get(request.id)
     if (view) this.update(view)
   }
   question(id: string, target: Target, fresh: boolean) {
     if (this.stopped || !this.config.notify || !this.remember(`question:${id}`) || !fresh) return
     if (this.questions.size >= 1024) return
-    const entry: Pending = { target, phase: "waiting" }
+    const entry: Pending = { identity: { kind: "question", id }, target, phase: "waiting" }
     this.questions.set(id, entry)
-    this.attention(entry)
+    this.select(entry)
+    this.attention(entry, "question")
+  }
+  /** Native queue identity, independent of route visibility and notification eligibility. */
+  pending(blockers: ReadonlyMap<string, NotificationInteraction>) {
+    if (this.stopped) return
+    this.blockers = new Map(blockers)
+    for (const entry of this.permissions.values()) this.select(entry)
+    for (const entry of this.questions.values()) this.select(entry)
+  }
+  private select(entry: Pending) {
+    const next = this.blockers.get(entry.target.root)
+    const blocking = next?.kind === entry.identity.kind && next.id === entry.identity.id
+    if (entry.blocking === blocking) return
+    entry.blocking = blocking
+    this.stopReminder(entry)
+    // A reminder may still be preparing audio or waiting to reach the backend.
+    // Losing the queue position invalidates that delivery, not just its timer.
+    if (!blocking && entry.banner?.reminder) { this.withdraw(entry.banner); entry.banner = undefined }
+    if (blocking) this.remind(entry)
+  }
+  private stopReminder(entry: Pending) { entry.reminder?.(); entry.reminder = undefined }
+  private remind(entry: Pending) {
+    const message = entry.message
+    if (!entry.blocking || entry.phase !== "attention" || !message || !this.config.staleReminderSeconds || this.stopped) return
+    let stopped = false, cancel: (() => void) | undefined
+    // Seconds remain representable even for MAX_SAFE_INTEGER. Chunk long waits
+    // below Node/Bun's signed 32-bit timer limit instead of overflowing to 1 ms.
+    let remaining = this.config.staleReminderSeconds, at = this.clock.now()
+    const schedule = () => { cancel = this.clock.after(Math.min(remaining * 1000, 2147483647), tick) }
+    const tick = () => {
+      if (stopped || this.stopped || !entry.blocking || entry.message !== message || entry.phase !== "attention") return
+      const now = this.clock.now()
+      remaining -= Math.max(0, now - at) / 1000; at = now
+      if (remaining > 0) { schedule(); return }
+      this.withdraw(entry.banner)
+      entry.banner = this.dispatch({ ...message, title: uiText.notifications.reminder(message.title) }, entry.target, true)
+      // No catch-up burst after a stalled event loop or suspended machine.
+      remaining = this.config.staleReminderSeconds
+      schedule()
+    }
+    entry.reminder = () => { stopped = true; cancel?.() }
+    schedule()
   }
   private withdraw(banner?: Banner) {
     if (!banner) return
@@ -55,18 +104,29 @@ export class NotificationPolicy {
     this.banners.delete(banner)
   }
   private show(kind: NotificationKind, title: string, target: Target): Banner | undefined {
-    if (this.stopped || !this.config.notify || this.banners.size >= 64) return
-    const banner: Banner = { abort: new AbortController(), target }
-    this.banners.add(banner)
-    let sound = this.config.notifySound
+    if (this.banners.size >= 64) return
+    const message = this.message(kind, title, target)
+    return message ? this.dispatch(message, target) : undefined
+  }
+  private message(kind: NotificationKind, title: string, target: Target): NotificationMessage | undefined {
+    if (this.stopped || !this.config.notify) return
+    const controls = this.config.notifications[kind]
+    let sound = this.config.notifySound && controls.sound
     if (kind === "approved" && sound) {
       sound = this.clock.now() - this.lastApprovalSound >= 2000
       if (sound) this.lastApprovalSound = this.clock.now()
     }
+    if (!controls.banner && !sound) return
+    return { kind, title, body: notificationText(target.title), sessionID: target.sessionID, banner: controls.banner, sound }
+  }
+  private dispatch(message: NotificationMessage, target: Target, reminder = false): Banner | undefined {
+    if (this.stopped || this.banners.size >= 64) return
+    const banner: Banner = { abort: new AbortController(), target, reminder }
+    this.banners.add(banner)
     // Dispatch off the controller's publication stack; failures never propagate.
     void Promise.resolve().then(() => {
       if (banner.abort.signal.aborted || this.stopped) return
-      return this.backend.show({ kind, title, body: notificationText(target.title), sessionID: target.sessionID, sound }, banner.abort.signal)
+      return this.backend.show(message, banner.abort.signal)
     }).then((handle) => {
       banner.handle = handle
       if (banner.abort.signal.aborted || this.stopped) this.withdraw(banner)
@@ -82,12 +142,21 @@ export class NotificationPolicy {
     banner.abort.signal.addEventListener("abort", cancel, { once: true })
     return banner
   }
-  private attention(entry: Pending) {
+  private attention(entry: Pending, kind: "attention" | "unsafe" | "question" = "attention") {
     entry.grace?.(); entry.grace = undefined
-    if (entry.phase === "attention") return
+    if (entry.phase === "attention" && entry.message?.kind === kind) return
+    this.stopReminder(entry)
     this.withdraw(entry.banner)
     entry.phase = "attention"
-    entry.banner = this.show("attention", uiText.notifications.attention, entry.target)
+    entry.message = this.message(kind, uiText.notifications[kind], entry.target)
+    entry.banner = entry.message ? this.dispatch(entry.message, entry.target) : undefined
+    this.remind(entry)
+  }
+  private wait(entry: Pending, phase: "waiting" | "automatic" = "waiting") {
+    entry.grace?.(); entry.grace = undefined
+    this.stopReminder(entry)
+    this.withdraw(entry.banner)
+    entry.banner = undefined; entry.message = undefined; entry.phase = phase
   }
   snapshot(views: readonly View[]) {
     if (this.stopped) return
@@ -103,19 +172,18 @@ export class NotificationPolicy {
     if (!entry) return
     const state = view.autoApproval?.status
     if (state === "countdown" || state === "checking" || state === "allowing") {
-      entry.grace?.(); entry.grace = undefined
-      if (entry.phase !== "automatic") {
-        this.withdraw(entry.banner)
-        entry.phase = "automatic"
-        entry.banner = undefined
-      }
+      this.wait(entry, "automatic")
       return
     }
+    // A canceled automation tombstone can coexist with a fresh analysis after
+    // re-enable. It must not send generic attention ahead of that report.
+    if (view.status === "identifying" || view.status === "analyzing") { this.wait(entry); return }
     if (state === "failed") {
-      if (entry.phase !== "attention") { this.withdraw(entry.banner); entry.banner = undefined }
-      if (view.approvalPendingConfirmed) this.attention(entry)
+      if (view.approvalPendingConfirmed) this.attention(entry, view.status === "complete" && view.assessment?.safe === false ? "unsafe" : "attention")
+      else this.wait(entry)
       return
     }
+    if (view.status === "complete" && view.assessment?.safe === false) { this.attention(entry, "unsafe"); return }
     if (state === "cancelled" || ["unrelated", "unidentified", "unavailable", "suspended"].includes(view.status)) {
       this.attention(entry); return
     }
@@ -138,6 +206,7 @@ export class NotificationPolicy {
     const entries = kind === "permission" ? this.permissions : this.questions
     const entry = entries.get(id)
     entry?.grace?.()
+    if (entry) this.stopReminder(entry)
     this.withdraw(entry?.banner)
     entries.delete(id)
     this.remember(`${kind}:${id}`)
@@ -152,9 +221,9 @@ export class NotificationPolicy {
   }
   dispose() {
     this.stopped = true
-    for (const entry of this.permissions.values()) entry.grace?.()
+    for (const entry of [...this.permissions.values(), ...this.questions.values()]) { entry.grace?.(); this.stopReminder(entry) }
     for (const banner of this.banners) this.withdraw(banner)
-    this.permissions.clear(); this.questions.clear(); this.views.clear(); this.seen.clear()
+    this.permissions.clear(); this.questions.clear(); this.views.clear(); this.seen.clear(); this.blockers.clear()
     return withDeadline(new AbortController().signal, 5000, async () => { await this.backend.dispose() }).catch(() => {})
   }
 }

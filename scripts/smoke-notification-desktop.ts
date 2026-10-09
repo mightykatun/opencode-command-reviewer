@@ -52,6 +52,8 @@ if (process.argv.includes("--all")) {
   }, processes)
   const cases = [
     { kind: "attention", title: "Session needs attention" },
+    { kind: "unsafe", title: "Unsafe permission needs human approval" },
+    { kind: "question", title: "Agent has a question" },
     { kind: "approved", title: "Reviewer approved a permission" },
     { kind: "error", title: "Session error" },
     { kind: "ended", title: "Session ended" },
@@ -62,7 +64,7 @@ if (process.argv.includes("--all")) {
     for (const item of cases) {
       console.log(`SHOW ${item.title}; SOUND ${item.kind}`)
       const before = playbacks.length
-      const handle = await backend.show({ ...item, body: "Reviewer desktop sound test", sessionID: "desktop-fixture", sound: true }, new AbortController().signal)
+      const handle = await backend.show({ ...item, body: "Reviewer desktop sound test", sessionID: "desktop-fixture", banner: true, sound: true }, new AbortController().signal)
       const end = Date.now() + 15000
       while (playbacks.length === before && Date.now() < end) await sleep(50)
       assert.equal(playbacks.length, before + 1, `${item.title} must reach its sound player`)
@@ -73,18 +75,18 @@ if (process.argv.includes("--all")) {
     }
     await Promise.all(measurements)
     assert.equal(measurements.length, cases.length)
-    console.log("PASS: all four notification messages and their normalized sounds were delivered; every sound player exited successfully.")
+    console.log("PASS: all six notification messages and their normalized sounds were delivered; every sound player exited successfully.")
   } finally { await backend.dispose() }
 } else if (process.argv.includes("--sounds")) {
   const audio = new NotificationAudio(processes, new URL("../sounds/", import.meta.url).pathname)
   try {
-    for (const kind of ["attention", "approved", "error", "ended"] as const) {
+    for (const kind of ["attention", "unsafe", "question", "approved", "error", "ended"] as const) {
       console.log(`PLAY ${kind}`)
       await audio.play(kind, new AbortController().signal)
       await sleep(300)
     }
     await Promise.all(measurements)
-    assert.equal(measurements.length, 4, "all four sounds must reach actual desktop playback")
+    assert.equal(measurements.length, 6, "all six sounds must reach actual desktop playback")
   } finally { await audio.dispose(); owned.dispose() }
 } else if (process.argv.includes("--click")) {
   assert.ok(gnomeTerminalIdentity(), "run directly inside GNOME Terminal, outside tmux/SSH")
@@ -98,7 +100,7 @@ if (process.argv.includes("--all")) {
     await sleep(10000)
     for (let attempt = 0; attempt < (process.argv.includes("--critical") ? 1 : 3) && !clicked; attempt++) {
       const handle = await backend.show({ kind: "attention", title: "Session needs attention", body: "Reviewer activation test",
-        sessionID: "desktop-fixture", sound: false }, new AbortController().signal)
+        sessionID: "desktop-fixture", banner: true, sound: false }, new AbortController().signal)
       for (let poll = 0; poll < (process.argv.includes("--critical") ? 150 : 60) && !clicked; poll++) await sleep(100)
       handle?.close()
     }

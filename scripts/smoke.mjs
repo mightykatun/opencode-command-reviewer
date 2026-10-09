@@ -17,6 +17,8 @@ const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
 const scenario = process.argv[2] ?? "correction"
 const measureReuse = process.argv.includes("--measure-reuse")
 const notifications = process.argv.includes("--notifications")
+const reminders = process.argv.includes("--reminders")
+if (reminders) assert.ok(notifications && ["auto-shell", "auto-zero", "auto-unsafe", "auto-error", "auto-cancel"].includes(scenario), "reminder fixture requires a supported notification scenario")
 const networkRetry = process.argv.includes("--network-retry")
 if (networkRetry) assert.equal(scenario, "auto-shell", "network recovery uses the auto-shell fixture")
 if (measureReuse) assert.equal(scenario, "external", "reuse baseline uses the two-stage external fixture")
@@ -297,7 +299,7 @@ try {
   await writeFile(tuiFile, JSON.stringify({
     $schema: "https://opencode.ai/tui.json",
     theme: scenario === "correction" ? "tokyonight" : "opencode",
-    plugin: [[pluginFile, { notify: notifications, baseURL: `http://127.0.0.1:${reviewPort}/review`, model: "review-fixture", apiKey: "fixture-review-key",
+    plugin: [[pluginFile, { notify: notifications, staleReminderSeconds: reminders ? 1 : 60, baseURL: `http://127.0.0.1:${reviewPort}/review`, model: "review-fixture", apiKey: "fixture-review-key",
       ...plan.settings,
       ...(scenario === "edit" || configFailure ? { instructions: customPrompts } : {}),
       ...(scenario === "patch" ? { maxFiles: 2 } : {}),
@@ -1013,6 +1015,14 @@ try {
   assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)
   if (measureReuse) assertReviewerReuse(metrics.snapshot())
   if (notificationRecords) {
+    if (reminders) {
+      const before = (await notificationRecords()).filter(record => record.event === "notification" && record.title.endsWith(" (Reminder)")).length
+      await sleep(1500)
+      const after = (await notificationRecords()).filter(record => record.event === "notification" && record.title.endsWith(" (Reminder)")).length
+      assert.equal(after, before, "native permission resolution must stop reminders")
+      if (["auto-unsafe", "auto-error", "auto-cancel"].includes(scenario)) assert.ok(before >= 2, "unresolved manual wait must repeat")
+      else assert.equal(before, 0, "automatic approval must suppress reminders even across multiple intervals")
+    }
     if (["auto-shell", "auto-edit", "auto-external", "auto-scroll"].includes(scenario)) {
       await until(async () => (await notificationRecords()).some(record => record.event === "sound" && record.kind === "ended"), 10000)
     } else await sleep(500)
@@ -1030,7 +1040,12 @@ try {
       assert.ok(banners.some(record => record.title === "Session ended"))
     } else if (scenario === "auto-zero") {
       assert.equal(countdowns.length, 0); assert.equal(approvals.length, 1); assert.equal(attention.length, 0)
-    } else if (["auto-unsafe", "auto-error", "error", "bash-disabled", "edit-disabled", "external-disabled", "correction"].includes(scenario)) {
+    } else if (scenario === "auto-unsafe") {
+      assert.equal(attention.length, 0); assert.equal(approvals.length, 0)
+      assert.equal(banners.filter(record => record.title === "Unsafe permission needs human approval").length, 1)
+      assert.ok(records.some(record => record.event === "sound" && record.kind === "unsafe"))
+      assert.ok(!records.some(record => record.event === "sound" && record.kind === "attention"))
+    } else if (["auto-error", "error", "bash-disabled", "edit-disabled", "external-disabled", "correction"].includes(scenario)) {
       assert.ok(attention.length >= 1); assert.equal(countdowns.length, 0); assert.equal(approvals.length, 0)
     } else if (["auto-cancel", "auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow"].includes(scenario)) {
       assert.equal(attention.length, 1); assert.equal(approvals.length, 0)

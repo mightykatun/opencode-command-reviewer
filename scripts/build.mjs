@@ -9,7 +9,7 @@ const prompts = Object.fromEntries(await Promise.all(
   ]),
 ))
 const sounds = Object.fromEntries(await Promise.all(
-  ["attention", "approved", "error", "ended"].map(async name => [name, {
+  ["attention", "unsafe", "question", "approved", "error", "ended"].map(async name => [name, {
     format: "mp3", data: (await readFile(new URL(`../sounds/${name}.mp3`, import.meta.url))).toString("base64"),
   }]),
 ))

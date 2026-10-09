@@ -11,7 +11,7 @@ import { OwnedNotificationProcesses, type NotificationProcesses, type ProcessRes
 import { fixtureWav } from "./notification-fixtures.js"
 
 const identity = { service: ":1.123", screen: "00000000-0000-0000-0000-000000000001" }
-const message = { kind: "attention" as const, title: "Session needs attention", body: "<root>&\u001b", sessionID: "root", sound: false }
+const message = { kind: "attention" as const, title: "Session needs attention", body: "<root>&\u001b", sessionID: "root", banner: true, sound: false }
 function fakeProcesses() {
   const calls: { command: string; args: readonly string[]; line?: (line: string) => void; finish(result: ProcessResult): void; signal: AbortSignal }[] = []
   let playerCode = 0
@@ -194,4 +194,51 @@ test("owned processes preserve argv, consume spawn failure, cap output and force
     line => { if (line === "ready") abort.abort() })!
   assert.equal((await stalled.result).code, null)
   processes.dispose(); assert.equal(processes.start(process.execPath, [], 1000, signal), undefined)
+})
+
+test("sound-only uses normalized audio without notify-send, icons, activation or desktop acknowledgements", async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "reviewer-sound-only-"))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  await writeFile(path.join(directory, "question.wav"), fixtureWav())
+  const f = fakeProcesses(), clicks: string[] = []
+  const backend = new LinuxNotifications({ notify: true, notifySound: true, notificationSoundDirectory: directory },
+    id => clicks.push(id), f.processes, identity)
+  t.after(() => backend.dispose())
+  const handle = await backend.show({ ...message, kind: "question", banner: false, sound: true }, new AbortController().signal)
+  await handle?.closed
+  assert.deepEqual(f.calls.map(c => c.command), ["paplay"])
+  assert.equal(path.basename(f.calls[0]!.args.at(-1)!), "question.wav")
+  assert.deepEqual(clicks, [])
+  const silent = await backend.show({ ...message, banner: false, sound: false }, new AbortController().signal)
+  assert.equal(silent, undefined); assert.equal(f.calls.length, 1)
+})
+
+test("sound-only preparation and active playback remain owned by resolution and disposal", async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "reviewer-sound-only-abort-"))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  await writeFile(path.join(directory, "unsafe.wav"), fixtureWav(1000, 160000))
+  const signals: AbortSignal[] = []
+  const processes: NotificationProcesses = {
+    start(command, _args, _ms, signal) {
+      assert.equal(command, "paplay"); signals.push(signal)
+      const result = new Promise<ProcessResult>(resolve => signal.addEventListener("abort", () => resolve({ code: null, stdout: "" }), { once: true }))
+      return { result, cancel() {} }
+    }, dispose() {},
+  }
+  const backend = new LinuxNotifications({ notify: true, notifySound: true, notificationSoundDirectory: directory }, () => {}, processes, null)
+  t.after(() => backend.dispose())
+  const cancelled = new AbortController()
+  const first = await backend.show({ ...message, kind: "unsafe", banner: false, sound: true }, cancelled.signal)
+  cancelled.abort(); await first?.closed
+  assert.equal(signals.length, 0)
+  const second = await backend.show({ ...message, kind: "unsafe", banner: false, sound: true }, new AbortController().signal)
+  const firstDeadline = performance.now() + 2000
+  while (!signals.length && performance.now() < firstDeadline) await settle()
+  assert.equal(signals.length, 1, "normalized playback must start within its preparation budget")
+  second?.close(); await second?.closed; assert.equal(signals[0]!.aborted, true)
+  const third = await backend.show({ ...message, kind: "unsafe", banner: false, sound: true }, new AbortController().signal)
+  const secondDeadline = performance.now() + 2000
+  while (signals.length < 2 && performance.now() < secondDeadline) await settle()
+  assert.equal(signals.length, 2, "cached playback must start")
+  await backend.dispose(); await third?.closed; assert.equal(signals[1]!.aborted, true)
 })

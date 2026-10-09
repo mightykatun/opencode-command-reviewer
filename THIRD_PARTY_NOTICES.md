@@ -29,7 +29,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 # Bundled audio decoder and supplied sounds
 
-The four notification MP3 files were supplied by the maintainer with explicit
+The six notification MP3 files were supplied by the maintainer with
 permission to redistribute them with this plugin. Their original bytes are
 embedded in the bundle. Normalization occurs during playback preparation.
 

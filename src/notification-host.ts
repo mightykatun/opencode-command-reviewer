@@ -4,6 +4,8 @@ import type { Message, PermissionRequest, QuestionRequest } from "@opencode-ai/s
 import type { ApprovalFact, View } from "./controller.js"
 import type { NotificationPolicy } from "./notification-policy.js"
 import { notificationClock, type NotificationClock } from "./notification-types.js"
+import { notificationBlockers, type PendingInteraction } from "./notification-order.js"
+import { withDeadline } from "./deadline.js"
 
 type Target = { root: string; sessionID: string; title: string }
 interface Request {
@@ -41,8 +43,15 @@ export class NotificationHost {
   private recentMessages = new Map<string, { message: Message; received: number }>()
   private created = new Map<string, number>()
   private deletedSessions = new Set<string>()
+  private questionSnapshot: readonly Pick<QuestionRequest, "id" | "sessionID">[] = []
+  private questionsReady = false
+  private questionRevision = 0
+  private questionRead = false
+  private questionPoll?: () => void
+  private abort = new AbortController()
   constructor(private api: HostApi, private policy: NotificationPolicy,
     private resolveRoot: (id: string, signal: AbortSignal) => Promise<string>,
+    private readQuestions: (signal: AbortSignal) => Promise<readonly QuestionRequest[]>,
     private clock: NotificationClock = notificationClock) {
     const on = api.event.on
     this.subscriptions.push(
@@ -74,8 +83,56 @@ export class NotificationHost {
         this.created.set(e.properties.info.id, ++this.sequence)
         for (const [id, request] of this.permissions) this.admit("permission", id, request)
         for (const [id, request] of this.questions) this.admit("question", id, request)
+        this.selectBlockers()
       }),
     )
+    this.pollQuestions()
+  }
+  private pollQuestions() {
+    if (this.stopped) return
+    void this.refreshQuestions()
+    this.questionPoll = this.clock.after(2000, () => this.pollQuestions())
+  }
+  private async refreshQuestions() {
+    if (this.stopped || this.questionRead) return
+    this.questionRead = true
+    const revision = this.questionRevision
+    let worker: Promise<readonly QuestionRequest[]> | undefined
+    try {
+      const requests = await withDeadline(AbortSignal.any([this.abort.signal, this.api.lifecycle.signal]), 5000, signal => {
+        worker = Promise.resolve().then(() => { signal.throwIfAborted(); return this.readQuestions(signal) })
+        // Retain actual read ownership after a bounded timeout, including late
+        // settlement. Never issue overlapping replacement reads.
+        void worker.then(() => { this.questionRead = false }, () => { this.questionRead = false })
+        return worker
+      })
+      if (this.stopped || revision !== this.questionRevision) return
+      if (!Array.isArray(requests) || requests.length > 1024
+        || requests.some(r => !r || typeof r.id !== "string" || typeof r.sessionID !== "string")) throw new Error("Invalid pending questions")
+      this.questionSnapshot = requests.map(({ id, sessionID }) => ({ id, sessionID }))
+      this.questionsReady = true
+      const ids = new Set(requests.map(r => r.id))
+      for (const id of this.questions.keys()) if (!ids.has(id)) this.resolved("question", id)
+      this.selectBlockers()
+    } catch {
+      if (!this.stopped) { this.questionsReady = false; this.selectBlockers() }
+    } finally { if (!worker) this.questionRead = false }
+  }
+  private selectBlockers() {
+    if (this.stopped) return
+    const pending = new Map<string, PendingInteraction>()
+    const add = (kind: "permission" | "question", id: string, sessionID: string) => {
+      if (!this.closed.has(`${kind}:${id}`) && !this.deletedSessions.has(sessionID)) pending.set(`${kind}:${id}`, { kind, id, sessionID })
+    }
+    for (const view of this.views) add("permission", view.request.id, view.request.sessionID)
+    for (const [id, request] of this.permissions) add("permission", id, request.sessionID)
+    // Public list snapshots establish ordering and reconciliation, never births.
+    // Without a healthy baseline an unseen question could be ahead of a fresh one.
+    if (this.questionsReady) {
+      for (const request of this.questionSnapshot) add("question", request.id, request.sessionID)
+      for (const [id, request] of this.questions) add("question", id, request.sessionID)
+    }
+    this.policy.pending(notificationBlockers(new Set(this.roots.keys()), pending.values(), id => this.api.state.session.get(id)))
   }
   private rootOf(id: string): string | undefined {
     const seen = new Set<string>()
@@ -122,6 +179,7 @@ export class NotificationHost {
     }
     for (const [key, request] of this.permissions) this.admit("permission", key, request)
     for (const [key, request] of this.questions) this.admit("question", key, request)
+    this.selectBlockers()
   }
   private asked(kind: "permission" | "question", value: PermissionRequest | QuestionRequest) {
     if (this.stopped || this.closed.has(`${kind}:${value.id}`)) return
@@ -129,6 +187,8 @@ export class NotificationHost {
     if (entries.has(value.id) || entries.size >= 1024) return
     const request: Request = { sessionID: value.sessionID, received: ++this.sequence }
     entries.set(value.id, request)
+    if (kind === "question") this.questionRevision++
+    this.selectBlockers()
     this.admit(kind, value.id, request)
     // State may already contain a new event's value, but only its event birth
     // authorizes a notification. Startup snapshot-only requests never enter here.
@@ -172,6 +232,7 @@ export class NotificationHost {
     for (const [id, request] of this.permissions) this.admit("permission", id, request)
     const pending = new Set(views.map(v => v.request.id))
     for (const [id] of this.permissions) if (!pending.has(id)) this.resolved("permission", id)
+    this.selectBlockers()
   }
   fact(fact: ApprovalFact) {
     if (this.stopped) return
@@ -188,11 +249,16 @@ export class NotificationHost {
     } else this.dispatched.delete(fact.request.id)
   }
   private resolved(kind: "permission" | "question", id: string) {
+    if (kind === "question") {
+      this.questionRevision++
+      this.questionSnapshot = this.questionSnapshot.filter(request => request.id !== id)
+    }
     ;(kind === "permission" ? this.permissions : this.questions).delete(id)
     const key = `${kind}:${id}`
     if (this.closed.size >= 4096) this.closed.delete(this.closed.values().next().value!)
     this.closed.add(key)
     this.policy.resolved(kind, id)
+    this.selectBlockers()
   }
   private message(message: Message) {
     if (this.stopped) return
@@ -244,6 +310,7 @@ export class NotificationHost {
     this.api.route.navigate("session", { sessionID })
   }
   private deleted(id: string) {
+    this.questionRevision++
     if (this.deletedSessions.size >= 4096) this.deletedSessions.delete(this.deletedSessions.values().next().value!)
     this.deletedSessions.add(id)
     this.roots.get(id)?.idle?.(); this.roots.delete(id)
@@ -252,13 +319,16 @@ export class NotificationHost {
     for (const [key, request] of this.questions) if (request.sessionID === id || request.target?.root === id) this.resolved("question", key)
     for (const [key, dispatch] of this.dispatched) if (dispatch.target.root === id || dispatch.target.sessionID === id) this.dispatched.delete(key)
     this.policy.deleted(id)
+    this.selectBlockers()
   }
   dispose() {
     this.stopped = true
+    this.abort.abort(); this.questionPoll?.()
     for (const stop of this.subscriptions) stop()
     for (const root of this.roots.values()) root.idle?.()
     this.roots.clear(); this.permissions.clear(); this.questions.clear(); this.dispatched.clear(); this.closed.clear(); this.recentMessages.clear(); this.created.clear()
     this.deletedSessions.clear()
+    this.questionSnapshot = []
     return this.policy.dispose()
   }
 }

@@ -35,6 +35,15 @@ OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-revie
         "autoApproveDelaySeconds": 15,
         "notify": true,
         "notifySound": true,
+        "staleReminderSeconds": 60,
+        "notifications": {
+          "attention": { "banner": true, "sound": true },
+          "unsafe": { "banner": true, "sound": true },
+          "question": { "banner": true, "sound": true },
+          "approved": { "banner": true, "sound": true },
+          "error": { "banner": true, "sound": true },
+          "ended": { "banner": true, "sound": true }
+        },
         "notificationSoundDirectory": "/absolute/path/to/notification-sounds",
         "formatRetries": 1,
         "maxOutputTokens": 2048,
@@ -75,7 +84,9 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 | `autoApproveDelaySeconds` | Countdown duration, 0–3600 seconds. |
 | `notify` | Linux desktop notifications and sounds. Defaults to `true`; set `false` to disable both. |
 | `notifySound` | Play notification sounds. Defaults to `true`; set `false` to keep banners silent. |
-| `notificationSoundDirectory` | Absolute custom sound directory. Use `attention`, `approved`, `error`, and `ended` basenames with `.wav` or `.mp3`; WAV takes precedence. Missing or unusable files fall back to bundled sounds. |
+| `staleReminderSeconds` | Repeat pending human-interaction notifications every 60 seconds by default. Nonnegative safe integer seconds; `0` disables reminders. Only the front-of-queue blocker per conversation repeats. |
+| `notifications` | Per-type `banner` and `sound` booleans for `attention`, `unsafe`, `question`, `approved`, `error`, and `ended`. Omitted types and fields default to `true`. |
+| `notificationSoundDirectory` | Absolute custom sound directory. Use any of the six notification type names as basenames with `.wav` or `.mp3`; WAV takes precedence. Missing or unusable files fall back to that type's bundled sound. |
 | `formatRetries` | Additional attempts to correct malformed assessment JSON, 0–100. |
 | `maxOutputTokens` | Provider output-token limit, sent as `max_tokens`. Defaults to 2,048; accepts positive safe integers within your provider/model's supported range. Retries keep the same limit. |
 | `timeoutMs` | Total review deadline, 1–3,600,000 ms. |
@@ -181,15 +192,19 @@ in the report; ratings are advice based on the supplied evidence.
 ### Desktop notifications
 
 Transient banners have an **Opencode (Session name)** heading and a small status icon: green
-checkmark for approvals, orange exclamation mark for attention, red X
+checkmark for approvals, orange exclamation mark for attention, red exclamation mark
+for Unsafe reviews, purple question mark for questions, red X
 for errors, and a neutral code mark for completed responses. GNOME controls the
 heading's font weight. The event message appears beneath it, even while the
 terminal is focused:
 
-- **Session needs attention:** questions and manual permissions. Reviewed requests
-  wait for a final validated assessment; failures, canceled automation, and a Safe
+- **Session needs attention:** manual permissions. Reviewed requests
+  stay silent during identification and report generation; failures, canceled automation, and a Safe
   review blocked from starting its countdown also notify. Unreviewed requests
   notify immediately, including when conversation review is disabled.
+- **Unsafe permission needs human approval:** a completed, validated Unsafe review,
+  with its own sound. Provisional streamed ratings never notify.
+- **Agent has a question:** a pending agent question, with its own sound.
 - **Reviewer approved a permission:** sent with the approval sound after confirmed
   automatic approval, for both positive and zero delays. The countdown is silent.
   Approval sounds are limited to
@@ -198,8 +213,34 @@ terminal is focused:
 - **Session ended:** a completed root-agent response, not a question/permission
   pause or an explicit user interruption.
 
+Each type's `banner` and `sound` can be controlled independently. For example,
+`notifications.approved.banner: false` keeps approval sounds without banners;
+`notifications.question.sound: false` keeps question banners silent. Set both to
+`false` to disable that type. `notify: false` overrides all types and disables
+reminders too; `notifySound: false` silences all types and their reminders.
+Sound-only delivery does not require a desktop banner or delivery acknowledgement.
+Invalid notification settings disable notification work without disabling reviews.
+
+Pending permissions and questions repeat after `staleReminderSeconds`, measured
+from initial dispatch, even if desktop delivery fails. Reminders replace their
+previous banner and append **(Reminder)** to the event text, reusing the same
+sound, icon, session heading and click target. Only the native front-of-queue
+interaction per root conversation repeats: permissions precede questions, with
+the host's session/request ordering. Queued interactions wait; when the blocker
+changes, its replacement waits a full interval. Independent visited conversations
+can each remind. The supported host presents input for roots and direct children;
+deeper descendants still receive initial notifications but cannot become a native
+root-input reminder target.
+
+Answering/dismissing a question in OpenCode, resolving a permission, deleting its
+session or closing the plugin stops its reminders. Closing/clicking a desktop
+banner, activating the terminal or viewing a conversation does not. Countdown
+and approval submission remain silent. Approval, error and completed-response
+notifications never repeat. Setting `staleReminderSeconds: 0` disables all reminders.
+
 Notifications cover conversations visited in this terminal and their descendants.
-Existing pending requests at startup/resume are not replayed. Clicking can select
+Existing pending requests at startup/resume are not replayed or reminded, but still
+participate in queue ordering. Clicking can select
 the originating GNOME Terminal tab and root conversation. Native input prompts
 cover root/direct-child requests in the supported host. Open dialogs are
 left intact; other terminals still receive banners and sounds. Desktop policies
@@ -210,7 +251,7 @@ the banner heading remains Opencode.
 
 Linux delivery uses `notify-send`, `stdbuf`, and `gdbus`; audio uses `paplay` or `pw-play`.
 On Ubuntu, `libnotify-bin`, `coreutils`, `libglib2.0-bin`, and `pulseaudio-utils` provide these
-utilities. The MP3 decoder and four default sounds are bundled; FFmpeg is not
+utilities. The MP3 decoder and six default sounds are bundled; FFmpeg is not
 required. MP3 and mono/stereo PCM/float WAV files up to 4 MiB and 10 seconds are
 normalized toward -20 dBFS RMS with a -3 dBFS peak ceiling before playback.
 Custom sounds are loaded on first use; restart after replacing them.

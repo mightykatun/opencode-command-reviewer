@@ -3,7 +3,7 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 
 /** Record fixed desktop/audio process effects while exercising the actual bundle. */
-export async function notificationRecorder(plugin, directory) {
+export async function notificationRecorder(plugin, directory, { dismissAfterMs } = {}) {
   const base = path.join(directory, "notification-reviewer-base.mjs")
   const records = path.join(directory, "notifications.jsonl")
   await copyFile(plugin, base)
@@ -13,6 +13,7 @@ import plugin, { withNotificationProcesses } from ${JSON.stringify(pathToFileURL
 import { appendFile, readFile } from "node:fs/promises"
 let writes = Promise.resolve(), sequence = 1
 const children = new Map()
+const dismissals = new Set()
 const record = data => { writes = writes.then(() => appendFile(${JSON.stringify(records)}, JSON.stringify({ at: Date.now(), ...data }) + "\\n")); writes.catch(() => {}) }
 const tui = withNotificationProcesses(() => ({
   start(command, args, ms, signal, line) {
@@ -29,6 +30,16 @@ const tui = withNotificationProcesses(() => ({
       const title = args.at(-1), body = summary.slice("Opencode (".length, -1)
       record({ event: "notification", id, summary: args.at(-2), title, body, args })
       queueMicrotask(() => line?.(id))
+      const dismissAfterMs = ${JSON.stringify(dismissAfterMs) ?? "undefined"}
+      if (dismissAfterMs !== undefined) {
+        const timer = setTimeout(() => {
+          dismissals.delete(timer)
+          if (!signal.aborted && children.has(id)) {
+            record({ event: "dismiss", id }); children.delete(id); finish({ code: 0, stdout: "" })
+          }
+        }, dismissAfterMs)
+        dismissals.add(timer)
+      }
     } else if (command === "gdbus") {
       const id = args.at(-1)
       record({ event: "withdraw", id })
@@ -48,7 +59,11 @@ const tui = withNotificationProcesses(() => ({
     } else finish({ code: 1, stdout: "" })
     return { result, cancel: () => finish({ code: null, stdout: "" }) }
   },
-  dispose() { for (const finish of children.values()) finish({ code: null, stdout: "" }); children.clear() },
+  dispose() {
+    for (const timer of dismissals) clearTimeout(timer)
+    dismissals.clear()
+    for (const finish of children.values()) finish({ code: null, stdout: "" }); children.clear()
+  },
 }))
 export default { id: plugin.id, tui: async (api, options) => {
   for (const type of ["permission.asked", "permission.replied", "question.asked", "question.replied", "question.rejected", "session.idle", "session.error"])

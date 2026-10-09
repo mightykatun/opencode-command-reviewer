@@ -32,11 +32,11 @@ test("silence stays silent; sparse transients respect the peak ceiling", async (
   assert.ok(stats(pcm).peak <= SOUND_PEAK + 1 / 32768)
 })
 
-test("the actual four bundled MP3 assets decode, normalize and yield while the event loop stays responsive", async () => {
+test("all six bundled MP3 assets decode, normalize and yield while the event loop stays responsive", async () => {
   let turns = 0
   const tick = setInterval(() => { turns++ }, 1)
   try {
-    for (const kind of ["attention", "approved", "error", "ended"]) {
+    for (const kind of ["attention", "unsafe", "question", "approved", "error", "ended"]) {
       const bytes = await readFile(new URL(`../sounds/${kind}.mp3`, import.meta.url))
       const pcm = await normalizedSound(bytes, "mp3", new AbortController().signal)
       const measured = stats(pcm)

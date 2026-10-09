@@ -10,6 +10,14 @@ import { smokeRuntime } from "./smoke-runtime.mjs"
 import { notificationRecorder, assertNotificationAudio } from "./smoke-notification-recorder.mjs"
 
 const scenario = process.argv[2] ?? "question"
+const reminders = process.argv.includes("--reminders"), queue = process.argv.includes("--queue")
+const bannerOnly = process.argv.includes("--banner-only"), soundOnly = process.argv.includes("--sound-only")
+const dismiss = process.argv.includes("--dismiss")
+assert.ok(!(bannerOnly && soundOnly))
+if (reminders || queue || bannerOnly || soundOnly || dismiss) assert.equal(scenario, "question")
+if (queue) assert.ok(reminders, "queue verification requires --reminders")
+const interval = 3
+const label = [scenario, ...process.argv.slice(3).map(flag => flag.replace(/^--/, ""))].join("-")
 assert.ok(["question", "error", "ended", "cancel", "click"].includes(scenario))
 const root = path.resolve(import.meta.dirname, "..")
 const temp = await mkdtemp(path.join(tmpdir(), "reviewer-notification-events-"))
@@ -18,7 +26,7 @@ await mkdir(project); await mkdir(path.join(temp, "config"))
 execFileSync("git", ["init", "--quiet", project])
 const plugin = path.join(temp, "reviewer.mjs")
 await copyFile(path.join(root, "dist/tui.js"), plugin)
-const records = await notificationRecorder(plugin, temp)
+const records = await notificationRecorder(plugin, temp, { dismissAfterMs: dismiss ? 200 : undefined })
 if (scenario === "click") await writeFile(plugin, `
 import plugin, { withNotifications } from ${JSON.stringify(pathToFileURL(path.join(temp, "notification-reviewer-base.mjs")).href)}
 import { appendFile } from "node:fs/promises"
@@ -65,10 +73,10 @@ const server = createServer(async (req, res) => {
   }
   const question = main && scenario === "question" && !sent
   if (question) sent = true
-  const delta = question ? { role: "assistant", tool_calls: [{ index: 0, id: "fixture_question", type: "function", function: {
+  const delta = question ? { role: "assistant", tool_calls: Array.from({ length: queue ? 2 : 1 }, (_, index) => ({ index, id: `fixture_question_${index}`, type: "function", function: {
     name: "question", arguments: JSON.stringify({ questions: [{ header: "Fixture choice", question: "Choose a fixture option",
       options: [{ label: "First", description: "Fixture first option" }, { label: "Second", description: "Fixture second option" }] }] }),
-  } }] } : { role: "assistant", content: main ? "Synthetic response complete." : "Notification fixture title" }
+  } })) } : { role: "assistant", content: main ? "Synthetic response complete." : "Notification fixture title" }
   if (main && scenario === "cancel") {
     held = true
     res.writeHead(200, { "Content-Type": "text/event-stream" })
@@ -105,7 +113,8 @@ try {
       models: { fixture: { name: "Fixture", limit: { context: 32000, output: 1000 } } } } } }
   const tui = path.join(temp, "tui.json")
   await writeFile(tui, JSON.stringify({ plugin: [[plugin, { baseURL: `http://127.0.0.1:${port}/review`, model: "fixture",
-    notify: true, reviewBash: false, reviewEdits: false }]] }))
+    notify: true, reviewBash: false, reviewEdits: false, staleReminderSeconds: reminders ? interval : 60,
+    notifications: { question: { banner: !soundOnly, sound: !bannerOnly } } }]] }))
   const env = { HOME: temp, XDG_CONFIG_HOME: path.join(temp, "config"), XDG_DATA_HOME: path.join(temp, "data"),
     XDG_STATE_HOME: path.join(temp, "state"), XDG_CACHE_HOME: path.join(temp, "cache"), OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
     OPENCODE_CONFIG: "", OPENCODE_TUI_CONFIG: tui, OPENCODE_CONFIG_DIR: path.join(temp, "config"),
@@ -115,11 +124,40 @@ try {
     "env", ...Object.entries(env).map(([k, v]) => `${k}=${v}`), process.env.OPENCODE_BIN ?? "opencode", project,
     "--prompt", "Perform the notification fixture.")
   if (scenario === "question") {
-    await until(async s => s.includes("Choose a fixture option") && (await records()).some(r => r.event === "sound" && r.kind === "attention"))
-    assert.equal((await records()).filter(r => r.event === "notification").length, 1)
+    const deliveries = async () => (await records()).filter(r => soundOnly ? r.event === "sound" && r.kind === "question"
+      : r.event === "notification" && r.title.startsWith("Agent has a question"))
+    const count = queue ? 2 : 1
+    await until(async s => s.includes("Choose a fixture option") && (await deliveries()).length >= count)
+    assert.equal((await deliveries()).length, count)
+    if (reminders) {
+      await until(async () => (await deliveries()).length >= count + 2, 12000)
+      const seen = await deliveries()
+      assert.equal(seen.length, count + 2, "only one blocker repeats even with queued questions")
+      // Initial delivery includes asynchronous decode/icon preparation. The
+      // question birth precedes policy dispatch; its timestamp is the public
+      // lower bound, not the later notify-send acknowledgement or queued banner.
+      const born = (await records()).find(r => r.event === "question.asked")
+      assert.ok(born)
+      assert.ok(seen[count].at - born.at >= interval * 1000 - 250)
+      assert.ok(seen[count + 1].at - seen[count].at >= interval * 1000 - 250)
+      if (!soundOnly) assert.ok(seen.slice(count).every(r => r.title === "Agent has a question (Reminder)"))
+      if (dismiss) assert.ok((await records()).some(r => r.event === "dismiss"), "desktop dismissal must not stop reminders")
+    }
+    const before = (await deliveries()).length
     runtime.tmux("send-keys", "-t", "smoke", "Enter")
     await until(async () => (await records()).some(r => r.event === "question.replied"), 10000)
+    if (queue) {
+      const reply = (await records()).find(r => r.event === "question.replied")
+      await until(async () => (await deliveries()).length > before, 8000)
+      assert.ok((await deliveries()).at(-1).at - reply.at >= interval * 1000 - 250, "next blocker waits a full interval after handoff")
+      runtime.tmux("send-keys", "-t", "smoke", "Enter")
+      await until(async () => (await records()).filter(r => r.event === "question.replied").length === 2, 10000)
+    }
     await until(async () => (await records()).some(r => r.event === "sound" && r.kind === "ended"), 10000)
+    const resolvedCount = (await deliveries()).length
+    if (reminders) { await sleep((interval + 0.5) * 1000); assert.equal((await deliveries()).length, resolvedCount, "native resolution stops reminders") }
+    if (bannerOnly) assert.equal((await records()).filter(r => r.event === "sound" && r.kind === "question").length, 0)
+    if (soundOnly) assert.equal((await records()).filter(r => r.event === "notification" && r.title.startsWith("Agent has a question")).length, 0)
   } else if (scenario === "cancel") {
     await until(s => held && s.includes("Fixture waiting for cancellation."))
     runtime.tmux("send-keys", "-t", "smoke", "Escape"); await sleep(150)
@@ -139,14 +177,20 @@ try {
   } else await until(async () => (await records()).some(r => r.event === "sound" && r.kind === scenario))
   const observed = await records()
   const titles = observed.filter(r => r.event === "notification").map(r => r.title)
-  assert.deepEqual(titles, scenario === "question" ? ["Session needs attention", "Session ended"]
+  assert.deepEqual(titles.filter(title => !title.endsWith(" (Reminder)")), scenario === "question" ? [...(soundOnly ? [] : Array(queue ? 2 : 1).fill("Agent has a question")), "Session ended"]
     : scenario === "error" ? ["Session error"] : ["ended", "click"].includes(scenario) ? ["Session ended"] : [])
   assertNotificationAudio(assert, observed)
   if (scenario === "cancel") assert.equal(observed.filter(r => r.event === "sound").length, 0)
   assert.ok(principal >= 1)
   await mkdir(path.join(root, ".runtime"), { recursive: true })
-  await writeFile(path.join(root, `.runtime/notification-${scenario}.json`), JSON.stringify(observed, null, 2))
-  console.log(`PASS notification ${scenario}: real host events, exact ${JSON.stringify(titles)}, ${scenario === "cancel" ? "silent interruption" : scenario === "click" ? "native dialog preserved and correct root selected" : "bundled normalized audio"}; ${temp}`)
+  await writeFile(path.join(root, `.runtime/notification-${label}.json`), JSON.stringify(observed, null, 2))
+  console.log(`PASS notification ${label}: real host events, exact ${JSON.stringify(titles)}, ${scenario === "cancel" ? "silent interruption" : scenario === "click" ? "native dialog preserved and correct root selected" : "bundled normalized audio"}; ${temp}`)
+} catch (error) {
+  await mkdir(path.join(root, ".runtime"), { recursive: true })
+  await writeFile(path.join(root, `.runtime/notification-${label}-failure.json`), JSON.stringify({
+    error: String(error), temp, screen, records: await records(),
+  }, null, 2))
+  throw error
 } finally {
   await runtime.dispose()
   server.closeAllConnections()

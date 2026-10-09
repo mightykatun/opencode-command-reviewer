@@ -331,6 +331,13 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 - `notify` and `notifySound` default true. Desktop settings are independently
   parsed; invalid notification options disable notification work without changing
   review. `notificationSoundDirectory` is an absolute optional path.
+- `notifications` is keyed by `attention`, `unsafe`, `question`, `approved`, `error`
+  and `ended`, each with independent `banner`/`sound` booleans defaulting true.
+  `notify` disables both channels globally; `notifySound` globally disables audio.
+  Sound-only delivery uses owned normalized playback without a desktop banner.
+  `staleReminderSeconds` defaults 60; nonnegative safe integer seconds, zero disables.
+  Chunk large waits below the signed 32-bit timer limit. Never catch up missed ticks
+  with a burst. All fixed event/reminder text remains in `ui-text.ts`.
 - Policy, public host events/scope, process ownership, Linux delivery, terminal
   activation and audio/codec live in separate `src/notification-*.ts` modules.
   Keep TUI/controller wiring narrow and notifications off approval critical paths.
@@ -338,6 +345,22 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   eligibility; startup snapshots/backlogs do not replay. Final validated assessments
   gate attention, and final Safe reviews get one second to start their countdown.
   Manual-wait episodes deduplicate but can renew after canceled automation.
+- Dedicated `unsafe` notifications require a completed validated Unsafe assessment;
+  `question` notifications use a purple question mark (default host accent #9d7cd8).
+  Identifying/analyzing requests stay silent even with a canceled automation tombstone.
+  Reminders retain the original presentation and channels with only ` (Reminder)`
+  appended to event text. Replace the previous banner. Dismissal/click/focus does
+  not resolve an interaction. Cancel timers on resolution, deletion and disposal.
+- One blocker per visited root may remind, independently of the selected route.
+  `notification-order.ts` mirrors pinned native ordering: permissions before questions,
+  then code-unit session/request order across roots and direct children. Baseline,
+  disabled and silent requests still block; deeper descendants have no native root
+  input prompt and only get initial notifications. Handoff waits a full interval.
+  `NotificationHost` polls the public pending-question list every two seconds under
+  a five-second bound, retaining actual read ownership through late settlement.
+  Revision guards reject event-raced snapshots; snapshots never create notification
+  births. Failed reads pause question reminders until healthy ordering is known.
+  Permission ordering/resolution continues to use the controller's reconciled views.
 - Countdowns send no desktop banner or audio; confirmed automatic success uses approval audio
   for positive/zero delays. Approval sounds are limited to one per two seconds.
   Native/manual footer approvals are not automatic successes. Unreviewed requests
@@ -370,6 +393,14 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   `node scripts/smoke-notification-events.mjs question` covers a native question
   and completed root response; `error`, `ended`, and `cancel` cover other outcomes.
   These do not prove desktop focus; test real GNOME clicks separately.
+- `node scripts/smoke-notification-events.mjs question --reminders --queue` verifies
+  two native pending questions, one repeating blocker, full-interval handoff and
+  resolution cleanup. Other combinations use `--sound-only`, or `--banner-only --dismiss`.
+  `node scripts/smoke.mjs auto-unsafe --notifications --reminders` checks dedicated
+  Unsafe reminders and normalized supplied audio; `auto-error` checks generic
+  reminders, `auto-shell`/`auto-zero` check suppression, and `auto-cancel` checks renewal.
+  All delivery effects remain isolated fixture process I/O. No real desktop focus
+  or audible playback is inferred from these fixtures.
   `npx tsx scripts/smoke-notification-desktop.ts --sounds` exercises actual local
   playback. `--click` waits ten seconds before banners for manual cross-workspace
   and terminal-tab acceptance; `--critical` is a diagnostic-only test override.
