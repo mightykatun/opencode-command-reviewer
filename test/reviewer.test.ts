@@ -45,6 +45,7 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   const cfg = parseConfig({ baseURL: "http://localhost:1234/v1/", model: "small" })
   assert.equal(cfg.baseURL, "http://localhost:1234/v1")
   assert.equal(cfg.timeoutMs, 30000)
+  assert.equal(cfg.maxOutputTokens, 2048)
   assert.equal(cfg.formatRetries, 1)
   assert.equal(cfg.maxFiles, 6)
   assert.equal(cfg.maxEvidenceBytes, 131072)
@@ -253,6 +254,7 @@ test("numeric settings default only on omission and enforce integer boundaries b
   for (const [name, fallback, min, max] of [
     ["formatRetries", 1, 0, 100],
     ["timeoutMs", 30000, 1, 3600000],
+    ["maxOutputTokens", 2048, 1, Number.MAX_SAFE_INTEGER],
     ["maxFiles", 6, 1, 1000],
     ["maxEvidenceBytes", 131072, 1, 16 * 1024 * 1024],
     ["autoApproveDelaySeconds", 15, 0, 3600],
@@ -648,7 +650,7 @@ test("extra-careful guidance defaults on and can be omitted from native auto rev
       assert.equal(request.body.messages[0].content, [prompts[kind].instructions, ...(autoApprove && extraCareful !== false ? [prompts.extraCareful] : []), CONTRACT].join("\n\n"))
       assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
       assert.equal(request.body.stream, stream)
-      assert.equal(request.body.max_tokens, 2000)
+      assert.equal(request.body.max_tokens, 2048)
       assert.doesNotMatch(JSON.stringify(request.body), /"extraCareful"|autoApprove|countdown|automatic approval/)
     }
     assert.equal(requests.length - start, 2)
@@ -660,6 +662,76 @@ test("provider reasoning stays outside the displayed assessment", async (t) => {
     content: '{"safe":true,"desc":"Visible effects."}', reasoning: "hidden reasoning", reasoning_content: "hidden thoughts",
   } }] })))
   assert.deepEqual(await review(evidence, config, signal()), { safe: true, desc: "Visible effects." })
+})
+
+test("configured output limit reaches both transports, network retries and format corrections unchanged", async t => {
+  for (const stream of [false, true]) {
+    const { config, requests } = await endpoint(t, (index, res) => {
+      if (index === 0) { res.writeHead(503); res.end("temporary"); return }
+      const content = index === 1 ? "bad format" : '{"safe":true,"desc":"Bounded."}'
+      res.writeHead(200, { "Content-Type": stream ? "text/event-stream" : "application/json" })
+      res.end(stream ? event(chunk(content, "stop")) + done : envelope(content))
+    })
+    const result = await review(evidence, { ...config, stream, maxOutputTokens: 8192 }, signal())
+    assert.equal(result.safe, true)
+    assert.equal(requests.length, 3)
+    assert.ok(requests.every(request => request.body.max_tokens === 8192))
+    assert.deepEqual(requests[0]!.body, requests[1]!.body)
+    assert.equal(requests[2]!.body.messages.length, 4)
+  }
+})
+
+test("truncated assessment stream clears its rating, drains usage, and retries the exact configured request", async () => {
+  const requests: string[] = [], progress: ReviewProgress[] = [], observed: Usage[] = []
+  let retries = 0
+  const result = await review(evidence, { ...streamConfig(), maxOutputTokens: 4096 }, signal(), async (_, init) => {
+    requests.push(init!.body as string)
+    if (requests.length === 1) return streamText(event(chunk('{"safe":true,"desc":"Old preview"}'))
+      + event(chunk("", "length")) + event({ choices: [], usage: { cost: 0.01 } }) + done)
+    assert.deepEqual(observed, [{ cost: 0.01 }], "failed attempt usage is finalized before retry dispatch")
+    assert.deepEqual(progress.at(-1), { attempt: 1, phase: "retrying" })
+    return streamText(event(chunk('{"safe":false,"desc":"Fresh report"}', "stop"))
+      + event({ choices: [], usage: { cost: 0.02 } }) + done)
+  }, {}, BUILTIN_PROMPTS, undefined, usage => { observed.push(usage) }, value => { progress.push(value) }, undefined, () => { retries++ })
+  assert.deepEqual(result, { safe: false, desc: "Fresh report", usage: { cost: 0.03 } })
+  assert.equal(retries, 1)
+  assert.equal(requests.length, 2)
+  assert.equal(requests[0], requests[1])
+  assert.equal(JSON.parse(requests[1]!).max_tokens, 4096, "retries never increase the configured cap")
+  assert.ok(progress.some(value => value.attempt === 0 && value.preview?.safe === true))
+  assert.ok(progress.some(value => value.attempt === 0 && value.phase === "streaming" && !value.preview))
+  assert.ok(progress.filter(value => value.attempt === 1).every(value => !value.preview?.desc?.includes("Old preview")))
+  assert.deepEqual(observed, [{ cost: 0.01 }, { cost: 0.02 }])
+})
+
+test("assessment-stream retries share the transport budget and surface token-limit errors only after exhaustion", async () => {
+  for (const httpFirst of [false, true]) {
+    let calls = 0, retries = 0
+    const observed: Usage[] = []
+    await assert.rejects(review(evidence, { ...streamConfig(), formatRetries: 0 }, signal(), async () => {
+      if (++calls === 1 && httpFirst) return new Response(null, { status: 503 })
+      return streamText(event(chunk('{"safe":true,')) + event(chunk("", "length"))
+        + event({ choices: [], usage: { cost: 0.01 } }) + done)
+    }, {}, BUILTIN_PROMPTS, undefined, usage => { observed.push(usage) }, undefined, undefined, () => { retries++ }),
+    /output token limit reached; increase maxOutputTokens/)
+    assert.equal(calls, 3); assert.equal(retries, 2)
+    assert.equal(observed.length, httpFirst ? 2 : 3)
+  }
+})
+
+test("canceling a rejected-stream retry clears the preview and dispatches no new request", async () => {
+  const abort = new AbortController(), reason = new Error("conversation disabled")
+  const progress: ReviewProgress[] = []
+  let calls = 0, retries = 0
+  await assert.rejects(review(evidence, streamConfig(), abort.signal, async () => {
+    calls++
+    return streamText(event(chunk('{"safe":true,"desc":"Discard"}')) + event(chunk("", "length")) + done)
+  }, {}, BUILTIN_PROMPTS, undefined, undefined, value => {
+    progress.push(value)
+    if (value.phase === "retrying") abort.abort(reason)
+  }, undefined, () => { retries++ }), error => error === reason)
+  assert.equal(calls, 1); assert.equal(retries, 0)
+  assert.deepEqual(progress.at(-1), { attempt: 1, phase: "retrying" })
 })
 
 test("new review kinds select only their own instructions and share the fixed correction contract", async (t) => {
@@ -684,7 +756,7 @@ test("new review kinds select only their own instructions and share the fixed co
       assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
       assert.equal(request.body.tools, undefined)
       assert.equal(request.body.stream, stream)
-      assert.equal(request.body.max_tokens, 2000)
+      assert.equal(request.body.max_tokens, 2048)
       assert.doesNotMatch(JSON.stringify(request.body), /"extraCareful"|autoApprove|countdown|automatic approval/)
     }
     assert.equal(requests[start + 1]!.body.messages[3].content, CORRECTION.replace("{{validationError}}", "Invalid JSON"))
@@ -889,6 +961,31 @@ test("SSE review survives every byte split, including UTF-8 and escaped assessme
   assert.equal((await review(evidence, streamConfig(), signal(), fetcher)).desc, desc)
 })
 
+test("a rejected stream is drained only under the original deadline", async () => {
+  let writer!: ReadableStreamDefaultController<Uint8Array>, calls = 0, canceled = false
+  const response = new Response(new ReadableStream<Uint8Array>({
+    start(value) { writer = value }, cancel() { canceled = true },
+  }), { headers: { "Content-Type": "text/event-stream" } })
+  writer.enqueue(Buffer.from(event(chunk('{"safe":true,"desc":"old"}')) + event(chunk("", "length"))))
+  await assert.rejects(review(evidence, { ...streamConfig(), timeoutMs: 30 }, signal(), async () => { calls++; return response }), /timed out/)
+  assert.equal(calls, 1); assert.equal(canceled, true)
+  assert.equal(response.body!.locked, false)
+})
+
+test("draining rejected metadata never turns refusals or resource failures into retriable results", async () => {
+  const prefix = Buffer.from(event(chunk('{"safe":true,"desc":"preview"}')) + event(chunk("", "length")))
+  for (const suffix of [Buffer.from(event(chunk("", "content_filter"))),
+    Buffer.from(event({ choices: [{ index: 0, delta: { refusal: "PRIVATE" }, finish_reason: "stop" }] })),
+    Buffer.from([0xff]), Buffer.from(":" + "x".repeat(65536))]) {
+    let calls = 0
+    await assert.rejects(review(evidence, streamConfig(), signal(), async () => {
+      calls++
+      return streamingResponse([prefix, suffix])
+    }), error => error instanceof Error && !error.message.includes("PRIVATE"))
+    assert.equal(calls, 1)
+  }
+})
+
 test("previews precede completion while stop, final cumulative usage, DONE and EOF are all consumed", async () => {
   let writer!: ReadableStreamDefaultController<Uint8Array>
   const body = new ReadableStream<Uint8Array>({ start(controller) { writer = controller } })
@@ -949,7 +1046,7 @@ test("only final assessment-format errors correct, with reset progress and fresh
   }
 })
 
-test("malformed/error SSE events and contradictory completion metadata terminate without correction", async (t) => {
+test("rejected SSE metadata retries boundedly; refusals, tool calls and API errors stay terminal", async (t) => {
   const valid = chunk('{"safe":true,"desc":"x"}')
   const withChoice = (fields: Record<string, unknown>) => event({ ...valid, choices: [{ ...valid.choices[0], ...fields }] })
   const withDelta = (fields: Record<string, unknown>) => withChoice({ delta: { ...valid.choices[0]!.delta, ...fields } })
@@ -982,33 +1079,41 @@ test("malformed/error SSE events and contradictory completion metadata terminate
     ["data after DONE", event(chunk("", "stop")) + done + event(valid)],
     ["duplicate DONE", event(chunk("", "stop")) + done + done],
   ]
+  const terminal = new Set(["invalid JSON", "error", "error event", "wrong role", "null role", "legacy call", "tool calls",
+    "bad calls", "refusal", "bad refusal", "filter", "tool finish"])
   for (const [name, text] of cases) await t.test(name, async () => {
     const observed: Usage[] = []
     let calls = 0
-    const response = streamText(event({ choices: [], usage: { cost: 0.01 } }) + text + done)
-    await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return response }, {}, BUILTIN_PROMPTS,
+    const responses: Response[] = []
+    await assert.rejects(review(evidence, streamConfig(), signal(), async () => {
+      calls++
+      const response = streamText(event({ choices: [], usage: { cost: 0.01 } }) + text + done)
+      responses.push(response)
+      return response
+    }, {}, BUILTIN_PROMPTS,
       undefined, (usage) => observed.push(usage)), (error: unknown) => {
       assert.ok(error instanceof Error)
       assert.doesNotMatch(error.message, /PRIVATE|format invalid/)
       return true
     })
-    assert.equal(calls, 1)
-    assert.equal(response.body!.locked, false)
-    assert.deepEqual(observed, [{ cost: name.startsWith("error") ? 0.02 : 0.01 }])
+    assert.equal(calls, terminal.has(name) ? 1 : 3)
+    assert.ok(responses.every(response => !response.body!.locked))
+    assert.deepEqual(observed, Array.from({ length: calls }, () => ({ cost: name.startsWith("error") ? 0.02 : 0.01 })))
   })
 })
 
-test("missing terminal protocol and unfinished events fail even after a valid assessment and stop", async () => {
-  for (const text of [
+test("missing completion markers retry while incomplete SSE framing remains terminal", async () => {
+  const cases = [
     event(chunk('{"safe":true,"desc":"x"}')),
     event(chunk('{"safe":true,"desc":"x"}', "stop")),
     event(chunk('{"safe":true,"desc":"x"}', "stop")) + "data: [DONE]\n",
     event(chunk('{"safe":true,"desc":"x"}', "stop")) + done + "data: trailing",
     event(chunk("invalid JSON", "stop")),
-  ]) {
+  ]
+  for (const [index, text] of cases.entries()) {
     let calls = 0
     await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return streamText(text) }), /ended/)
-    assert.equal(calls, 1, "format errors cannot retry an incomplete transport")
+    assert.equal(calls, [0, 1, 4].includes(index) ? 3 : 1, "unfinished records cannot be treated as completed assessment frames")
   }
 })
 

@@ -12,6 +12,9 @@ class TransientTransportError extends Error {
   constructor(message: string, readonly notBefore = 0) { super(message) }
 }
 
+/** A rejected stream may be regenerated from scratch, never resumed or accepted. */
+export class AssessmentStreamError extends TransientTransportError {}
+
 export function networkFailure(error: unknown, message: string): Error {
   // Node fetch wraps socket errors in cause; Bun exposes code directly. Unknown
   // failures, TLS/certificate errors, redirects and invalid URLs stay terminal.
@@ -46,7 +49,7 @@ export function httpFailure(response: Response): Error {
 /** Two extra POSTs total per review, independently of assessment-format retries. */
 export class TransportRetries {
   private used = 0
-  async wait(error: unknown, signal: AbortSignal): Promise<boolean> {
+  async wait(error: unknown, signal: AbortSignal, beforeWait?: () => unknown): Promise<boolean> {
     reviewStage(signal, "Reviewer response")
     if (!(error instanceof TransientTransportError) || this.used >= 2) return false
     const base = 250 * 2 ** this.used
@@ -55,6 +58,7 @@ export class TransportRetries {
     // review rather than extending its deadline or retrying before permission.
     if (delay + 250 >= remainingTime(signal)) return false
     this.used++
+    try { void Promise.resolve(beforeWait?.()).catch(() => {}) } catch {}
     try { await sleep(Math.ceil(delay), undefined, { signal }) }
     catch { signal.throwIfAborted(); throw error }
     reviewStage(signal, "Reviewer response")

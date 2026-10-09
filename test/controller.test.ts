@@ -264,7 +264,7 @@ for (const failure of ["missing message", "reader error", "timeout"] as const) {
     const controller = new Controller((req, parent, onIdentified) => {
       if (req.id === "c-later") return Promise.resolve(result)
       callbacks.push(onIdentified)
-      return withDeadline(parent, 10, async (signal) => {
+      return withDeadline(parent, failure === "timeout" ? 10 : 1000, async (signal) => {
         const context = await loadContext(req, reader, signal)
         if (!context) return null
         onIdentified()

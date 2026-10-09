@@ -19,10 +19,11 @@ export interface Config extends Limits, NotificationConfig {
   autoApproveDelaySeconds: number
   formatRetries: number
   timeoutMs: number
+  maxOutputTokens: number
 }
 
 export function parseConfig(options: Record<string, unknown> = {}): Config {
-  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "stream", "reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "extraCareful", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxFiles", "maxEvidenceBytes", "notify", "notifySound", "notificationSoundDirectory"])
+  const keys = new Set(["baseURL", "model", "apiKey", "apiKeyEnv", "instructions", "stream", "reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "extraCareful", "autoApproveDelaySeconds", "formatRetries", "timeoutMs", "maxOutputTokens", "maxFiles", "maxEvidenceBytes", "notify", "notifySound", "notificationSoundDirectory"])
   for (const key of Object.keys(options)) if (!keys.has(key)) throw new Error(`Unknown opencode-reviewer setting: ${key}`)
   const text = (name: string, optional = false): string | undefined => {
     const value = options[name]
@@ -69,6 +70,7 @@ export function parseConfig(options: Record<string, unknown> = {}): Config {
     autoApproveDelaySeconds: number("autoApproveDelaySeconds", 15, 0, 3600),
     formatRetries: number("formatRetries", 1, 0, 100),
     timeoutMs: number("timeoutMs", 30000, 1, 3600000),
+    maxOutputTokens: number("maxOutputTokens", 2048, 1, Number.MAX_SAFE_INTEGER),
     maxFiles: number("maxFiles", 6, 1, 1000),
     maxEvidenceBytes: number("maxEvidenceBytes", 131072, 1, 16 * 1024 * 1024),
   }

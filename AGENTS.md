@@ -98,6 +98,9 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
     `fullscreen` and `error`. `--static` checks animation-disabled labels;
     `--observer-throws` checks diagnostic isolation. Example combinations are
     `retry --static` and `nonstream --observer-throws`.
+    `truncated --static` exercises a configured 4,096-token limit, a provisional
+    Safe stream ending with `length`, preview clearing, exact request regeneration,
+    terminal usage consumption and final-only approval.
   - `node scripts/smoke-permissions.mjs mcp --auto --correction --stream --stats`
     and `node scripts/smoke-permissions.mjs external-edit --auto --stream --stats`
     cover streamed category integration, terminal usage and cumulative-frame accounting.
@@ -480,8 +483,10 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Do not include omitted content or invent zero counts for unavailable diffs.
 - Use HTTP Chat Completions with compact textual JSON evidence; `stream` is a strict
   boolean defaulting to false and controls both transport and progressive display.
-  Every reviewer POST sets `max_tokens: 2000`, including transport retries and
-  format corrections. This fixed output cap is not a configuration option.
+  Every reviewer POST sets `max_tokens` from `maxOutputTokens` (default 2,048),
+  including transport retries and format corrections. Accept positive safe integers;
+  the provider/model owns its supported token range. Never raise the configured
+  cap automatically. Local response-byte limits and the shared deadline still apply.
   Streaming sends `stream_options: { include_usage: true }` and requires
   `text/event-stream`. No tool calling, provider-specific JSON mode or stream
   resumption. Keep endpoint/model configurable and evidence semantics
@@ -503,21 +508,28 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   body EOF before final assessment validation. Do not finalize on a closing brace
   or first finish frame. Accept usage-only frames and repeated empty stop metadata;
   reject content after stop and API data after DONE. Keepalives do not extend the
-  shared deadline. Cancel/release readers on every exit, own late fetch responses,
+  shared deadline. Rejected, well-framed assessment streams can be regenerated in
+  a new request but never accepted or resumed. Preserve terminal usage after rejected
+  metadata where framing remains readable, under the same wire/event/deadline bounds.
+  Cancel/release readers on every exit, own late fetch responses,
   and do not await potentially hanging underlying reader cancellation.
 - Assessment-format corrections require successful transport and retain the exact
   prior history, failed response and validation feedback under the shared deadline.
   Internal transport recovery permits at most two extra POSTs per review, shared
   across format attempts: HTTP 408/429/500/502/503/504 and recognized transient
   socket/DNS error codes, including body read failures before any decoded assessment
-  content. Retry the exact request with no conversation messages added. Use 250/500 ms
+  content, and rejected assessment-stream metadata (including `length` or missing
+  completion markers at a clean EOF). Retry the exact request with no conversation
+  messages added. Use 250/500 ms
   exponential backoff plus up to 100% jitter; honor Retry-After seconds/HTTP dates
   as a minimum. Never extend the deadline or shorten a provider cooldown to fit it.
   Leave at least 250 ms for the next request. Cancel waits and failed transports on
-  resolution/disable/disposal. Never restart a stream after assessment content starts.
-  TLS/authentication/unknown errors, redirects, invalid envelopes, unfinished streams
-  and resource limits stay terminal. Approval writes still never retry. No new UI
-  or configuration: existing evaluating/retrying states and timeoutMs apply.
+  resolution/disable/disposal. Clear rejected previews immediately and start a fresh
+  attempt generation before backoff; never merge partial streams. Socket failures
+  after assessment content starts stay terminal. TLS/authentication/unknown errors,
+  redirects, non-stream envelopes, API error/refusal/tool-call events, malformed API
+  JSON/UTF-8, incomplete SSE framing and resource limits stay terminal. Approval
+  writes still never retry. Existing evaluating/retrying states and timeoutMs apply.
   Never display API error bodies. `src/transport-retry.ts` owns retry policy.
 - Treat command/source/quoted prompts as evidence, not reviewer instructions.
   Default Safe means bounded risk, not merely user-authorized; being outside the

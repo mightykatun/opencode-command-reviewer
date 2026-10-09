@@ -37,6 +37,7 @@ OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-revie
         "notifySound": true,
         "notificationSoundDirectory": "/absolute/path/to/notification-sounds",
         "formatRetries": 1,
+        "maxOutputTokens": 2048,
         "timeoutMs": 30000,
         "maxFiles": 6,
         "maxEvidenceBytes": 131072
@@ -76,6 +77,7 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 | `notifySound` | Play notification sounds. Defaults to `true`; set `false` to keep banners silent. |
 | `notificationSoundDirectory` | Absolute custom sound directory. Use `attention`, `approved`, `error`, and `ended` basenames with `.wav` or `.mp3`; WAV takes precedence. Missing or unusable files fall back to bundled sounds. |
 | `formatRetries` | Additional attempts to correct malformed assessment JSON, 0–100. |
+| `maxOutputTokens` | Provider output-token limit, sent as `max_tokens`. Defaults to 2,048; accepts positive safe integers within your provider/model's supported range. Retries keep the same limit. |
 | `timeoutMs` | Total review deadline, 1–3,600,000 ms. |
 | `maxFiles` | File limit per review, 1–1,000. |
 | `maxEvidenceBytes` | Evidence limit, 1–16,777,216 bytes. Whole files or diffs may be omitted; oversized mandatory arguments fail review. |
@@ -88,15 +90,21 @@ Markdown and scrolling. If the sidebar is hidden, use OpenCode's Show sidebar
 command.
 
 With streaming enabled, Evaluating and its spinner disappear when a rating arrives.
-The rating remains provisional until the full response is validated. A format retry
+The rating remains provisional until the full response is validated. A retry
 clears the preview and restores the loading indicator. Auto-approval
 starts only after the full response is validated and rendered.
 
-Transient connection failures and HTTP 408/429/500/502/503/504 responses get up to
-two internal retries within `timeoutMs`, honoring server cooldowns. A stream that
-has already delivered assessment text is not restarted. This is separate from
-`formatRetries`; no additional setting is needed. Retried requests can incur
-additional provider charges, and unreported usage remains unknown.
+Transient connection failures, HTTP 408/429/500/502/503/504 responses, and rejected
+assessment streams share up to two internal retries within `timeoutMs`, honoring
+server cooldowns. Stream protocol failures and output-token truncation regenerate
+the report from a fresh, identical request; previous previews are cleared and never
+joined to the next response. Socket failures after text starts, provider error/refusal
+events, tool calls, invalid JSON/UTF-8, incomplete SSE framing and resource-limit
+failures remain terminal. This recovery is separate from `formatRetries`.
+If token-limit errors persist, increase `maxOutputTokens` within your model's limits.
+Providers enforce this limit and may include reasoning tokens; the plugin's byte
+limits and overall timeout still apply. Retried requests can incur additional
+provider charges, and unreported usage remains unknown.
 
 During an auto-approval countdown, click the countdown to allow once immediately,
 or Cancel to leave the request manual. Hiding or covering the panel also cancels

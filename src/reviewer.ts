@@ -6,7 +6,7 @@ import { remainingTime, reviewStage, withDeadline } from "./deadline.js"
 import { SSEParser } from "./sse.js"
 import { AssessmentFormatError, StreamingAssessment } from "./streaming-assessment.js"
 import { diagnosticAttempt, type DiagnosticObserver } from "./diagnostics.js"
-import { httpFailure, networkFailure, TransportRetries } from "./transport-retry.js"
+import { AssessmentStreamError, httpFailure, networkFailure, TransportRetries } from "./transport-retry.js"
 export { withDeadline } from "./deadline.js"
 export type { ReviewProgress } from "./types.js"
 
@@ -89,6 +89,7 @@ const textMetadata = (message: Record<string, unknown>) => (message.role === und
   && message.function_call == null
   && (message.tool_calls == null || (Array.isArray(message.tool_calls) && message.tool_calls.length === 0))
   && (message.refusal == null || message.refusal === "")
+const nonTextFinish = (value: unknown) => value === "content_filter" || value === "tool_calls" || value === "function_call"
 
 async function streamedAssessment(response: Response, signal: AbortSignal, accounting: ReturnType<typeof usageAttempt>,
   progress: (preview?: Partial<Assessment>) => void, firstContent?: () => void): Promise<StreamingAssessment> {
@@ -100,59 +101,84 @@ async function streamedAssessment(response: Response, signal: AbortSignal, accou
   let stopped = false, done = false
   let id: string | undefined, model: string | undefined
   let last: Partial<Assessment> | undefined
-  function invalid(): never { throw new Error("Reviewer API did not return a text assessment stream") }
+  let failure: AssessmentStreamError | undefined
+  function invalid(retryable = true): never {
+    const message = "Reviewer API did not return a text assessment stream"
+    throw retryable ? new AssessmentStreamError(message) : new Error(message)
+  }
   const sse = new SSEParser(({ data, event }) => {
-    if (data.trim() === "[DONE]") {
-      if (done || !stopped || event !== "message") invalid()
-      done = true
-      return
-    }
-    let body: unknown
-    try { body = JSON.parse(data) } catch { throw new Error("Reviewer returned invalid SSE API JSON") }
-    // Even an invalid/error/late frame can report real usage. Capture it before validation.
-    // Usage-only frames may omit the response model. Keep the established identity
-    // for generic catalog estimates rather than reverting to a requested alias.
-    accounting.observe(object(body) && body.model === undefined && model !== undefined ? { ...body, model } : body)
-    reviewStage(signal, "Reviewer response body")
-    if (done || event !== "message" || !object(body) || body.error != null) invalid()
-    if (body.object !== undefined && body.object !== "chat.completion.chunk") invalid()
-    for (const key of ["id", "model"] as const) {
-      const value = body[key]
-      if (value === undefined) continue
-      if (typeof value !== "string" || !value) invalid()
-      const previous = key === "id" ? id : model
-      if (previous !== undefined && previous !== value) invalid()
-      if (key === "id") id = value
-      else model = value
-    }
-    if (!Array.isArray(body.choices) || body.choices.length > 1) invalid()
-    if (body.choices.length === 0) {
-      if (!object(body.usage)) invalid()
-      return
-    }
-    const choice: unknown = body.choices[0]
-    if (!object(choice) || choice.index !== 0 || choice.message != null || choice.text != null || choice.error != null) invalid()
-    const finish = choice.finish_reason
-    if ((finish != null && finish !== "stop") || (stopped && finish !== "stop")) invalid()
-    const delta = choice.delta === undefined && finish === "stop" ? {} : choice.delta
-    if (!object(delta) || !textMetadata(delta)) invalid()
-    if (delta.content != null && typeof delta.content !== "string") invalid()
-    if (stopped && [delta.content, delta.reasoning, delta.reasoning_content, delta.reasoning_details]
-      .some((value) => value != null && value !== "" && !(Array.isArray(value) && value.length === 0))) invalid()
-    if (typeof delta.content === "string" && delta.content) {
-      firstContent?.()
-      assessment.push(delta.content)
-      const preview = assessment.preview()
-      if (preview?.safe !== last?.safe || preview?.desc !== last?.desc) {
-        last = preview
-        progress(preview)
+    try {
+      if (data.trim() === "[DONE]") {
+        if (failure) return
+        if (done || !stopped || event !== "message") invalid()
+        done = true
+        return
       }
+      let body: unknown
+      try { body = JSON.parse(data) } catch { throw new Error("Reviewer returned invalid SSE API JSON") }
+      // Even an invalid/error/late frame can report real usage. Capture it before validation.
+      // Usage-only frames may omit the response model. Keep the established identity
+      // for generic catalog estimates rather than reverting to a requested alias.
+      accounting.observe(object(body) && body.model === undefined && model !== undefined ? { ...body, model } : body)
+      reviewStage(signal, "Reviewer response body")
+      if (event === "error" || (object(body) && body.error != null)) invalid(false)
+      // Once rejected, consume only usage until EOF under the original bounds.
+      // No more provisional text can be published or merged into a later attempt.
+      if (failure) {
+        if (object(body) && Array.isArray(body.choices) && body.choices.some(choice => object(choice)
+          && (choice.error != null || nonTextFinish(choice.finish_reason)
+            || (object(choice.delta) && !textMetadata(choice.delta))
+            || (object(choice.message) && !textMetadata(choice.message))))) invalid(false)
+        return
+      }
+      if (done || event !== "message" || !object(body)) invalid()
+      if (body.object !== undefined && body.object !== "chat.completion.chunk") invalid()
+      for (const key of ["id", "model"] as const) {
+        const value = body[key]
+        if (value === undefined) continue
+        if (typeof value !== "string" || !value) invalid()
+        const previous = key === "id" ? id : model
+        if (previous !== undefined && previous !== value) invalid()
+        if (key === "id") id = value
+        else model = value
+      }
+      if (!Array.isArray(body.choices) || body.choices.length > 1) invalid()
+      if (body.choices.length === 0) {
+        if (!object(body.usage)) invalid()
+        return
+      }
+      const choice: unknown = body.choices[0]
+      if (!object(choice) || choice.index !== 0 || choice.message != null || choice.text != null) invalid()
+      if (choice.error != null) invalid(false)
+      const finish = choice.finish_reason
+      if (nonTextFinish(finish)) invalid(false)
+      const delta = choice.delta === undefined && (finish === "stop" || finish === "length") ? {} : choice.delta
+      if (!object(delta)) invalid()
+      if (!textMetadata(delta)) invalid(false)
+      if (finish === "length") throw new AssessmentStreamError("Reviewer output token limit reached; increase maxOutputTokens")
+      if ((finish != null && finish !== "stop") || (stopped && finish !== "stop")) invalid()
+      if (delta.content != null && typeof delta.content !== "string") invalid()
+      if (stopped && [delta.content, delta.reasoning, delta.reasoning_content, delta.reasoning_details]
+        .some((value) => value != null && value !== "" && !(Array.isArray(value) && value.length === 0))) invalid()
+      if (typeof delta.content === "string" && delta.content) {
+        firstContent?.()
+        assessment.push(delta.content)
+        const preview = assessment.preview()
+        if (preview?.safe !== last?.safe || preview?.desc !== last?.desc) {
+          last = preview
+          progress(preview)
+        }
+      }
+      if (finish === "stop") stopped = true
+    } catch (error) {
+      if (!(error instanceof AssessmentStreamError)) throw error
+      if (!failure) { failure = error; progress() }
     }
-    if (finish === "stop") stopped = true
   })
   await readBody(response, signal, (bytes) => sse.push(bytes))
   sse.finish()
-  if (!done || !stopped) throw new Error("Reviewer stream ended without stop and DONE")
+  if (failure) throw failure
+  if (!done || !stopped) throw new AssessmentStreamError("Reviewer stream ended without stop and DONE")
   return assessment
 }
 
@@ -188,14 +214,15 @@ export async function review(
   let usage: Usage | undefined
   let corrections = 0
   const retries = new TransportRetries()
+  let startedAttempt = -1
   for (let attempt = 0; ; attempt++) {
     signal.throwIfAborted()
-    const progress = (phase: ReviewProgress["phase"], preview?: Partial<Assessment>) => {
+    const progress = (phase: ReviewProgress["phase"], preview?: Partial<Assessment>, ordinal = attempt) => {
       if (signal.aborted) return
-      try { void Promise.resolve(onProgress?.({ attempt, phase, ...(preview ? { preview: { ...preview } } : {}) })).catch(() => {}) }
+      try { void Promise.resolve(onProgress?.({ attempt: ordinal, phase, ...(preview ? { preview: { ...preview } } : {}) })).catch(() => {}) }
       catch { /* Observational callbacks cannot change review outcomes. */ }
     }
-    progress(attempt ? "retrying" : "evaluating")
+    if (startedAttempt !== attempt) { startedAttempt = attempt; progress(attempt ? "retrying" : "evaluating") }
     const accounting = usageAttempt(config.baseURL, config.model, pricing, onUsage)
     const requestAbort = new AbortController()
     let contentStarted = false
@@ -206,7 +233,7 @@ export async function review(
       let response: Response
       let diagnose: ReturnType<typeof diagnosticAttempt> | undefined
       try {
-        const body = JSON.stringify({ model: config.model, messages, max_tokens: 2000, stream: config.stream,
+        const body = JSON.stringify({ model: config.model, messages, max_tokens: config.maxOutputTokens, stream: config.stream,
           ...(config.stream ? { stream_options: { include_usage: true } } : {}) })
         reviewStage(signal, "Reviewer response")
         diagnose = onDiagnostics ? diagnosticAttempt(onDiagnostics, attempt) : undefined
@@ -283,7 +310,7 @@ export async function review(
       }
     } catch (error) {
       requestAbort.abort()
-      if (contentStarted) throw error
+      if (contentStarted && !(error instanceof AssessmentStreamError)) throw error
       failed = true
       failure = error
     } finally {
@@ -291,6 +318,9 @@ export async function review(
       const currentUsage = accounting.finalize()
       usage = attempt === 0 ? currentUsage : sumUsage(usage, currentUsage)
     }
-    if (failed && !await retries.wait(failure, signal)) throw failure
+    if (failed && !await retries.wait(failure, signal, () => {
+      startedAttempt = attempt + 1
+      progress("retrying", undefined, startedAttempt)
+    })) throw failure
   }
 }

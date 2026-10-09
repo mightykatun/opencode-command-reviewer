@@ -10,8 +10,9 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime, smokeMetrics } from "./smoke-runtime.mjs"
 
 const scenario = process.argv[2] ?? "complete"
-assert.ok(["complete", "retry", "nonstream", "cancel", "manual", "disable", "hidden", "dialog", "narrow", "fullscreen", "error"].includes(scenario))
+assert.ok(["complete", "retry", "truncated", "nonstream", "cancel", "manual", "disable", "hidden", "dialog", "narrow", "fullscreen", "error"].includes(scenario))
 const streaming = scenario !== "nonstream"
+const maxOutputTokens = scenario === "truncated" ? 4096 : 2048
 const throwingObserver = process.argv.includes("--observer-throws")
 const staticAnimations = process.argv.includes("--static")
 const name = `streaming-${scenario}${staticAnimations ? "-static" : ""}${throwingObserver ? "-throwing-observer" : ""}`
@@ -66,6 +67,7 @@ const prefix = `STREAM START\n\nLiteral: \`\x1b[2J\u202e\`\n\n${code}\n\n`
 const longText = Array.from({ length: 55 }, (_, i) => `STREAM ROW ${String(i + 1).padStart(2, "0")}.`).join("\n\n")
 const encoded = (text) => JSON.stringify(text).slice(1, -1)
 const calls = [], reviews = [], errors = []
+const reviewBodies = []
 let toolSent = false
 const server = createServer(async (req, res) => {
   try {
@@ -75,6 +77,9 @@ const server = createServer(async (req, res) => {
     calls.push({ url: req.url, body })
     if (req.url === "/review/chat/completions") {
       assert.equal(body.stream, streaming)
+      assert.equal(body.max_tokens, maxOutputTokens)
+      reviewBodies.push(text)
+      if (scenario === "truncated" && reviewBodies.length > 1) assert.equal(text, reviewBodies[0], "stream regeneration repeats the exact request")
       if (!streaming) {
         assert.equal(body.stream_options, undefined)
         res.writeHead(200, { "Content-Type": "application/json" })
@@ -91,7 +96,7 @@ const server = createServer(async (req, res) => {
       res.flushHeaders()
       const review = { aborted: false, ended: false,
         content: (content) => res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`),
-        stop: () => res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`),
+        stop: (reason = "stop") => res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: reason }] })}\n\n`),
         done: () => {
           res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 40, completion_tokens: 20 } })}\n\n`)
           res.end("data: [DONE]\n\n")
@@ -195,7 +200,7 @@ const validateDiagnostics = async () => {
   assert.doesNotMatch(JSON.stringify(record), /fixture\.py|STREAM START|PAINTED_CODE|http:|ses_|per_|msg_|apiKey|"messages"\s*:|"headers"\s*:/)
   const dispatched = events.filter((event) => event.phase === "dispatch")
   assert.equal(dispatched.length, reviews.length, "one client dispatch per server attempt")
-  if (scenario === "retry") {
+  if (["retry", "truncated"].includes(scenario)) {
     assert.equal(dispatched[0].review, dispatched[1].review)
     assert.deepEqual(dispatched.map((event) => event.attempt), [0, 1])
   }
@@ -242,7 +247,7 @@ try {
   const tuiFile = path.join(temp, "tui.json")
   await writeFile(tuiFile, JSON.stringify({ $schema: "https://opencode.ai/tui.json", plugin: [[plugin, {
     notify: false, baseURL: `http://127.0.0.1:${port}/review`, model: "fixture", stream: streaming, timeoutMs: 120000,
-    autoApprove: true, autoApproveDelaySeconds: delay,
+    autoApprove: true, autoApproveDelaySeconds: delay, maxOutputTokens,
   }]] }))
   const env = { HOME: temp, XDG_CONFIG_HOME: path.join(temp, "config"), XDG_DATA_HOME: path.join(temp, "data"),
     XDG_STATE_HOME: path.join(temp, "state"), XDG_CACHE_HOME: path.join(temp, "cache"),
@@ -279,7 +284,7 @@ try {
     await save("partial-description")
   } else await pendingFor(300, (s) => assert.doesNotMatch(sidebar(s), /✓ Safe|STREAM START/))
 
-  if (["complete", "retry"].includes(scenario)) {
+  if (["complete", "retry", "truncated"].includes(scenario)) {
     for (let i = 0; i < 20 && sidebar(capture()).includes("STREAM START"); i++) { wheel(65); await sleep(40) }
     await until((s) => !sidebar(s).includes("STREAM START") && !!firstRow(s))
     const before = firstRow(screen)
@@ -289,9 +294,9 @@ try {
     await save("scrolled-chunk")
   }
 
-  if (scenario === "retry") {
-    current.content('","extra":true}') // Valid transport, invalid assessment contract.
-    current.stop(); current.done()
+  if (["retry", "truncated"].includes(scenario)) {
+    if (scenario === "retry") current.content('","extra":true}') // Valid transport, invalid assessment contract.
+    current.stop(scenario === "truncated" ? "length" : "stop"); current.done()
     await until((s) => reviews.length === 2 && sidebar(s).includes(" Retrying"))
     assert.doesNotMatch(sidebar(screen), /✓ Safe|✗ Unsafe|STREAM ROW|STREAM START|PAINTED_CODE|APPENDED/)
     if (staticAnimations) assert.match(sidebar(screen), /\[⋯\] Retrying/)
@@ -386,6 +391,10 @@ try {
     assert.match(screen, /Allow once.*Allow always.*Reject/)
     assert.doesNotMatch(sidebar(screen), / Retrying| Evaluating/)
     await save("validated-full-countdown")
+    if (scenario === "truncated") {
+      await until(s => sidebar(s).includes("token: 80 in 40 out") && sidebar(s).includes("1 ✓ 0 ✗"), 3000)
+      await save("retry-usage-and-one-rating")
+    }
     if (scenario !== "complete") {
       assert.match(sidebar(screen), /PAINTED_CODE|print\(fruit\)/, "final report code must be painted before the full countdown")
       const ansi = tmux("capture-pane", "-p", "-e", "-t", "stream")
@@ -398,7 +407,7 @@ try {
     await until((s) => !s.includes("Permission required") && !s.includes("Permission analysis"))
     await save("resolved")
   }
-  assert.equal(reviews.length, ["retry", "disable"].includes(scenario) ? 2 : 1)
+  assert.equal(reviews.length, ["retry", "truncated", "disable"].includes(scenario) ? 2 : 1)
   assert.deepEqual(errors, [])
   for (const call of calls.filter((call) => call.url === "/main/chat/completions")) {
     assert.doesNotMatch(JSON.stringify(call.body.messages), /STREAM START|CORRECTED START|Permission analysis|reviewer-disable|reviewer-enable/)

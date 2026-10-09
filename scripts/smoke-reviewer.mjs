@@ -6,7 +6,7 @@ const bytes = (text) => Buffer.byteLength(text, "utf8")
 const count = (value) => Number.isSafeInteger(value) && value >= 0
 
 /** Keep comparison data in memory only. Reports contain ordinals, sizes and numeric usage. */
-export function reviewerAudit({ stream = false } = {}) {
+export function reviewerAudit({ stream = false, maxOutputTokens = 2048 } = {}) {
   const permissions = new Map(), systems = new Map(), rows = []
   let verified = false
   return {
@@ -15,7 +15,7 @@ export function reviewerAudit({ stream = false } = {}) {
       const body = JSON.parse(text), messages = body.messages
       assert.ok(text === JSON.stringify(body), "request envelope must already be compact JSON")
       assert.equal(body.stream, stream)
-      assert.equal(body.max_tokens, 2000)
+      assert.equal(body.max_tokens, maxOutputTokens)
       assert.deepEqual(Object.keys(body).sort(), ["model", "messages", "max_tokens", "stream", ...(stream ? ["stream_options"] : [])].sort())
       if (stream) assert.deepEqual(body.stream_options, { include_usage: true })
       assert.ok(Array.isArray(messages) && messages.length >= 2)
