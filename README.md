@@ -1,13 +1,15 @@
-# OpenCode reviewer
+# OpenCode Reviewer
 
 Reviews pending permissions in the OpenCode sidebar using a separate LLM. Covers
 shell commands, file edits, MCP calls, custom tools, and external-directory access.
-Supports streaming explanations, saved report history, optional one-time auto-approval, and
-reviewer-aware Linux desktop notifications with distinct sounds.
+Supports streaming explanations, saved report history, auto-approval, and Linux
+desktop notifications with distinct sounds.
 
-Requires OpenCode 1.18.35 on Linux.
+![](./assets/recording.gif)
 
-## Install
+Requires OpenCode 1.18.35 or newer on Linux.
+
+## Install and config
 
 Add this entry to `~/.config/opencode/tui.json` or `.opencode/tui.json`.
 OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-reviewer).
@@ -57,7 +59,7 @@ OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-revie
 ```
 
 Only `baseURL` and `model` are required. Use any OpenAI-compatible Chat Completions
-endpoint; `/chat/completions` is appended to the base URL. Choose a model available
+endpoint: `/chat/completions` is appended to the base URL. Choose a model available
 at that endpoint.
 
 Replace `apiKey`, or remove it and set the variable named by `apiKeyEnv` before
@@ -69,7 +71,7 @@ The remaining values above are the defaults. Restart OpenCode after changing
 configuration. Reviews run when OpenCode asks for permission, so set the relevant
 rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 
-## Options
+## Options reference
 
 | Option | Behavior |
 | --- | --- |
@@ -94,8 +96,10 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 | `maxEvidenceBytes` | Evidence limit, 1–16,777,216 bytes. Whole files or diffs may be omitted; oversized mandatory arguments fail review. |
 | `instructions` | Absolute directory containing overrides for the [prompt templates](https://github.com/mightykatun/opencode-reviewer/tree/main/prompts). Missing templates use the built-ins. |
 
-## Usage
+My LLMs insist on writing a bunch of useless text to my README, so I collapsed them here in case anyone wants to inflict themselves (or more likely their agent) the pain of reading it.
 
+<details>
+<summary>Usage</summary>
 The sidebar shows Safe, Unsafe, or Analysis unavailable. Explanations support
 Markdown and scrolling. If the sidebar is hidden, use OpenCode's Show sidebar
 command.
@@ -188,9 +192,10 @@ Reviews send the pending request, latest user prompt, project context, and relev
 file snapshots, diffs, or tool arguments to your endpoint before approval. Shell
 file snapshots can follow symlinks outside the project. Missing evidence is noted
 in the report; ratings are advice based on the supplied evidence.
+</details>
 
-### Desktop notifications
-
+<details>
+<summary>Desktop notifications</summary>
 Transient banners have an **Opencode (Session name)** heading and a small status icon: green
 checkmark for approvals, orange exclamation mark for attention, red exclamation mark
 for Unsafe reviews, purple question mark for questions, red X
@@ -270,6 +275,7 @@ with a low-latency buffer; preparation never blocks permission approval.
 `stdbuf` makes delivery acknowledgements immediate instead of waiting for
 `notify-send` to flush its output when the banner closes.
 Disable overlapping notification plugins to avoid duplicate alerts.
+</details>
 
 ## Development
 
