@@ -1,13 +1,12 @@
-# OpenCode reviewer
+# OpenCode Reviewer
 
 Reviews pending permissions in the OpenCode sidebar using a separate LLM. Covers
 shell commands, file edits, MCP calls, custom tools, and external-directory access.
-Supports streaming explanations, optional one-time auto-approval, and
-reviewer-aware Linux desktop notifications with distinct sounds.
+Supports streaming explanations, auto-approval, and Linux desktop notifications with distinct sounds.
 
-Requires OpenCode 1.18.35 on Linux.
+Requires OpenCode 1.18.35 or newer on Linux.
 
-## Install
+## Install and config
 
 Add this entry to `~/.config/opencode/tui.json` or `.opencode/tui.json`.
 OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-reviewer).
@@ -81,7 +80,8 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 | `maxEvidenceBytes` | Evidence limit, 1–16,777,216 bytes. Whole files or diffs may be omitted; oversized mandatory arguments fail review. |
 | `instructions` | Absolute directory containing overrides for the [prompt templates](https://github.com/mightykatun/opencode-reviewer/tree/main/prompts). Missing templates use the built-ins. |
 
-## Usage
+<details>
+<summary>Usage</summary>
 
 The sidebar shows Safe, Unsafe, or Analysis unavailable. Explanations support
 Markdown and scrolling. If the sidebar is hidden, use OpenCode's Show sidebar
@@ -135,7 +135,7 @@ file snapshots, diffs, or tool arguments to your endpoint before approval. Shell
 file snapshots can follow symlinks outside the project. Missing evidence is noted
 in the report; ratings are advice based on the supplied evidence.
 
-### Desktop notifications
+<summary>Desktop notifications</summary>
 
 Transient banners have an **Opencode (Session name)** heading and a small status icon: green
 checkmark for approvals, orange exclamation mark for attention, red X
@@ -176,6 +176,8 @@ with a low-latency buffer; preparation never blocks permission approval.
 `stdbuf` makes delivery acknowledgements immediate instead of waiting for
 `notify-send` to flush its output when the banner closes.
 Disable overlapping notification plugins to avoid duplicate alerts.
+
+</details>
 
 ## Development
 
