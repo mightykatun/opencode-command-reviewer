@@ -24,12 +24,15 @@ export type HistoryEvent =
   | { type: "approvalSettled"; context: HistoryReview; at: number; approval: string; result: "not-sent" | "uncertain" }
   | { type: "approvalConfirmed"; context: HistoryReview; at: number; approval: string; automatic: boolean }
   | { type: "permissionResolved"; context: HistoryReview; at: number; outcome: HistoryOutcome; payload: HistoryPayload }
+  | { type: "permissionOutcome"; context: HistoryReview; at: number; outcome: "manual" | "rejected" }
   | { type: "sessionDeleted"; context: HistoryScope; at: number }
 export interface HistoryOperation { writer: string; sequence: number; event: HistoryEvent }
 export type HistoryQuery =
   | { type: "totals" }
   | { type: "history"; scope: string; root: string; entry?: string; direction?: "older" | "newer" }
   | { type: "sessions"; scope: string; after?: string; limit?: number }
+  | { type: "resolution"; scope: string; root: string; session: string; permission: string }
+  | { type: "session"; scope: string; session: string }
 
 export const opaque = (...parts: string[]): string => createHash("sha256").update(JSON.stringify(parts)).digest("hex")
 export const entryID = (c: HistoryReview): string => opaque(c.scope, c.permission)
@@ -88,7 +91,7 @@ export function validateEvent(e: HistoryEvent): HistoryEvent {
     attemptDispatched: ["attempt", "retry"], attemptFinalized: ["attempt", "usage", "reportedModel"],
     reviewAccepted: ["accepted"], approvalDispatched: ["approval", "automatic"],
     approvalSettled: ["approval", "result"], approvalConfirmed: ["approval", "automatic"],
-    permissionResolved: ["outcome", "payload"], sessionDeleted: [],
+    permissionResolved: ["outcome", "payload"], permissionOutcome: ["outcome"], sessionDeleted: [],
   }
   requireValue(e && Object.hasOwn(extra, e.type)); object(e, ["type", "context", "at", ...extra[e.type]])
   timestamp(e.at)
@@ -101,6 +104,7 @@ export function validateEvent(e: HistoryEvent): HistoryEvent {
     case "approvalDispatched": case "approvalConfirmed": text(e.approval); requireValue(typeof e.automatic === "boolean"); break
     case "approvalSettled": text(e.approval); requireValue(["not-sent", "uncertain"].includes(e.result)); break
     case "permissionResolved": requireValue(["auto", "manual", "rejected", "cancelled"].includes(e.outcome)); validatePayload(e.payload); break
+    case "permissionOutcome": requireValue(["manual", "rejected"].includes(e.outcome)); break
   }
   return e
 }
@@ -119,9 +123,14 @@ export function decodeEvent(text: string): HistoryEvent {
   try { return validateEvent(JSON.parse(text)) } catch { throw new HistoryInvalid("Invalid history event") }
 }
 export function validateQuery(q: HistoryQuery): void {
-  requireValue(q && ["totals", "history", "sessions"].includes(q.type))
+  requireValue(q && ["totals", "history", "sessions", "resolution", "session"].includes(q.type))
   if (q.type === "totals") { object(q, ["type"]); return }
   text(q.scope); requireValue(path.isAbsolute(q.scope))
+  if (q.type === "session") { object(q, ["type", "scope", "session"]); text(q.session); return }
+  if (q.type === "resolution") {
+    object(q, ["type", "scope", "root", "session", "permission"])
+    validateScope(q); text(q.permission); return
+  }
   if (q.type === "sessions") {
     object(q, ["type", "scope", "after", "limit"])
     if (q.after !== undefined) text(q.after)

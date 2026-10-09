@@ -1,5 +1,6 @@
 import type { Config } from "./config.js"
-import type { Assessment, ReviewEvidence, ReviewProgress, ReviewResult } from "./types.js"
+import type { Assessment, ReviewEvidence, ReviewProgress, ReviewResult, ReviewObservation, ReviewAttemptEvent } from "./types.js"
+import { randomUUID } from "node:crypto"
 import { BUILTIN_PROMPTS, CONTRACT, correctionPrompt, type PromptSet } from "./prompts.js"
 import { usageAttempt, sumUsage, type PricingLookup, type Usage } from "./usage.js"
 import { remainingTime, reviewStage, withDeadline } from "./deadline.js"
@@ -194,6 +195,7 @@ export async function review(
   onProgress?: (progress: ReviewProgress) => void,
   onDiagnostics?: DiagnosticObserver,
   onRetry?: () => unknown,
+  observation: ReviewObservation = { review: randomUUID() },
 ): Promise<ReviewResult> {
   // Production already shares a deadline with evidence collection. Direct
   // callers get the same bound, including all internal backoff and POSTs.
@@ -201,7 +203,7 @@ export async function review(
     let worker: Promise<ReviewResult> | undefined
     try {
       return await withDeadline(signal, config.timeoutMs, (bounded) =>
-        worker = review(evidence, config, bounded, fetcher, environment, prompts, pricing, onUsage, onProgress, onDiagnostics, onRetry))
+        worker = review(evidence, config, bounded, fetcher, environment, prompts, pricing, onUsage, onProgress, onDiagnostics, onRetry, observation))
     } finally { await worker?.catch(() => {}) }
   }
   const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)
@@ -215,6 +217,10 @@ export async function review(
   let corrections = 0
   const retries = new TransportRetries()
   let startedAttempt = -1
+  let retry: "initial" | "transport" | "format" = "initial"
+  const observe = (event: ReviewAttemptEvent) => {
+    try { void Promise.resolve(observation.observe?.(event)).catch(() => {}) } catch {}
+  }
   for (let attempt = 0; ; attempt++) {
     signal.throwIfAborted()
     const progress = (phase: ReviewProgress["phase"], preview?: Partial<Assessment>, ordinal = attempt) => {
@@ -224,6 +230,8 @@ export async function review(
     }
     if (startedAttempt !== attempt) { startedAttempt = attempt; progress(attempt ? "retrying" : "evaluating") }
     const accounting = usageAttempt(config.baseURL, config.model, pricing, onUsage)
+    const attemptID = randomUUID()
+    let dispatched = false
     const requestAbort = new AbortController()
     let contentStarted = false
     let failed = false
@@ -240,12 +248,14 @@ export async function review(
         signal.throwIfAborted()
         let pending: Promise<Response>
         try {
+          dispatched = true
           pending = fetcher(`${config.baseURL}/chat/completions`, {
             method: "POST", redirect: "error", signal: AbortSignal.any([signal, requestAbort.signal]),
             headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
             body,
           })
         } finally {
+          observe({ type: "dispatched", review: observation.review, attempt: attemptID, retry })
           // Count dispatched extra attempts, not proposed or canceled backoff.
           if (attempt > 0) { try { void Promise.resolve(onRetry?.()).catch(() => {}) } catch {} }
         }
@@ -298,7 +308,10 @@ export async function review(
         try { result = assessment.finish() } finally { diagnose?.("final-validation") }
         if (config.stream) progress("streaming", result)
         signal.throwIfAborted()
-        return { ...result, ...(reportUsage ? { usage: reportUsage } : {}) }
+        return { ...result, ...(reportUsage ? { usage: reportUsage } : {}), metadata: {
+          review: observation.review, kind: evidence.kind, configuredModel: config.model, provider: config.baseURL,
+          ...(accounting.model() ? { reportedModel: accounting.model() } : {}),
+        } }
       }
       catch (error) {
         if (!(error instanceof AssessmentFormatError)) throw error
@@ -316,11 +329,14 @@ export async function review(
     } finally {
       // Disposal must await aborted review workers before flushing their queued accounting writes.
       const currentUsage = accounting.finalize()
+      if (dispatched) observe({ type: "finalized", review: observation.review, attempt: attemptID,
+        ...(currentUsage ? { usage: { ...currentUsage } } : {}), ...(accounting.model() ? { reportedModel: accounting.model() } : {}) })
       usage = attempt === 0 ? currentUsage : sumUsage(usage, currentUsage)
     }
     if (failed && !await retries.wait(failure, signal, () => {
       startedAttempt = attempt + 1
       progress("retrying", undefined, startedAttempt)
     })) throw failure
+    retry = failed ? "transport" : "format"
   }
 }

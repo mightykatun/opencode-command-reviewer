@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { build } from "esbuild"
 import { HistorySQL } from "../src/history-schema.js"
-import type { HistorySelection, HistoryTotals } from "../src/history-schema.js"
+import type { HistorySelection, HistoryTotals, HistoryResolution } from "../src/history-schema.js"
 import { encodeEvent, entryID, reviewID } from "../src/history-records.js"
 import type { HistoryEvent, HistoryPayload, HistoryReview } from "../src/history-records.js"
 import { privateDatabase } from "../src/history-storage-worker.js"
@@ -17,6 +17,44 @@ const context: HistoryReview = { scope: "/project", root: "root", session: "chil
 const payload: HistoryPayload = { safe: true, completedAt: 100, desc: "Resolved private report", reportedModel: "reported", usage: { cost: 0 } }
 const resolve = (c = context, p = payload, outcome: "auto" | "manual" | "cancelled" | "rejected" = "manual"): HistoryEvent =>
   ({ type: "permissionResolved", context: c, at: 200, outcome, payload: p })
+
+test("data-only resolution queries observe independent clients without reading or admitting report bodies", t => {
+  const f = fixture(t), second = f.second()
+  const query = { type: "resolution" as const, scope: context.scope, root: context.root, session: context.session, permission: context.permission }
+  f.apply({ type: "reviewAccepted", context, at: 100, accepted: { safe: true, completedAt: 100 } })
+  assert.deepEqual(second.query(query), { uncertain: false, conflict: false, deleted: false, outcome: undefined })
+  assert.throws(() => second.query({ ...query, root: "another-root" }), /ownership/)
+  f.apply({ type: "approvalDispatched", context, at: 200, approval: "write", automatic: true })
+  assert.equal((second.query(query) as HistoryResolution).uncertain, true)
+  f.apply({ type: "approvalConfirmed", context, at: 201, approval: "write", automatic: true })
+  assert.equal((second.query(query) as HistoryResolution).outcome, "auto")
+  assert.equal(f.db.prepare("SELECT count(*) n FROM payloads").get()!.n, 0)
+  f.apply(resolve(context, payload, "rejected"))
+  assert.equal((second.query(query) as HistoryResolution).conflict, true)
+  assert.equal((second.query(query) as HistoryResolution).outcome, undefined)
+})
+
+test("stored session ownership and late outcome updates remain strict, data-only and deletion-aware", t => {
+  const f = fixture(t)
+  f.apply(resolve(context, payload, "cancelled"))
+  assert.deepEqual(f.sql.query({ type: "session", scope: context.scope, session: context.session }),
+    { context: { scope: context.scope, root: context.root, session: context.session } })
+  f.apply({ type: "permissionOutcome", context, at: 300, outcome: "rejected" })
+  assert.equal(f.history().record?.outcome, "rejected")
+  assert.equal(f.history().record?.payload.desc, payload.desc)
+  assert.throws(() => encodeEvent({ type: "permissionOutcome", context, at: 300, outcome: "rejected", payload } as any))
+  f.apply({ type: "sessionDeleted", context: { scope: context.scope, root: context.root, session: context.session }, at: 400 })
+  assert.deepEqual(f.sql.query({ type: "session", scope: context.scope, session: context.session }), {})
+  const facts = f.sql.query({ type: "resolution", scope: context.scope, root: context.root, session: context.session, permission: context.permission }) as HistoryResolution
+  assert.equal(facts.deleted, true); assert.equal(facts.outcome, undefined)
+})
+
+test("resolution facts reject corrupt attribution rather than authorize cancelled history", t => {
+  const f = fixture(t)
+  f.apply({ type: "approvalConfirmed", context, at: 200, approval: "write", automatic: true })
+  f.db.exec("UPDATE approvals SET automatic=-1")
+  assert.throws(() => f.sql.query({ type: "resolution", scope: context.scope, root: context.root, session: context.session, permission: context.permission }), /ownership/)
+})
 function fixture(t: any) {
   const directory = mkdtempSync(path.join(tmpdir(), "history-test-"))
   const file = path.join(directory, "private/history-v1.sqlite")

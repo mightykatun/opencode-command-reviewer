@@ -42,8 +42,12 @@ for (const stream of [false, true]) test(`${stream ? "streaming" : "non-streamin
   const args = [evidence, config(stream), new AbortController().signal, fetcher] as const
   const measuredResult = await review(...args, {}, undefined, undefined, undefined, undefined, trace.forward)
   const plainResult = await review(...args)
-  assert.deepEqual(measuredResult, safe)
-  assert.deepEqual(measuredResult, plainResult)
+  const { metadata: measuredMetadata, ...measuredAssessment } = measuredResult
+  const { metadata: plainMetadata, ...plainAssessment } = plainResult
+  assert.deepEqual(measuredAssessment, safe)
+  assert.deepEqual(measuredAssessment, plainAssessment)
+  assert.notEqual(measuredMetadata?.review, plainMetadata?.review)
+  assert.equal(measuredMetadata?.reportedModel, "PRIVATE_MODEL")
   assert.equal(bodies[0], bodies[1])
   assert.deepEqual(events.map((event) => event.phase), ["dispatch", "headers", "first-content", "first-rating", "final-validation"])
   assert.ok(events.every((event) => event.attempt === 0 && event.review === 17))
@@ -85,7 +89,7 @@ test("correction attempts retain one numeric review ID and separate dispatch-rel
     const content = ++calls === 1 ? '{"safe":true,"desc":"PRIVATE_DESCRIPTION","extra":1}' : JSON.stringify(safe)
     return new Response(frame(content.slice(0, 13)) + frame(content.slice(13)) + finish, { headers: { "Content-Type": "text/event-stream" } })
   }, {}, undefined, undefined, undefined, undefined, trace.forward)
-  assert.deepEqual(result, safe)
+  assert.deepEqual(result, { ...safe, metadata: result.metadata })
   assert.equal(calls, 2)
   for (const attempt of [0, 1]) {
     const group = events.filter((event) => event.attempt === attempt)
@@ -106,7 +110,7 @@ for (const kind of ["throw", "reject", "mutate"] as const) test(`observer ${kind
     return new Response(frame(JSON.stringify(safe)) + finish, { headers: { "Content-Type": "text/event-stream" } })
   }, {}, undefined, undefined, undefined, undefined, observer)
   await settle() // Rejected asynchronous observers must also be consumed.
-  assert.deepEqual(result, safe)
+  assert.deepEqual(result, { ...safe, metadata: result.metadata })
   assert.equal(calls, 1)
 })
 

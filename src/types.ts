@@ -161,4 +161,20 @@ export interface ReviewProgress {
 /** Endpoint metadata stays outside the model's strict assessment JSON. */
 export interface ReviewResult extends Assessment {
   usage?: import("./usage.js").Usage
+  metadata?: ReviewMetadata
+}
+
+export interface ReviewMetadata {
+  review: string
+  kind: ReviewKind
+  configuredModel: string
+  provider: string
+  reportedModel?: string
+}
+export type ReviewAttemptEvent =
+  | { type: "dispatched"; review: string; attempt: string; retry: "initial" | "transport" | "format" }
+  | { type: "finalized"; review: string; attempt: string; usage?: import("./usage.js").Usage; reportedModel?: string }
+export interface ReviewObservation {
+  review: string
+  observe?: (event: ReviewAttemptEvent) => unknown
 }

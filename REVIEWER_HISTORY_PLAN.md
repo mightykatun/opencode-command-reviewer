@@ -1,6 +1,7 @@
 # Reviewer history: implementation handoff
 
-Status: implementation in progress; Phases 0 and 1 passed, lifecycle integration next.
+Status: implementation in progress; Phases 0 and 1 passed, Phase 2 implemented;
+lifetime replacement and history UI remain later phases.
 
 Prepared on 2026-10-09 against repository commit
 `983e888d0bb7f31e4169b30ceb436046c1003a52`, package version `0.7.0`,
@@ -799,6 +800,23 @@ before connecting the TUI.
 
 ### Phase 2: reviewer/controller lifecycle integration
 
+- [x] Correlated reviewer/controller events, in-memory candidate coordination and
+  TUI lifecycle wiring implemented. Legacy lifetime callbacks remain active for
+  this integration phase; Phase 3 removes them when replacing its persistence.
+- Native `once` attribution is conservative: the public keymap trace does not
+  carry the selected option/request identity. Neither it nor absence of a local
+  dispatch proves a manual reply. Confirmed footer/automatic acknowledgements and
+  explicit native `always`/`reject` are used. Linked assistant-message abortion
+  plus removal can qualify as cancellation, without generic idle attribution.
+- The existing schema gains bounded data-only `resolution` and `session` queries,
+  plus `permissionOutcome` updates for late explicit outcomes on resolved records.
+  No table migration or unresolved body event is introduced. Up to 128 removed
+  candidates can await shared confirmation in memory for 6.5 seconds; checks retain
+  actual read ownership and run at two-second cadence. Unavailable/late attribution
+  is conservatively omitted. A later confirmation can still update an already
+  committed entry independently of its latest report. No storage commit gates
+  permission approval. Offline maintenance/dirty-deletion replay remain Phase 6.
+
 - `src/types.ts`: carry endpoint/model result metadata outside `Assessment` and its
   strict model JSON; define storage-facing events separately from diagnostics.
 - `src/reviewer.ts`: capture configured/final response model, per-dispatch retry
@@ -1015,6 +1033,25 @@ Typecheck, build and packed production adapter smoke passed; the package check
 proved reproducibility and exactly five files. Runtime artifacts are under
 `.runtime/history-storage/`. No controller or legacy-accounting integration is
 claimed by this storage-only phase.
+
+Phase 2 verification (2026-10-09, working tree after `f8ee971`):
+
+- `npm run check` passed: typecheck, 743 TypeScript tests, 74 pure helper tests,
+  and build. After final resolution-query validation and three more storage tests,
+  typecheck and the focused history/diagnostics suite passed all 91 tests.
+- `npm run check:package` passed on the final source: reproducible bundle and
+  exactly five archive files. `npm run test:runtime-cleanup` passed all six checks.
+- `node scripts/smoke-history-storage.mjs` passed on the final packed bundle in
+  OpenCode 1.18.35, including two-client Bun SQLite and bounded disposal.
+- `node scripts/smoke.mjs auto-shell --notifications` and
+  `node scripts/smoke-streaming.mjs complete` passed. The new
+  `scripts/smoke-history-lifecycle.mjs` passed `auto-shell`, `auto-immediate`,
+  `auto-manual`, and `auto-cancel`, inspecting committed production accounting and
+  outcomes after the existing real-host approval fixtures. `auto-shell` was also
+  rerun on the final bundle. Captures/accounting assertions are in
+  `.runtime/history-lifecycle/`, `.runtime/history-storage/` and the existing
+  per-scenario capture files. These are integration proofs, not live-model tests.
+- Phase 3 persistence/presentation replacement and history UI were not implemented.
 
 Local references are relative to this repository and were reviewed at the baseline
 commit identified at the top of this document:

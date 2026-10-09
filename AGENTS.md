@@ -546,21 +546,46 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 
 ## Usage and lifetime accounting
 
-- Phase 1 history storage is a standalone, exported API, not yet wired into the
-  controller or legacy tracker. `HistoryStore.admit` accepts the strict events in
-  `history-records.ts`; only `permissionResolved` carries report text. The worker
+- Phase 2 history storage is wired through `history-coordinator.ts`, reviewer
+  attempt observers and controller lifecycle/approval facts. The legacy lifetime
+  tracker and its presentation remain active until Phase 3; the new correlated
+  store is independent and never imports legacy snapshots. `HistoryStore.admit`
+  accepts the strict events in `history-records.ts`; only `permissionResolved`
+  carries report text. `permissionOutcome` updates a previously resolved outcome
+  without resending text. The worker
   embeds in the five-file bundle and uses public `node:worker_threads` eval CJS
   with `env: {}` and Bun SQLite; tests use the Node SQLite adapter. Its private
   `history-v1.sqlite` has transactional checkpoints, opaque contribution/tombstone
   keys and precomputed totals. It does not import legacy usage snapshots.
 - `HistoryStore.query` returns snapshot history navigation, totals or bounded
-  session maintenance pages. Its optional `settled` promise retains actual worker
+  session maintenance pages, single-session stored ownership or data-only shared
+  resolution facts. Its optional `settled` promise retains actual worker
   ownership after a bounded caller timeout. Commit/failure subscriptions and
   `HistoryRefresh` support future integration. Disposal drains against a supplied
   monotonic lifecycle-abort timestamp with a 3.5-second deadline. Run
   `npx tsx --test test/history*.test.ts` and, after building,
   `node scripts/smoke-history-storage.mjs` for the packed production adapter in
-  OpenCode 1.18.35. These verify storage, not later history UI/lifecycle phases.
+  OpenCode 1.18.35. `node scripts/smoke-history-lifecycle.mjs auto-shell` runs
+  the existing real-host approval fixture and verifies its production database.
+  Other scenarios are `auto-immediate` (manual footer), `auto-manual` (unattributed
+  native once) and `auto-cancel` (cancellation followed by explicit rejection).
+  History UI and lifetime presentation replacement remain later phases.
+- Capture category from actual evidence and scope from the invocation host and
+  `modes.root`, never a target directory or a history-browsing mode load. Each
+  execution and POST has a separate UUID. Keep the latest completed candidate
+  through disabled mode and failed replacement; unresolved text remains memory-only.
+  Native once events have no submitting-client identity. The public keymap trace
+  lacks request/selected-option identity, so do not infer manual attribution from
+  it or from no local dispatch. Explicit always/reject and confirmed reviewer writes
+  are usable. A linked assistant `MessageAbortedError` plus permission removal can
+  qualify as cancellation; generic idle/error cannot. Check shared observed dispatch
+  uncertainty before cancellation admission. At most 128 removed candidates await
+  shared confirmation for 6.5 seconds, polling every two seconds. Expiry/unavailable
+  attribution omits the body; it never proves absence of remote writes. Disposal
+  drops candidates immediately, allows real transport finalizers to enqueue usage,
+  and drains/terminates storage within 3.5 seconds of lifecycle abort. Live deletion
+  invalidates candidates immediately, with bounded stored-ownership fallback for
+  deleted children; offline maintenance and dirty-deletion replay remain Phase 6.
 
 - Usage stays outside assessment JSON and model evidence. Tokens are a valid
   input/output pair; cost is independently available. For the normalized exact

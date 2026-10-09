@@ -1,7 +1,7 @@
 import { add, empty, validate } from "./lifetime.js"
 import type { LifetimeTotals } from "./lifetime.js"
 import { count, decodeEvent, entryID, HistoryInvalid, opaque, reviewID, rootID, sessionID, validatePayload, validateQuery, validateReview, validateScope } from "./history-records.js"
-import type { HistoryEvent, HistoryOutcome, HistoryPayload, HistoryQuery, HistoryReview } from "./history-records.js"
+import type { HistoryEvent, HistoryOutcome, HistoryPayload, HistoryQuery, HistoryReview, HistoryScope } from "./history-records.js"
 
 type Row = Record<string, any>
 export interface HistoryDatabase {
@@ -16,7 +16,9 @@ export interface HistorySelection {
 }
 export interface HistoryTotals { revision: number; totals: LifetimeTotals }
 export interface HistorySessions { sessions: { scope: string; root: string; session: string }[]; after?: string }
-export type HistoryResult = HistorySelection | HistoryTotals | HistorySessions
+export interface HistoryResolution { outcome?: HistoryOutcome; uncertain: boolean; conflict: boolean; deleted: boolean }
+export interface HistorySession { context?: HistoryScope }
+export type HistoryResult = HistorySelection | HistoryTotals | HistorySessions | HistoryResolution | HistorySession
 
 const schema = `
 CREATE TABLE meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, revision INTEGER NOT NULL, totals TEXT NOT NULL);
@@ -173,10 +175,11 @@ export class HistorySQL {
         if (e.automatic) activity.autoApproved = 1; else activity.since = null
         this.contribute(opaque("approvalConfirmed", id), delta)
       }
-    } else if (e.type === "permissionResolved" && !deleted) {
+    } else if ((e.type === "permissionResolved" || e.type === "permissionOutcome") && !deleted) {
       const old = this.get("SELECT * FROM history WHERE id=?", entry)
-      const replace = !old || e.payload.completedAt > old.completed || (e.payload.completedAt === old.completed
-        && Buffer.compare(Buffer.from(context.review), Buffer.from(old.tie)) >= 0)
+      if (e.type === "permissionOutcome" && !old) return
+      const replace = e.type === "permissionResolved" && (!old || e.payload.completedAt > old.completed || (e.payload.completedAt === old.completed
+        && Buffer.compare(Buffer.from(context.review), Buffer.from(old.tie)) >= 0))
       // Outcome and displayed report are independent. A cancellation never downgrades an approval.
       const prior = old?.resolution
       const resolution = !prior || prior === "cancelled" ? e.outcome : e.outcome === "cancelled" ? prior
@@ -219,6 +222,36 @@ export class HistorySQL {
           if (row.id !== sessionID(row as any) || row.scope !== q.scope) throw new HistoryInvalid("Invalid session index")
           return { scope: row.scope, root: row.root, session: row.session }
         }), after: rows.at(-1)?.id }
+      }
+      if (q.type === "session") {
+        const row = this.get(`SELECT CASE WHEN length(CAST(scope AS BLOB))<=4096 THEN scope END AS scope,
+          CASE WHEN length(CAST(session AS BLOB))<=4096 THEN session END AS session,
+          CASE WHEN length(CAST(root AS BLOB))<=4096 THEN root END AS root
+          FROM sessions WHERE id=?`, opaque(q.scope, q.session))
+        if (!row) return {}
+        validateScope(row as HistoryScope)
+        if (row.scope !== q.scope || row.session !== q.session) throw new HistoryInvalid("Invalid session ownership")
+        return { context: { scope: row.scope, root: row.root, session: row.session } }
+      }
+      if (q.type === "resolution") {
+        const entry = opaque(q.scope, q.permission), root = rootID(q), session = sessionID(q)
+        const deleted = !!this.get("SELECT id FROM tombstones WHERE id IN (?,?) LIMIT 1", root, session)
+        const invalid = this.get(`SELECT 1 AS invalid FROM approvals WHERE entry=? AND
+          (root!=? OR session!=? OR state NOT IN ('pending','confirmed','uncertain','not-sent') OR automatic NOT IN (-1,0,1)
+          OR (state='confirmed' AND automatic=-1)) LIMIT 1`, entry, root, session)
+        const invalidReview = this.get("SELECT 1 AS invalid FROM reviews WHERE entry=? AND (root!=? OR session!=?) LIMIT 1", entry, root, session)
+        const history = this.get(`SELECT CASE WHEN length(root)=64 THEN root END AS root,
+          CASE WHEN length(session)=64 THEN session END AS session,
+          CASE WHEN length(CAST(resolution AS BLOB))<=16 THEN resolution END AS resolution FROM history WHERE id=?`, entry)
+        if (invalid || invalidReview || (history && (history.root !== root || history.session !== session
+          || !["auto", "manual", "rejected", "cancelled", "conflict"].includes(history.resolution)))) throw new HistoryInvalid("Invalid resolution ownership")
+        const auto = !!this.get("SELECT id FROM approvals WHERE entry=? AND state='confirmed' AND automatic=1 LIMIT 1", entry)
+        const manual = !!this.get("SELECT id FROM approvals WHERE entry=? AND state='confirmed' AND automatic=0 LIMIT 1", entry)
+        const uncertain = !!this.get("SELECT id FROM approvals WHERE entry=? AND state IN ('pending','uncertain') LIMIT 1", entry)
+        const conflict = history?.resolution === "conflict" || (history?.resolution === "rejected" && (auto || manual))
+        const outcome = deleted || conflict ? undefined : auto ? "auto" : manual ? "manual"
+          : history?.resolution === "rejected" ? "rejected" : history?.resolution === "manual" && !uncertain ? "manual" : undefined
+        return { outcome, uncertain, conflict, deleted }
       }
       const root = rootID(q), revision = this.get("SELECT revision FROM roots WHERE id=?", root)?.revision ?? 0
       const base = "scope=? AND root=? AND outcome IS NOT NULL"

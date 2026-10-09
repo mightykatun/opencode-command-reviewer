@@ -84,6 +84,7 @@ export class HistoryStore {
   get pendingOperations() { return this.queue.length }
   /** Saturated deletion admission leaves one bounded reconciliation signal, never an ID side queue. */
   get maintenanceDirty() { return this.dirty }
+  markMaintenanceDirty() { if (!this.stopped) this.dirty = true }
   maintenanceReconciled() { if (!this.queue.length && !this.blocked) this.dirty = false }
   onCommit(listener: () => unknown) { this.commits.add(listener); return () => { this.commits.delete(listener) } }
   onWriteFailure(listener: () => unknown) { this.failures.add(listener); return () => { this.failures.delete(listener) } }

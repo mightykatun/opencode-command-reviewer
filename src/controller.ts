@@ -3,6 +3,7 @@ import type { ReviewProgress, ReviewResult, ReviewTiming } from "./types.js"
 import type { Config } from "./config.js"
 import type { ApprovalTransport } from "./approval.js"
 import { isDeepStrictEqual } from "node:util"
+import { randomUUID } from "node:crypto"
 import { withDeadline } from "./reviewer.js"
 import { candidateEnabled, type ReviewOptions } from "./classification.js"
 import type { SessionModeGate } from "./session-mode.js"
@@ -22,13 +23,16 @@ export interface View {
   approvalPendingConfirmed?: boolean
 }
 
-type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void, onProgress: (progress: ReviewProgress) => void) => Promise<ReviewResult | null>
+type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void, onProgress: (progress: ReviewProgress) => void,
+  execution?: { review: string; root?: string }) => Promise<ReviewResult | null>
 interface Entry {
   view: View; abort: AbortController; root?: string; gateRevision: number
   suspension?: "mode" | "unavailable"
   cancelTimer?: () => void; deadline?: number; approvalAbort?: AbortController
   attempt: number; progressGeneration: number; pendingProgress?: ReviewProgress; cancelProgress?: () => void
   startedAt?: number; ratingAt?: number
+  review: string
+  approvalDispatched?: boolean
 }
 
 export interface ApprovalClock {
@@ -46,8 +50,14 @@ export interface Approval extends ApprovalTransport {
   visibleID(): string | undefined
 }
 
-export type ApprovalFact = { type: "dispatched" | "confirmed" | "settled"; request: PermissionRequest; automatic: boolean }
+export type ApprovalFact = { type: "dispatched" | "confirmed" | "settled"; request: PermissionRequest; automatic: boolean;
+  approval?: string; review?: string; result?: "not-sent" | "uncertain" }
 export type ApprovalObserver = (fact: ApprovalFact) => unknown
+export type ReviewLifecycleFact =
+  | { type: "accepted"; request: PermissionRequest; result: ReviewResult; timing: ReviewTiming; root?: string; review: string; completedAt: number }
+  | { type: "cancelled"; request: PermissionRequest; reason: "explicit" | "visibility" | "mode" }
+  | { type: "removed"; request: PermissionRequest; reason: "resolved" | "reconciled" | "deleted" | "disposed" }
+export type ReviewLifecycleObserver = (fact: ReviewLifecycleFact) => unknown
 
 /** Reviews remain advisory unless explicitly configured with a once-only writer. */
 export class Controller {
@@ -58,18 +68,22 @@ export class Controller {
   private modeChanges = new Map<string, number>()
   private manual = new Map<string, "cancelled" | "failed">()
   private workers = new Set<Promise<unknown>>()
-  private acknowledgements = new Map<AbortController, PermissionRequest>()
+  private acknowledgements = new Map<AbortController, { request: PermissionRequest; root?: string }>()
   private approvalWorkers = new Set<Promise<unknown>>()
   constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
     private options: Options = { reviewBash: true, reviewEdits: true },
     private approval?: Approval, private time: ApprovalClock = clock, private modes?: SessionModeGate,
-    private approvalObserver?: ApprovalObserver, private ratingObserver?: (safe: boolean, timing: ReviewTiming) => unknown) {}
+    private approvalObserver?: ApprovalObserver, private ratingObserver?: (safe: boolean, timing: ReviewTiming) => unknown,
+    private lifecycleObserver?: ReviewLifecycleObserver) {}
   get revision() { return this.version }
   get views() { return [...this.entries.values()].map((entry) => entry.view) }
   private publish() { if (!this.stopped) this.changed(this.views) }
   private approvalFact(fact: ApprovalFact) {
     if (this.stopped) return
     try { void Promise.resolve(this.approvalObserver?.(fact)).catch(() => {}) } catch {}
+  }
+  private lifecycleFact(fact: ReviewLifecycleFact) {
+    try { void Promise.resolve(this.lifecycleObserver?.(fact)).catch(() => {}) } catch {}
   }
 
   /** Local state is already switched; invalidate snapshots before any publication. */
@@ -83,6 +97,8 @@ export class Controller {
   private suspend(entry: Entry, reason: "mode" | "unavailable" = "mode") {
     const id = entry.view.request.id
     const state = entry.view.autoApproval?.status
+    if (state === "countdown" || state === "checking" || (state === "allowing" && !entry.approvalDispatched))
+      this.lifecycleFact({ type: "cancelled", request: entry.view.request, reason: "mode" })
     if (state) this.manual.set(id, state === "failed" || state === "allowing" ? "failed" : "cancelled")
     entry.cancelTimer?.()
     this.clearProgress(entry)
@@ -98,7 +114,7 @@ export class Controller {
     if (id !== this.visibleID) {
       const old = this.visibleID
       this.visibleID = id
-      if (old) this.cancelAutoApproval(old)
+      if (old) this.cancelAutoApproval(old, "visibility")
     }
     const entry = id ? this.entries.get(id) : undefined
     if (!entry || entry.view.autoApproval || !this.eligible(entry)) return
@@ -112,9 +128,10 @@ export class Controller {
     this.schedule(entry)
   }
 
-  cancelAutoApproval(id: string) {
+  cancelAutoApproval(id: string, reason: "explicit" | "visibility" = "explicit") {
     const entry = this.entries.get(id)
     if (!entry || !["countdown", "checking"].includes(entry.view.autoApproval?.status ?? "")) return
+    this.lifecycleFact({ type: "cancelled", request: entry.view.request, reason })
     entry.cancelTimer?.()
     entry.cancelTimer = undefined
     entry.approvalAbort?.abort()
@@ -195,7 +212,7 @@ export class Controller {
     entry.cancelTimer = this.time.after(Math.min(1000, remaining), () => {
       entry.cancelTimer = undefined
       if (!this.active(entry) || entry.view.autoApproval?.status !== "countdown") return
-      if (!this.eligible(entry)) { this.cancelAutoApproval(entry.view.request.id); return }
+      if (!this.eligible(entry)) { this.cancelAutoApproval(entry.view.request.id, "visibility"); return }
       const seconds = Math.min(this.options.autoApproveDelaySeconds ?? 15,
         Math.max(0, Math.ceil((entry.deadline! - this.time.now()) / 1000)))
       if (seconds === 0) { void this.approveNow(entry.view.request.id, true); return }
@@ -210,30 +227,36 @@ export class Controller {
   async approveNow(id: string, automatic = false) {
     const entry = this.entries.get(id)
     if (!entry || entry.view.autoApproval?.status !== "countdown" || !this.approval) return
-    if (!this.eligible(entry)) { this.cancelAutoApproval(id); return }
+    if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
     entry.cancelTimer?.()
     entry.cancelTimer = undefined
     entry.approvalAbort = new AbortController()
     entry.view = { ...entry.view, autoApproval: { status: "checking" } }
     this.publish()
     let dispatched = false
+    let confirmed = false
+    const approvalID = randomUUID()
+    const fact = (type: ApprovalFact["type"]) => this.approvalFact({ type, request: entry.view.request, automatic,
+      approval: approvalID, review: entry.review,
+      ...(type === "settled" && !confirmed ? { result: dispatched ? "uncertain" as const : "not-sent" as const } : {}) })
     try {
       await withDeadline(AbortSignal.any([entry.abort.signal, entry.approvalAbort.signal]), 5000, async (signal) => {
         const revision = this.version
         const pending = await this.approval!.list(signal)
         signal.throwIfAborted()
-        if (!this.eligible(entry)) { this.cancelAutoApproval(id); return }
+        if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
         if (revision !== this.version) throw new Error("Pending permissions changed during verification")
         const current = pending.find((request) => request.id === id)
-        if (!current) { this.replied(id); return }
+        if (!current) { this.replied(id, true, "reconciled"); return }
         if (!isDeepStrictEqual(current, entry.view.request)) throw new Error("Pending request changed")
         this.reconcile(pending, revision)
-        if (!this.eligible(entry)) { this.cancelAutoApproval(id); return }
+        if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
         entry.view = { ...entry.view, autoApproval: { status: "allowing" } }
         this.publish()
         // Publishing can synchronously trigger native resolution or visibility loss.
         signal.throwIfAborted()
         if (!this.eligible(entry)) {
+          this.lifecycleFact({ type: "cancelled", request: entry.view.request, reason: "visibility" })
           this.manual.set(id, "cancelled")
           entry.view = { ...entry.view, autoApproval: { status: "cancelled" } }
           this.publish()
@@ -241,11 +264,12 @@ export class Controller {
         }
         this.manual.set(id, "failed") // A dispatched write must never be tried again after a mode switch.
         const remaining = remainingTime(signal)
-        this.approvalFact({ type: "dispatched", request: entry.view.request, automatic })
+        fact("dispatched")
         signal.throwIfAborted()
         dispatched = true
+        entry.approvalDispatched = true
         const acknowledgement = new AbortController()
-        this.acknowledgements.set(acknowledgement, entry.view.request)
+        this.acknowledgements.set(acknowledgement, { request: entry.view.request, root: entry.root })
         const abort = () => { if (signal.reason !== permissionResolved) acknowledgement.abort(signal.reason) }
         signal.addEventListener("abort", abort, { once: true })
         if (signal.aborted) abort()
@@ -255,11 +279,11 @@ export class Controller {
         const write = withDeadline(acknowledgement.signal, remaining, async (bounded) => {
           try {
             await this.approval!.once(entry.view.request, bounded)
-            if (!bounded.aborted) this.approvalFact({ type: "confirmed", request: entry.view.request, automatic })
+            if (!bounded.aborted) { confirmed = true; fact("confirmed") }
           } finally {
             this.acknowledgements.delete(acknowledgement)
             signal.removeEventListener("abort", abort)
-            this.approvalFact({ type: "settled", request: entry.view.request, automatic })
+            fact("settled")
           }
         })
         this.approvalWorkers.add(write)
@@ -280,7 +304,7 @@ export class Controller {
         const pending = await withDeadline(entry.abort.signal, 5000, (signal) => this.approval!.list(signal))
         this.reconcile(pending, revision)
       } catch { /* Periodic read-only reconciliation remains active. */ }
-    } finally { if (!dispatched) this.approvalFact({ type: "settled", request: entry.view.request, automatic }) }
+    } finally { if (!dispatched) fact("settled") }
   }
 
   asked(request: PermissionRequest) {
@@ -289,6 +313,7 @@ export class Controller {
     const enabled = candidateEnabled(request, this.options)
     const entry: Entry = {
       abort: new AbortController(),
+      review: randomUUID(),
       attempt: -1, progressGeneration: 0,
       gateRevision: this.version,
       view: {
@@ -324,7 +349,7 @@ export class Controller {
         if (active() && (entry.view.status === "identifying" || entry.view.status === "analyzing")) {
           entry.view = { ...entry.view, status: "analyzing" }; this.publish()
         }
-      }, (progress) => this.progress(entry, progress))
+      }, (progress) => this.progress(entry, progress), { review: entry.review, root: entry.root })
     }).then((assessment) => {
       this.clearProgress(entry)
       if (active()) {
@@ -336,6 +361,8 @@ export class Controller {
           try {
             const fullReportMs = Math.max(0, this.time.now() - entry.startedAt!)
             const ratingMs = entry.ratingAt === undefined ? fullReportMs : Math.max(0, entry.ratingAt - entry.startedAt!)
+            this.lifecycleFact({ type: "accepted", request, result: assessment, timing: { fullReportMs, ratingMs },
+              root: entry.root, review: entry.review, completedAt: Date.now() })
             void Promise.resolve(this.ratingObserver?.(assessment.safe, { fullReportMs, ratingMs })).catch(() => {})
           } catch {}
         }
@@ -352,12 +379,13 @@ export class Controller {
     void worker.finally(() => this.workers.delete(worker))
   }
 
-  replied(id: string, resolved = true) {
+  replied(id: string, resolved = true, reason: "resolved" | "reconciled" = "resolved") {
     if (this.stopped) return
     // Increment even for an unknown ID: an in-flight snapshot may still contain it.
     this.version++
     this.entries.get(id)?.cancelTimer?.()
     const entry = this.entries.get(id)
+    if (entry) this.lifecycleFact({ type: "removed", request: entry.view.request, reason: resolved ? reason : "deleted" })
     if (entry) this.clearProgress(entry)
     this.entries.get(id)?.abort.abort(resolved ? permissionResolved : undefined)
     this.manual.delete(id)
@@ -368,15 +396,16 @@ export class Controller {
     if (this.stopped) return
     // A startup snapshot may contain requests for a session not yet tracked here.
     this.version++
-    for (const [abort, request] of this.acknowledgements) if (request.sessionID === sessionID) abort.abort()
-    for (const entry of this.entries.values()) if (entry.view.request.sessionID === sessionID) this.replied(entry.view.request.id, false)
+    for (const [abort, value] of this.acknowledgements)
+      if (value.request.sessionID === sessionID || value.root === sessionID) abort.abort()
+    for (const entry of this.entries.values()) if (entry.view.request.sessionID === sessionID || entry.root === sessionID) this.replied(entry.view.request.id, false)
   }
 
   /** Reject stale HTTP snapshots if permission events arrived during the request. */
   reconcile(requests: readonly PermissionRequest[], revision: number) {
     if (this.stopped || this.version !== revision) return
     const ids = new Set(requests.map((request) => request.id))
-    for (const id of this.entries.keys()) if (!ids.has(id)) this.replied(id)
+    for (const id of this.entries.keys()) if (!ids.has(id)) this.replied(id, true, "reconciled")
     for (const request of requests) {
       const entry = this.entries.get(request.id)
       if (entry?.view.autoApproval?.status === "failed" && !entry.view.approvalPendingConfirmed) {
@@ -396,7 +425,10 @@ export class Controller {
   async dispose() {
     this.stopped = true
     for (const abort of this.acknowledgements.keys()) abort.abort()
-    for (const entry of this.entries.values()) { entry.cancelTimer?.(); this.clearProgress(entry); entry.abort.abort() }
+    for (const entry of this.entries.values()) {
+      this.lifecycleFact({ type: "removed", request: entry.view.request, reason: "disposed" })
+      entry.cancelTimer?.(); this.clearProgress(entry); entry.abort.abort()
+    }
     this.entries.clear()
     await Promise.allSettled([...this.workers])
     await Promise.allSettled([...this.approvalWorkers])

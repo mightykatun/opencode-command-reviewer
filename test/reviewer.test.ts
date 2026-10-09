@@ -8,7 +8,19 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { parseConfig } from "../src/config.js"
-import { parseAssessment, review, withDeadline } from "../src/reviewer.js"
+import { parseAssessment, review as reviewWithMetadata, withDeadline } from "../src/reviewer.js"
+
+// Existing transport assertions stay exact for assessment/usage. Historical
+// metadata has its own assertions here and detailed correlation tests separately.
+async function review(...args: Parameters<typeof reviewWithMetadata>) {
+  const { metadata, ...result } = await reviewWithMetadata(...args)
+  assert.ok(metadata)
+  assert.match(metadata.review, /^[0-9a-f-]{36}$/)
+  assert.equal(metadata.kind, args[0].kind)
+  assert.equal(metadata.configuredModel, args[1].model)
+  assert.equal(metadata.provider, args[1].baseURL)
+  return result
+}
 import { BUILTIN_PROMPTS, CONTRACT, CORRECTION, loadPrompts } from "../src/prompts.js"
 import { collectEditEvidence } from "../src/evidence.js"
 import type { Evidence, ReviewEvidence, ReviewProgress } from "../src/types.js"

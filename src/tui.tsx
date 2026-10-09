@@ -14,6 +14,7 @@ import { reviewSyntaxStyles, scannerFrame, SCANNER_FRAME_COUNT, SCANNER_INTERVAL
 import { modelPricing, usageText } from "./usage.js"
 import { lifetimeTracker } from "./lifetime-view.js"
 import path from "node:path"
+import { randomUUID } from "node:crypto"
 import { SessionModes, SessionModeStore } from "./session-mode.js"
 import { sessionModeCommands } from "./session-mode-commands.js"
 import { DiagnosticTrace, measured, type DiagnosticObserver } from "./diagnostics.js"
@@ -25,6 +26,8 @@ import { LinuxNotifications } from "./notification-linux.js"
 import type { NotificationConfig } from "./notification-config.js"
 import type { NotificationProcesses } from "./notification-process.js"
 import { uiText } from "./ui-text.js"
+import { HistoryStore } from "./history-store.js"
+import { HistoryCoordinator, drainHistory } from "./history-coordinator.js"
 export type { DiagnosticEvent, DiagnosticObserver } from "./diagnostics.js"
 
 function ReviewLoading(props: { api: TuiPluginApi; retrying: boolean }) {
@@ -185,6 +188,8 @@ export interface HistoryRenderProbe {
 
 async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], fileIO?: FileIO, observer?: DiagnosticObserver,
   notificationBackend?: NotificationBackendFactory, historyProbe?: HistoryRenderProbe) {
+  let lifecycleAbortAt: number | undefined
+  api.lifecycle.signal.addEventListener("abort", () => { lifecycleAbortAt = performance.now() }, { once: true })
   let config: Config | undefined
   let reviewOptions: Config | undefined
   let prompts = BUILTIN_PROMPTS
@@ -207,6 +212,8 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const reader = contextReader(api, hostTrace)
   const modes = new SessionModes(new SessionModeStore(path.join(api.state.path.state, "opencode-reviewer", "session-mode-v1"),
     api.state.path.directory), async (id, signal) => api.state.session.get(id) ?? reader.session(id, signal))
+  const historyStore = new HistoryStore(api.state.path.state)
+  const history = new HistoryCoordinator(api.state.path.directory, historyStore, (id, signal) => modes.root(id, signal))
   let notifications: NotificationHost | undefined
   if (notificationConfig?.notify) {
     try {
@@ -220,7 +227,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const files = new FileAccess(fileIO)
   const approval = approvalTransport(api.client, api.state.path.directory)
   let visibleApproval: () => string | undefined = () => undefined
-  const controller: Controller = new Controller(async (request, parent, onIdentified, onProgress) => {
+  const controller: Controller = new Controller(async (request, parent, onIdentified, onProgress, execution = { review: randomUUID() }) => {
     const trace = observer ? new DiagnosticTrace(observer, ++reviewSequence) : undefined
     if (trace) traces!.set(request, trace)
     const reviewReader = trace ? contextReader(api, trace) : reader
@@ -231,7 +238,8 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
         if (!evidence) return null
         signal.throwIfAborted()
         const result = review(evidence, config!, signal, undefined, undefined, prompts,
-          (model) => modelPricing(api.state.provider, config!.baseURL, model), lifetime.record, onProgress, trace?.forward, lifetime.recordRetry)
+          (model) => modelPricing(api.state.provider, config!.baseURL, model), lifetime.record, onProgress, trace?.forward, lifetime.recordRetry,
+          history.observation(request, evidence.kind, config!, execution))
         worker = result
         return result
       })
@@ -256,13 +264,25 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
     },
     once: (request, signal) => measured(traces?.get(request), "approval-reply", () => approval.once(request, signal)),
   } : approval), visibleID: () => visibleApproval() }, undefined, modes, fact => {
+    history.approval(fact)
     if (fact.type === "confirmed" && fact.automatic) lifetime.recordAutoApproval()
     notifications?.fact(fact)
-  }, lifetime.recordRating)
+  }, lifetime.recordRating, history.lifecycle)
 
   api.event.on("permission.asked", (event) => controller.asked(event.properties))
-  api.event.on("permission.replied", (event) => controller.replied(event.properties.requestID))
-  api.event.on("session.deleted", (event) => { modes.deleted(event.properties.info.id); controller.deleted(event.properties.info.id) })
+  api.event.on("permission.replied", (event) => {
+    history.reply(event.properties)
+    controller.replied(event.properties.requestID)
+  })
+  api.event.on("message.updated", (event) => history.message(event.properties.info))
+  api.event.on("session.deleted", (event) => {
+    const info = event.properties.info
+    // Start ancestry before invalidating its cache. The public deletion event
+    // identifies roots directly; known child ancestry retains the normal bound.
+    const deletion = history.sessionDeleted(info)
+    controller.deleted(info.id)
+    void deletion.catch(() => {}).finally(() => modes.deleted(info.id))
+  })
 
   // Startup recovery and bounded reconciliation cover attachment to an existing
   // request and cancellation paths that do not emit permission.replied.
@@ -274,17 +294,26 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const interval = setInterval(() => void refresh(), 2000)
   api.event.on("session.idle", () => void refresh())
   api.event.on("session.error", () => void refresh())
-  api.lifecycle.onDispose(async () => {
+  let cleanup: Promise<void> | undefined
+  const stop = () => cleanup ??= (async () => {
+    const abortAt = lifecycleAbortAt ?? performance.now()
+    history.dispose()
     const notificationCleanup = notifications?.dispose()
     pendingRefresh.dispose()
     clearInterval(interval)
-    setSidebar(undefined)
     unregisterMode()
     const reviewCleanup = controller.dispose()
-    await Promise.allSettled([reviewCleanup, notificationCleanup])
-    await modes.flush().catch(() => {})
-    await lifetime.flush()
-  })
+    setSidebar(undefined)
+    const legacy = Promise.allSettled([notificationCleanup, modes.flush(), reviewCleanup.then(() => lifetime.flush())])
+    const storage = drainHistory(historyStore, reviewCleanup, abortAt)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    await Promise.all([storage, Promise.race([legacy, new Promise(resolve => {
+      timer = setTimeout(resolve, Math.max(0, abortAt + 3500 - performance.now()))
+    })])])
+    clearTimeout(timer)
+  })()
+  api.lifecycle.signal.addEventListener("abort", () => { void stop() }, { once: true })
+  api.lifecycle.onDispose(stop)
 
   api.slots.register({
     slots: {

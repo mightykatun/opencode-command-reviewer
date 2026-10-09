@@ -9,6 +9,9 @@ export type PricingLookup = (model: string) => Pricing | undefined
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
 const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0
 const rate = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0
+/** Bounded historical metadata, independent of assessment validation and pricing. */
+export const reportedModel = (value: unknown): string | undefined => typeof value === "string" && value.trim()
+  && !value.includes("\0") && Buffer.byteLength(value) <= 4096 ? value : undefined
 const endpoint = (value: unknown) => {
   if (typeof value !== "string") return
   try { return new URL(value).href.replace(/\/+$/, "") } catch { return }
@@ -68,14 +71,18 @@ export function usageAttempt(baseURL: string, requestedModel: string, pricing?: 
   const reportedCost = endpoint(baseURL) === "https://openrouter.ai/api/v1"
   let usage: Usage | undefined
   let finalized = false
+  let model: string | undefined
   const current = () => usage ? { ...usage } : undefined
   return {
     observe(envelope: unknown): void {
       if (finalized) return
+      const body = record(envelope)
+      if (body.model !== undefined) model = reportedModel(body.model)
       const next = responseUsage(envelope, requestedModel, pricing, baseURL)
       if (next) usage = reportedCost ? { ...usage, ...next } : next
     },
     current,
+    model: () => model,
     finalize(): Usage | undefined {
       if (!finalized) {
         finalized = true
