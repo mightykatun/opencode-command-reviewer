@@ -37,13 +37,14 @@ async function fixture(t: TestContext) {
   let command!: { run: () => void }
   const api = {
     lifecycle: { signal: parent.signal, onDispose: (run: () => void) => { disposers.push(run) } },
+    state: { path: { directory: "/project" } }, route: { current: { name: "home" } },
     keymap: { registerLayer: (layer: { commands: { run: () => void }[] }) => {
       command = layer.commands[0]!; return () => { unregistered++ }
     } },
     // Do not evaluate JSX: a refresh must never replace a dismissed host dialog.
     ui: { dialog: { replace: () => { replacements++; open = true } } },
   } as unknown as TuiPluginApi
-  const tracker = lifetimeTracker(api, store)
+  const tracker = lifetimeTracker(api, store, async () => "root")
   const dispose = () => { parent.abort(); for (const run of disposers.splice(0)) run() }
   const finish = (index: number, value = totals(index + 1)) => {
     calls[index]!.value.resolve({ revision: index, totals: value }); calls[index]!.cleanup.resolve()

@@ -29,7 +29,8 @@ export type HistoryEvent =
 export interface HistoryOperation { writer: string; sequence: number; event: HistoryEvent }
 export interface HistoryOrder { completed: number; tie: string; id: string }
 export type HistoryQuery =
-  | { type: "totals" }
+  | { type: "totals"; conversation?: { scope: string; root: string } }
+  | { type: "conversationTotals"; scope: string; root: string }
   | { type: "history"; scope: string; root: string; entry?: string; direction?: "older" | "newer"; order?: HistoryOrder }
   | { type: "sessions"; scope: string; after?: string; limit?: number }
   | { type: "resolution"; scope: string; root: string; session: string; permission: string }
@@ -127,9 +128,17 @@ export function decodeEvent(text: string): HistoryEvent {
   try { return validateEvent(JSON.parse(text)) } catch { throw new HistoryInvalid("Invalid history event") }
 }
 export function validateQuery(q: HistoryQuery): void {
-  requireValue(q && ["totals", "history", "sessions", "resolution", "session"].includes(q.type))
-  if (q.type === "totals") { object(q, ["type"]); return }
+  requireValue(q && ["totals", "conversationTotals", "history", "sessions", "resolution", "session"].includes(q.type))
+  if (q.type === "totals") {
+    object(q, ["type", "conversation"])
+    if (q.conversation !== undefined) {
+      object(q.conversation, ["scope", "root"]); text(q.conversation.scope); text(q.conversation.root)
+      requireValue(path.isAbsolute(q.conversation.scope))
+    }
+    return
+  }
   text(q.scope); requireValue(path.isAbsolute(q.scope))
+  if (q.type === "conversationTotals") { object(q, ["type", "scope", "root"]); text(q.root); return }
   if (q.type === "session") { object(q, ["type", "scope", "session"]); text(q.session); return }
   if (q.type === "resolution") {
     object(q, ["type", "scope", "root", "session", "permission"])

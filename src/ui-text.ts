@@ -32,7 +32,7 @@ export const uiText = {
     category: "Reviewer",
     enable: "Reviewer: Enable for conversation",
     disable: "Reviewer: Disable for conversation",
-    lifetime: "Reviewer: Lifetime usage",
+    lifetime: "Reviewer: Statistics",
   },
   sessionMode: {
     saved: (enabled: boolean) => enabled
@@ -56,7 +56,14 @@ export const uiText = {
     cost: (amount: string) => `cost: $${amount}`,
   },
   lifetime: {
-    title: "Reviewer lifetime usage",
+    title: "Reviewer statistics",
+    close: "Close",
+    scopeTab: (scope: "conversation" | "lifetime", active: boolean) => `${active ? "[" : ""}${scope === "conversation" ? "Conversation" : "Lifetime"}${active ? "]" : ""}`,
+    switchScope: "Tab: switch view",
+    noConversation: "Select a conversation to see its statistics.",
+    conversationUnavailable: "Conversation statistics unavailable. Recorded totals have not been reset.",
+    partialConversation: "Partial history: retained records and new activity. Earlier deleted or unrecorded usage is unavailable.",
+    recordedCoverage: "Recorded Reviewer activity only. Usage before history tracking is unavailable.",
     loading: "Loading recorded usage…",
     unavailable: "Lifetime usage unavailable. Recorded totals have not been reset.",
     inlineUnavailable: "lifetime: usage unavailable",

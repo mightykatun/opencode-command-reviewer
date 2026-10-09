@@ -19,7 +19,7 @@ export class HistoryRefresh {
     this.offCommit = store.onCommit(() => this.refresh())
     // A write outage does not hide readable history. Analytics retains its unavailable policy.
     this.offFailure = store.onWriteFailure(() => {
-      if (this.query.type !== "totals" || this.stopped) return
+      if ((this.query.type !== "totals" && this.query.type !== "conversationTotals") || this.stopped) return
       this.revision++; this.again = false; this.publish(undefined)
     })
     // A healthy read taking over two seconds must still be publishable.

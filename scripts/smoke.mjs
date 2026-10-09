@@ -979,10 +979,10 @@ try {
       const showLifetime = async () => {
         tmux("send-keys", "-t", "smoke", "C-p")
         await until((s) => s.includes("Commands"), 10000)
-        tmux("send-keys", "-t", "smoke", "-l", "Reviewer: Lifetime usage")
-        await until((s) => (s.match(/Reviewer: Lifetime usage/g) ?? []).length >= 2, 10000)
+        tmux("send-keys", "-t", "smoke", "-l", "Reviewer: Statistics")
+        await until((s) => (s.match(/Reviewer: Statistics/g) ?? []).length >= 2, 10000)
         tmux("send-keys", "-t", "smoke", "Enter")
-        await until((s) => s.includes("Reviewer lifetime usage") && s.includes("Reviews: 1") && s.includes("Average time to rating:"), 10000)
+        await until((s) => s.includes("Reviewer statistics") && s.includes("Reviews: 1") && s.includes("Average time to rating:"), 10000)
         assert.match(screen, /Cost: \$0\.0011/)
         assert.match(screen, /Tokens: 1000 in 40 out/)
         assert.match(screen, /Retries: 1/)

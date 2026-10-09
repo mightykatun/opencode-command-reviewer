@@ -417,8 +417,8 @@ try {
   await validateDiagnostics()
   if (process.argv.includes("--stats")) {
     assert.ok(["complete", "retry", "truncated", "nonstream"].includes(scenario), "stats fixture requires a completed automatic review")
-    await palette("Reviewer: Lifetime usage")
-    await until(s => s.includes("Reviewer lifetime usage") && s.includes("Auto-approved: 1 (100.0%)"))
+    await palette("Reviewer: Statistics")
+    await until(s => s.includes("Reviewer statistics") && s.includes("Auto-approved: 1 (100.0%)"))
     assert.match(screen, /Reviews: 1/)
     assert.match(screen, /Safe: 1 \(100\.0%\)/)
     assert.ok(screen.includes(`Retries: ${reviews.length - 1}`))

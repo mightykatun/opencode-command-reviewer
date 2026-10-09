@@ -202,7 +202,6 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   } catch (error) { configError = error instanceof Error ? error.message : uiText.review.invalidConfiguration }
   api.lifecycle.signal.throwIfAborted()
   const historyStore = new HistoryStore(api.state.path.state)
-  const lifetime = lifetimeTracker(api, historyStore)
   const [views, setViews] = createSignal<View[]>([])
   const [sidebar, setSidebar] = createSignal<{ sessionID: string; token: symbol }>()
   const hostTrace = observer ? new DiagnosticTrace(observer, 0) : undefined
@@ -212,6 +211,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const modes = new SessionModes(new SessionModeStore(path.join(api.state.path.state, "opencode-reviewer", "session-mode-v1"),
     api.state.path.directory), async (id, signal) => api.state.session.get(id) ?? reader.session(id, signal))
   const history = new HistoryCoordinator(api.state.path.directory, historyStore, (id, signal) => modes.root(id, signal))
+  const lifetime = lifetimeTracker(api, historyStore, (id, signal) => history.root(id, signal))
   const [historyState, setHistoryState] = createSignal<HistoryViewState>({ open: false, status: "loading", reset: 0 })
   const browser = new HistoryController(api.state.path.directory, historyStore, (id, signal) => history.root(id, signal), setHistoryState)
   const maintenance = new HistoryMaintenance(api.state.path.directory, historyStore,

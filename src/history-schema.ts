@@ -1,6 +1,7 @@
 import { add, empty, validate } from "./lifetime.js"
 import type { LifetimeTotals } from "./lifetime.js"
-import { count, decodeEvent, entryID, HistoryInvalid, opaque, reviewID, rootID, sessionID, validatePayload, validateQuery, validateReview, validateScope } from "./history-records.js"
+import { count, decodeEvent, entryID, HistoryInvalid, opaque, reviewID, rootID, sessionID, validateEvent, validatePayload, validateQuery, validateReview, validateScope } from "./history-records.js"
+import { historyDelta } from "./history-statistics.js"
 import type { HistoryEvent, HistoryOutcome, HistoryPayload, HistoryQuery, HistoryReview, HistoryScope, HistoryOrder } from "./history-records.js"
 
 type Row = Record<string, any>
@@ -17,11 +18,13 @@ export interface HistorySelection {
   deleted?: boolean
   session?: string
 }
-export interface HistoryTotals { revision: number; totals: LifetimeTotals }
+export interface ConversationTotals { totals: LifetimeTotals; partialHistory: boolean }
+export interface HistoryTotals { revision: number; totals: LifetimeTotals; conversation?: ConversationTotals }
+export interface HistoryConversationTotals extends HistoryTotals { partialHistory: boolean }
 export interface HistorySessions { sessions: { scope: string; root: string; session: string }[]; after?: string }
 export interface HistoryResolution { outcome?: HistoryOutcome; uncertain: boolean; conflict: boolean; deleted: boolean }
 export interface HistorySession { context?: HistoryScope }
-export type HistoryResult = HistorySelection | HistoryTotals | HistorySessions | HistoryResolution | HistorySession
+export type HistoryResult = HistorySelection | HistoryTotals | HistoryConversationTotals | HistorySessions | HistoryResolution | HistorySession
 
 const schema = `
 CREATE TABLE meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, revision INTEGER NOT NULL, totals TEXT NOT NULL);
@@ -67,6 +70,10 @@ export class HistorySQL {
         CREATE INDEX IF NOT EXISTS approvals_root ON approvals(root);
         CREATE INDEX IF NOT EXISTS approvals_session ON approvals(session);
         CREATE INDEX IF NOT EXISTS history_root ON history(root);`)
+      db.exec(`CREATE TABLE IF NOT EXISTS conversation_totals (id TEXT PRIMARY KEY, totals TEXT NOT NULL, partial INTEGER NOT NULL CHECK(partial IN (0,1)));
+        CREATE INDEX IF NOT EXISTS reviews_root_id ON reviews(root,id);
+        CREATE INDEX IF NOT EXISTS attempts_review_id ON attempts(review,id);
+        CREATE INDEX IF NOT EXISTS approvals_review_id ON approvals(review,id);`)
     })
   }
   private statement(sql: string) {
@@ -104,16 +111,83 @@ export class HistorySQL {
       return { replay: false }
     })
   }
-  private contribute(key: string, delta: LifetimeTotals) {
+  /** Indexed, bounded-memory baseline of attributable v1 facts. Never reads
+   * report payloads or legacy aggregate snapshots, and never rebuilds lifetime.
+   * Deletions before this feature may have removed facts, hence partial coverage.
+   * Reads are pure; the next actual event materializes the baseline transactionally.
+   */
+  private conversation(root: string): { totals: LifetimeTotals; partialHistory: boolean } {
+    const saved = this.get("SELECT CASE WHEN length(CAST(totals AS BLOB))<=4096 THEN totals END AS totals,partial FROM conversation_totals WHERE id=?", root)
+    if (saved) {
+      if (saved.partial !== 0 && saved.partial !== 1) throw new HistoryInvalid("Invalid conversation coverage")
+      return { totals: this.parseTotals(saved.totals), partialHistory: saved.partial === 1 }
+    }
+    let totals = empty(), after = "", partialHistory = !!this.get("SELECT id FROM roots WHERE id=?", root)
+    const include = (event: HistoryEvent) => { validateEvent(event); totals = add(totals, historyDelta(event)) }
+    for (;;) {
+      const reviews = this.all(`SELECT id,CASE WHEN length(CAST(context AS BLOB))<=262144 THEN context END AS context,
+        CASE WHEN length(CAST(accepted AS BLOB))<=16384 THEN accepted END AS accepted,accepted IS NOT NULL AS hasAccepted
+        FROM reviews WHERE root=? AND id>? ORDER BY id LIMIT 100`, root, after)
+      if (!reviews.length) break
+      partialHistory = true
+      for (const row of reviews) {
+        const context = JSON.parse(row.context); validateReview(context)
+        if (rootID(context) !== root || reviewID(context) !== row.id) throw new HistoryInvalid("Invalid conversation ownership")
+        if (row.hasAccepted) {
+          const accepted = JSON.parse(row.accepted)
+          include({ type: "reviewAccepted", context, at: accepted?.completedAt, accepted })
+        }
+        for (const table of ["attempts", "approvals"] as const) {
+          let cursor = ""
+          for (;;) {
+            const rows = table === "attempts" ? this.all(`SELECT id,
+              CASE WHEN length(CAST(dispatched AS BLOB))<=16384 THEN dispatched END AS dispatched,
+              CASE WHEN length(CAST(finalized AS BLOB))<=16384 THEN finalized END AS finalized,
+              dispatched IS NOT NULL AS hasDispatched,finalized IS NOT NULL AS hasFinalized
+              FROM attempts WHERE review=? AND id>? ORDER BY id LIMIT 100`, row.id, cursor)
+              : this.all("SELECT id,root,session,at,state,automatic FROM approvals WHERE review=? AND id>? ORDER BY id LIMIT 100", row.id, cursor)
+            if (!rows.length) break
+            for (const fact of rows) {
+              if (table === "attempts") {
+                if (fact.hasDispatched) include({ ...JSON.parse(fact.dispatched), type: "attemptDispatched", context, attempt: fact.id })
+                if (fact.hasFinalized) include({ ...JSON.parse(fact.finalized), type: "attemptFinalized", context, attempt: fact.id })
+              } else {
+                if (fact.root !== root || fact.session !== sessionID(context) || ![-1, 0, 1].includes(fact.automatic)
+                  || !["pending", "uncertain", "not-sent", "confirmed"].includes(fact.state)) throw new HistoryInvalid("Invalid conversation approval")
+                if (fact.state === "confirmed") {
+                  if (fact.automatic === -1) throw new HistoryInvalid("Invalid conversation approval")
+                  include({ type: "approvalConfirmed", context, at: fact.at, approval: fact.id, automatic: fact.automatic === 1 })
+                }
+              }
+            }
+            cursor = rows.at(-1)!.id
+          }
+        }
+      }
+      after = reviews.at(-1)!.id
+    }
+    return { totals, partialHistory }
+  }
+  private ensureConversation(root: string) {
+    if (this.get("SELECT id FROM conversation_totals WHERE id=?", root)) return
+    const baseline = this.conversation(root)
+    this.run("INSERT INTO conversation_totals VALUES (?,?,?)", root, JSON.stringify(baseline.totals), Number(baseline.partialHistory))
+  }
+  private contribute(key: string, delta: LifetimeTotals, root: string) {
     if (this.get("SELECT id FROM contributions WHERE id=?", key)) return
     const meta = this.get("SELECT CASE WHEN length(CAST(totals AS BLOB))<=4096 THEN totals END AS totals,revision FROM meta WHERE id=1")!
     const totals = add(this.parseTotals(meta.totals), delta)
+    const conversation = add(this.conversation(root).totals, delta)
     if (!count(meta.revision + 1)) throw new HistoryInvalid("History revision overflow")
     this.run("INSERT INTO contributions VALUES (?)", key)
     if (JSON.stringify(totals) !== meta.totals) this.run("UPDATE meta SET totals=?,revision=revision+1 WHERE id=1", JSON.stringify(totals))
+    this.run("UPDATE conversation_totals SET totals=? WHERE id=?", JSON.stringify(conversation), root)
   }
   private event(e: HistoryEvent) {
     const c = e.context, root = rootID(c), session = sessionID(c)
+    // Capture retained old facts before mutations/deletion. Shared deduplication
+    // and one transaction keep future root/lifetime contributions exactly aligned.
+    this.ensureConversation(root)
     if (e.type === "sessionDeleted") {
       const owner = this.get("SELECT root FROM sessions WHERE id=?", session)
       if (owner && owner.root !== c.root) throw new HistoryInvalid("Conflicting session ownership")
@@ -144,8 +218,7 @@ export class HistorySQL {
       if (pendingOwner && (pendingOwner.root !== root || pendingOwner.session !== session)) throw new HistoryInvalid("Conflicting permission ownership")
       this.run("INSERT OR IGNORE INTO reviews VALUES (?,?,?,?,?,NULL)", review, entry, root, session, JSON.stringify(context))
     }
-    const delta = empty(), activity = delta.activity
-    activity.since = e.at
+    const delta = historyDelta(e)
     if (e.type === "attemptDispatched" || e.type === "attemptFinalized") {
       const attempt = opaque(review, e.attempt)
       if (!deleted) {
@@ -153,19 +226,10 @@ export class HistorySQL {
         if (e.type === "attemptDispatched") this.run("UPDATE attempts SET dispatched=COALESCE(dispatched,?) WHERE id=?", JSON.stringify({ at: e.at, retry: e.retry }), attempt)
         else this.run("UPDATE attempts SET finalized=COALESCE(finalized,?) WHERE id=?", JSON.stringify({ at: e.at, usage: e.usage, reportedModel: e.reportedModel }), attempt)
       }
-      if (e.type === "attemptDispatched") { if (e.retry !== "initial") activity.retries = 1; else activity.since = null }
-      else if (e.usage) {
-        delta.requests = activity.usageRequests = 1; delta.since = e.at
-        if (e.usage.input !== undefined) { delta.tokenRequests = 1; delta.input = e.usage.input; delta.output = e.usage.output! }
-        if (e.usage.cost !== undefined) { delta.priced = 1; delta.cost = e.usage.cost }
-      } else activity.since = null
-      this.contribute(opaque(e.type, attempt), delta)
+      this.contribute(opaque(e.type, attempt), delta, root)
     } else if (e.type === "reviewAccepted") {
       if (!deleted) this.run("UPDATE reviews SET accepted=COALESCE(accepted,?) WHERE id=?", JSON.stringify(e.accepted), review)
-      delta.safe = e.accepted.safe ? 1 : 0; delta.unsafe = e.accepted.safe ? 0 : 1; delta.ratingsSince = e.accepted.completedAt
-      activity.reviews = 1; activity.since = e.accepted.completedAt
-      if (e.accepted.timing) { activity.timedReviews = 1; activity.meanFullReportMs = e.accepted.timing.fullReportMs; activity.meanRatingMs = e.accepted.timing.ratingMs }
-      this.contribute(opaque(e.type, review), delta)
+      this.contribute(opaque(e.type, review), delta, root)
     } else if (e.type === "approvalConfirmed" || e.type === "approvalDispatched" || e.type === "approvalSettled") {
       const id = opaque(entry, e.approval)
       if (!deleted) {
@@ -182,8 +246,7 @@ export class HistorySQL {
         this.outcome(entry); this.revision(root)
       }
       if (e.type === "approvalConfirmed") {
-        if (e.automatic) activity.autoApproved = 1; else activity.since = null
-        this.contribute(opaque("approvalConfirmed", id), delta)
+        this.contribute(opaque("approvalConfirmed", id), delta, root)
       }
     } else if ((e.type === "permissionResolved" || e.type === "permissionOutcome") && !deleted) {
       const old = this.get("SELECT * FROM history WHERE id=?", entry)
@@ -220,7 +283,13 @@ export class HistorySQL {
       if (q.type === "totals") {
         const row = this.get("SELECT revision,CASE WHEN length(CAST(totals AS BLOB))<=4096 THEN totals END AS totals FROM meta WHERE id=1")!
         if (!count(row.revision)) throw new HistoryInvalid("Invalid aggregate revision")
-        return { revision: row.revision, totals: this.parseTotals(row.totals) }
+        return { revision: row.revision, totals: this.parseTotals(row.totals),
+          ...(q.conversation ? { conversation: this.conversation(rootID(q.conversation)) } : {}) }
+      }
+      if (q.type === "conversationTotals") {
+        const revision = this.get("SELECT revision FROM meta WHERE id=1")!.revision
+        if (!count(revision)) throw new HistoryInvalid("Invalid aggregate revision")
+        return { revision, ...this.conversation(rootID(q)) }
       }
       if (q.type === "sessions") {
         const rows = this.all(`SELECT CASE WHEN length(id)=64 THEN id END AS id,scope,

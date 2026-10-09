@@ -168,12 +168,17 @@ lost on shutdown or prolonged storage failure.
 ### Usage totals
 
 Token and cost totals appear below completed reports when available. Open
-Reviewer: Lifetime usage in the command palette for cumulative totals. OpenRouter
+**Reviewer: Statistics** in the command palette for **Lifetime** and **Conversation**
+views. Use Tab or click a scope to switch. The dialog opens on Lifetime;
+Conversation uses the session selected when opened, resolving its root and all
+descendants, including subagents, within the current host-directory scope.
+Opening from a descendant shows the same combined conversation totals.
+OpenRouter
 costs use reported charges; other endpoints use available catalog estimates.
 Received usage counts even if a review fails or is interrupted. Unreported charges
 are missing from the totals.
 
-The lifetime dialog shows completed reviews, retries, tokens, cost, Safe/Unsafe
+Both views show completed reviews, retries, tokens, cost, Safe/Unsafe
 percentages, confirmed auto-approvals, and average time to a rating and full report.
 Percentages use recorded completed reviews as their denominator. Each validated
 review counts once, even without usage data; a fresh review after re-enabling counts
@@ -182,11 +187,25 @@ corrections and transport recovery. Manual approvals are not auto-approvals.
 Timings run from evaluation start, including evidence and retries, to the accepted
 attempt's first rating and final validated response, excluding rendering/countdown
 time. Non-streaming reviews use the final response time for both measurements.
-Lifetime averages use running means and sample counts; stored review details also
-retain their individual timings. Totals persist across restarts and are shared
-across conversations and host directories using the same state directory.
-Deleting report history does not reduce lifetime totals. Averages include measured
-reviews only; unrecorded usage cannot be reconstructed.
+Averages use running means and sample counts; stored review details also retain
+their individual timings. Both scopes persist in the existing history database
+across restart/resume. Conversation totals keep independent roots separate;
+Lifetime combines activity across conversations and host directories using the
+same state directory. Browsing and switching views do not add usage.
+
+Older retained history can provide a **partial** conversation baseline. Previously
+deleted details and usage predating history tracking cannot be attributed or
+reconstructed from legacy lifetime aggregates. This limitation is labeled in the
+dialog. Once recorded in conversation totals, deleting report details does not
+reduce those totals or Lifetime. Storage failures show unavailable, not zero.
+
+Tokens describe received provider usage, not just the visible explanation. One
+report may sum several reviewer POSTs, including format corrections and transport
+retries with received usage. Each POST can resend the prompt and evidence;
+corrections also include the failed response and feedback. Cached input remains
+part of the provider's input-token count. Lifetime and Conversation also retain
+received usage from unsuccessful or interrupted reviews, which do not count as
+completed reviews. Averages include measured reviews only.
 
 Reviews send the pending request, latest user prompt, project context, and relevant
 file snapshots, diffs, or tool arguments to your endpoint before approval. Shell

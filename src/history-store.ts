@@ -167,7 +167,7 @@ export class HistoryStore {
       }
       if (this.stopped) return
       if (read) {
-        if (read.query.type === "totals" && this.writeFailed) throw new Error("History accounting unavailable")
+        if ((read.query.type === "totals" || read.query.type === "conversationTotals") && this.writeFailed) throw new Error("History accounting unavailable")
         const revision = this.dirtyRevision
         if (read.query.type === "history" && this.dirty) throw new Error("History reconciliation pending")
         const result = await worker.call({ type: "query", query: read.query })

@@ -726,6 +726,17 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   `lifetime.ts` retains pure validation, weighted aggregation and exact presentation
   helpers. Received-request, token/pricing coverage, accepted ratings and activity
   remain separate. No checkout or native session-accounting writes.
+- Conversation statistics use `conversation_totals`, keyed by the existing opaque
+  host-directory/root identity. `history-statistics.ts` supplies the same event delta
+  to lifetime and conversation aggregates inside the same deduplicated transaction.
+  Initialize a missing root accumulator before mutating/deleting its older facts.
+  Existing attributable v1 review/attempt/approval rows provide a partial baseline
+  through indexed 100-row pages; never infer counters from report payloads or legacy
+  usage snapshots. Earlier deleted details are unrecoverable. A baseline read is pure;
+  only an actual event materializes it. Once accumulated, root totals never decrease
+  on deletion. Lifetime is never reconstructed or corrected from detail rows.
+  Standalone `conversationTotals` queries and `totals` queries with a `conversation`
+  selector return consistent snapshots. Invalid/unreadable data remains unavailable.
 - Count ratings at controller acceptance of each completed, validated review,
   independently of received usage. Previews, transport/format attempts, errors,
   stale/aborted results and repeated display updates never count. A fresh accepted
@@ -742,6 +753,26 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   never just when a backoff is scheduled. Count only confirmed automatic approvals,
   independently of notification settings. Manual approvals and uncertain writes do
   not count. Metrics observers cannot affect review or approval.
+- `Reviewer: Statistics` retains the `opencode-reviewer.lifetime` command identity.
+  The dialog opens on Lifetime; Tab/click switches Conversation/Lifetime. Resolve
+  the session captured on open through `HistoryCoordinator.root`, without loading
+  review mode. Root and all descendants share scope. Home/unknown ancestry cannot
+  fabricate conversation totals. `StatisticsController` owns one `HistoryRefresh`
+  for both scopes (a combined totals read also feeds inline lifetime), generation
+  guards and one actual bounded ancestry lookup with latest-request coalescing.
+  Closing/reopening cannot resurrect dialogs or publish stale root data. The public
+  dialog stack supplies its frame; bindings use pinned host mode `modal`, plus the
+  dialog's public depth to avoid stealing keys from covering dialogs.
+- Run `npx tsx --test test/conversation-statistics.test.ts test/statistics-controller.test.ts test/lifetime*.test.ts`
+  and, after a build, `node scripts/smoke-statistics.mjs`. The fixture uses native
+  roots/children/deep descendants, both production SQL adapters, real Tab/click
+  controls, disabled review, restart/resume, shared updates and partial v1 coverage.
+  It checks unchanged model/permission activity and saves `.runtime/statistics/`.
+  `node scripts/audit-usage-history.mjs` separately replays provider responses against
+  the actual local v0.7.0 Git tag and current source, including cumulative frames,
+  correction POSTs, cache accounting, failed/interrupted usage, refresh and restart.
+  It needs the tag and is not part of shallow-checkout CI. All records are isolated
+  fixtures, not original user/provider billing data; results go in `.runtime/`.
 - Measure monotonic durations from evaluation start after the mode gate through
   evidence/retries to final controller acceptance and the accepted attempt's first
   parsed rating. Clear the rating timestamp on format/transport retry. Non-streaming
