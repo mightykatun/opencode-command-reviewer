@@ -80,6 +80,7 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 | `maxEvidenceBytes` | Evidence limit, 1–16,777,216 bytes. Whole files or diffs may be omitted; oversized mandatory arguments fail review. |
 | `instructions` | Absolute directory containing overrides for the [prompt templates](https://github.com/mightykatun/opencode-reviewer/tree/main/prompts). Missing templates use the built-ins. |
 
+My LLMs insist on writing a bunch of useless text to my README, so I collapsed them here in case anyone wants to inflict themselves (or more likely their agent) the pain of reading it.
 <details>
 <summary>Usage</summary>
 The sidebar shows Safe, Unsafe, or Analysis unavailable. Explanations support
