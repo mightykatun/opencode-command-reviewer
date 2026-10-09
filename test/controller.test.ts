@@ -593,6 +593,11 @@ test("disabled root and all descendants skip enrichment while independent roots 
   const controller = new CoreController(async (req) => { calls.push(req.id); return result }, () => {}, undefined, undefined, undefined, modes)
   for (const id of ["root", "child", "grandchild", "other"]) controller.asked(request(id, id))
   await tick()
+  // The two ancestry slots defer excess roots to ordinary fresh reconciliation.
+  // Capacity loss cannot bypass mode loading or turn a snapshot into enrichment.
+  assert.deepEqual(calls, [])
+  controller.reconcile(["root", "child", "grandchild", "other"].map(id => request(id, id)), controller.revision)
+  await tick()
   assert.deepEqual(calls, ["other"])
   assert.ok(controller.views.slice(0, 3).every((view) => view.status === "suspended"))
   const revision = controller.revision

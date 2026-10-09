@@ -11,6 +11,7 @@ import { encodeEvent } from "../src/history-records.js"
 import { HistoryStore, type HistoryTransport } from "../src/history-store.js"
 import { HistoryController } from "../src/history-controller.js"
 import { HistoryCoordinator } from "../src/history-coordinator.js"
+import { setImmediate as settle } from "node:timers/promises"
 
 const present = (id: string) => ({ response: { status: 200 }, data: { id } })
 const missing = (session = "root") => ({ response: { status: 404 }, error: { name: "NotFoundError", data: { message: `Session not found: ${session}` } } })
@@ -34,14 +35,16 @@ test("absence requires the pinned session.get HTTP status and exact NotFound env
 function fixture(t: any) {
   const dir = mkdtempSync(path.join(tmpdir(), "maintenance-")), file = path.join(dir, "history.sqlite")
   const sql = new HistorySQL(new DatabaseSync(file)), second = new HistorySQL(new DatabaseSync(file))
-  let sequence = 0, fail = false, revision = 0, dirty = false
+  let sequence = 0, fail = false, revision = 0, scanRevision = 0, dirty = false
   const events: HistoryEvent[] = []
   const apply = (event: HistoryEvent) => sql.apply("seed", ++sequence, encodeEvent(event))
   const store = {
     query: async (q: any) => second.query(q),
     admit: (event: HistoryEvent) => { events.push(event); if (fail) return false; apply(event); return true },
     get maintenanceRevision() { return revision },
-    markMaintenanceDirty: () => { revision++; dirty = true },
+    get maintenanceScanRevision() { return scanRevision },
+    get maintenancePending() { return false },
+    markMaintenanceDirty: (origin?: "cleanup") => { revision++; if (origin !== "cleanup") scanRevision++; dirty = true; return revision },
     maintenanceReconciled: (r = revision) => { if (r !== revision || fail) return false; dirty = false; return true },
   }
   t.after(() => { second.close(); sql.close(); rmSync(dir, { recursive: true, force: true }) })
@@ -95,7 +98,8 @@ test("saturated deletion retries via dirty revision, does not clear after an inc
   const f = fixture(t); f.apply(resolved()); f.fail(true); f.store.markMaintenanceDirty()
   const m = new HistoryMaintenance(context.scope, f.store, async () => missing())
   await m.step(); assert.equal(f.dirty(), true)
-  f.fail(false); await m.step(); await m.step()
+  f.fail(false)
+  for (let n = 0; n < 5; n++) await m.step()
   assert.equal(f.dirty(), false)
   assert.equal((f.second.query({ type: "history", scope: context.scope, root: "root" }) as any).deleted, true)
   m.dispose()
@@ -105,7 +109,8 @@ test("indexed pages stay <=100, one row per turn, scopes isolated, dirty revisio
   const f = fixture(t)
   for (let n = 0; n < 105; n++) f.apply(resolved({ ...context, session: "s" + n, permission: "p" + n, review: "r" + n }))
   const pages: any[] = [], calls: string[] = []
-  const store = { ...f.store, get maintenanceRevision() { return f.store.maintenanceRevision }, query: async (q: any) => {
+  const store = { ...f.store, get maintenanceRevision() { return f.store.maintenanceRevision },
+    get maintenanceScanRevision() { return f.store.maintenanceScanRevision }, query: async (q: any) => {
     pages.push(q); return f.store.query(q)
   } }
   const m = new HistoryMaintenance(context.scope, store, async id => { calls.push(id); return present(id) })
@@ -134,7 +139,8 @@ test("timed-out storage read retains settled ownership instead of spawning repla
   let release!: () => void, calls = 0
   const settled = new Promise<void>(resolve => { release = resolve })
   const store = { query: () => { calls++; return Object.assign(Promise.reject(Error("timeout")), { settled }) },
-    admit: () => true, maintenanceRevision: 0, maintenanceReconciled: () => true, markMaintenanceDirty: () => {} }
+    admit: () => true, maintenanceRevision: 0, maintenanceScanRevision: 0, maintenancePending: false,
+    maintenanceReconciled: () => true, markMaintenanceDirty: () => 0 }
   const m = new HistoryMaintenance("/project", store, async () => { throw Error("unexpected") })
   const first = m.step(); await Promise.resolve(); await m.step(); assert.equal(calls, 1)
   m.dispose(); release(); await first; await m.step(); assert.equal(calls, 1)
@@ -224,4 +230,76 @@ test("dirty gate suppresses already-dispatched history snapshots and open UI unt
   assert.equal(browser.state.status, "ready")
   assert.equal(browser.scroll, 17)
   assert.ok(browser.state.reset > reset)
+})
+
+test("production scheduler reconciles a surviving prefix and missing suffix across pages in linear work", async t => {
+  const f = fixture(t)
+  for (let n = 0; n < 110; n++) f.apply(resolved({ ...context, root: `root${n}`, session: `root${n}`, permission: `p${n}`, review: `r${n}` }))
+  const first = f.sql.query({ type: "sessions", scope: context.scope, limit: 100 }) as any
+  const last = f.sql.query({ type: "sessions", scope: context.scope, after: first.after }) as any
+  const absent = new Set<string>(last.sessions.map((c: any) => c.session))
+  let lookups = 0
+  const store = new HistoryStore("/state", { transport: () => ({ async call(m) {
+    if (m.type === "apply") return f.sql.apply(m.writer as string, m.sequence as number, m.event as string)
+    if (m.type === "query") return f.sql.query(m.query as any)
+    return {}
+  }, async terminate() {} }) })
+  const m = new HistoryMaintenance(context.scope, store, async id => { lookups++; return absent.has(id) ? missing(id) : present(id) })
+  t.after(async () => { m.dispose(); await store.dispose(performance.now() - 3500) })
+  store.markMaintenanceDirty()
+  let turns = 0
+  while (store.maintenanceDirty && turns < 230) { turns++; await m.step(); await settle() }
+  assert.equal(store.maintenanceDirty, false, `reconciliation still dirty after ${turns} turns and ${lookups} lookups`)
+  assert.ok(lookups <= 220, `linear bound exceeded: ${lookups}`)
+  t.diagnostic(`110 indexed roots, 10 absent: ${lookups} host lookups, ${turns} turns including final healthy pass`)
+  assert.equal(store.pendingOperations, 0)
+  assert.equal((f.sql.query({ type: "sessions", scope: context.scope }) as any).sessions.length, 100)
+})
+
+test("cleanup invalidates cached root descendants across pages and external changes restart the final pass", async t => {
+  const f = fixture(t)
+  for (let n = 0; n < 105; n++) f.apply(resolved({ ...context, session: `child${n}`, permission: `p${n}`, review: `r${n}` }))
+  f.apply(resolved({ ...context, root: "alive", session: "alive", permission: "alive", review: "alive" }))
+  let calls = 0
+  const m = new HistoryMaintenance(context.scope, f.store, async id => { calls++; return id === "root" ? missing(id) : present(id) })
+  t.after(() => m.dispose())
+  f.store.markMaintenanceDirty()
+  for (let n = 0; n < 4; n++) await m.step()
+  // An external event during/restarting confirmation must not be absorbed into cleanup's revision.
+  f.store.markMaintenanceDirty()
+  assert.equal(f.dirty(), true)
+  await m.step(); assert.equal(f.dirty(), true)
+  await m.step(); assert.equal(f.dirty(), false)
+  assert.ok(calls <= 6, `root cascade should invalidate every cached child: ${calls}`)
+  assert.equal(f.events.filter(e => e.type === "sessionDeleted").length, 1)
+  assert.equal((f.sql.query({ type: "sessions", scope: context.scope }) as any).sessions.length, 1)
+})
+
+test("queued cleanup and a transient commit failure cannot release the gate before durable cleanup and confirmation", async t => {
+  const f = fixture(t); f.apply(resolved())
+  let release!: () => void, fail = true, retry!: () => void, now = 0
+  const held = new Promise<void>(resolve => { release = resolve })
+  const store = new HistoryStore("/state", { now: () => now, schedule: cb => { retry = cb; return 1 as any }, cancel: () => {},
+    transport: () => ({ async call(m) {
+      if (m.type === "apply") {
+        await held
+        if (fail) throw Error("temporary outage")
+        return f.sql.apply(m.writer as string, m.sequence as number, m.event as string)
+      }
+      if (m.type === "query") return f.sql.query(m.query as any)
+      return {}
+    }, async terminate() {} }) })
+  const m = new HistoryMaintenance(context.scope, store, async id => missing(id))
+  t.after(async () => { m.dispose(); release(); await store.dispose(performance.now() - 3500) })
+  await m.step(); await settle()
+  assert.equal(store.maintenanceDirty, true); assert.equal(store.pendingOperations, 1)
+  release(); await settle()
+  await m.step() // End of cleanup pass, but the admitted deletion has failed.
+  for (let n = 0; n < 5; n++) await m.step()
+  assert.equal(store.maintenanceDirty, true)
+  assert.equal(store.pendingOperations, 1)
+  fail = false; now = 2000; retry(); await settle()
+  assert.equal(store.pendingOperations, 0); assert.equal(store.maintenanceDirty, true)
+  await m.step(); assert.equal(store.maintenanceDirty, true, "draining cleanup starts a fresh confirmation pass")
+  await m.step(); assert.equal(store.maintenanceDirty, false)
 })

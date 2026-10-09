@@ -487,3 +487,82 @@ test("newer root command defeats an older descendant lookup and pending persiste
   persistence.resolve()
   await disable
 })
+
+function ancestryFixture(t: import("node:test").TestContext) {
+  const calls: { id: string; signal: AbortSignal; value: ReturnType<typeof deferred<{ id: string; parentID?: string }>>;
+    cleanup: ReturnType<typeof deferred<void>> }[] = []
+  let active = 0, maximum = 0
+  const modes = new SessionModes(memory(), async (id, signal) => {
+    active++; maximum = Math.max(maximum, active)
+    const call = { id, signal, value: deferred<{ id: string; parentID?: string }>(), cleanup: deferred<void>() }
+    calls.push(call)
+    try { return await call.value.promise }
+    finally { try { await call.cleanup.promise } finally { active-- } }
+  })
+  const finish = (n: number) => { calls[n]!.value.resolve({ id: calls[n]!.id }); calls[n]!.cleanup.resolve() }
+  t.after(async () => {
+    calls.forEach((_, n) => finish(n)); await settle()
+    assert.equal(active, 0); assert.ok(maximum <= 2)
+  })
+  return { modes, calls, finish, active: () => active }
+}
+
+for (const outcome of ["resolve", "reject"] as const) test(`ancestry deadlines retain two actual reads through late ${outcome} and cleanup without caching`, async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const f = ancestryFixture(t)
+  const a = f.modes.root("a", signal()), b = f.modes.root("b", signal())
+  const expired = Promise.all([assert.rejects(a, /timed out/), assert.rejects(b, /timed out/)])
+  let settled = false; void a.settled!.then(() => { settled = true })
+  await settle(); t.mock.timers.tick(5000); await expired
+  for (let n = 0; n < 25; n++) {
+    await assert.rejects(f.modes.root("a", signal()), /timed out/)
+    await assert.rejects(f.modes.root(`other-${n}`, signal()), /capacity/)
+    t.mock.timers.tick(5000)
+  }
+  assert.equal(f.calls.length, 2); assert.equal(settled, false)
+  if (outcome === "resolve") f.calls[0]!.value.resolve({ id: "a" })
+  else f.calls[0]!.value.reject(Error("late metadata failure"))
+  await settle()
+  assert.equal(f.active(), 2); assert.equal(settled, false)
+  f.calls[0]!.cleanup.resolve(); await a.settled
+  assert.equal(settled, true)
+  const fresh = f.modes.root("a", signal()); await settle()
+  assert.equal(f.calls.length, 3, "an expired result cannot populate ancestry cache")
+  f.finish(2); assert.equal(await fresh, "a")
+  f.finish(1); await b.settled
+})
+
+test("ancestry joins share actual ownership but a joining abort never cancels the owner's operation", async t => {
+  const f = ancestryFixture(t), parent = new AbortController()
+  const owner = f.modes.root("root", signal()); await settle()
+  const join = f.modes.root("root", parent.signal)
+  assert.equal(join.settled, owner.settled)
+  const rejected = assert.rejects(join, { name: "AbortError" }); parent.abort(); await rejected
+  assert.equal(f.calls[0]!.signal.aborted, false)
+  const more = Array.from({ length: 50 }, () => f.modes.root("root", signal()))
+  assert.equal(f.calls.length, 1)
+  f.finish(0); assert.equal(await owner, "root"); await Promise.all(more)
+  assert.equal(await f.modes.root("root", signal()), "root"); assert.equal(f.calls.length, 1)
+})
+
+test("ancestry owner abort and deletion suppress late caches while retaining physical slots", async t => {
+  const f = ancestryFixture(t), abort = new AbortController()
+  const first = f.modes.root("old", abort.signal), second = f.modes.root("deleted", signal())
+  const canceled = assert.rejects(first, { name: "AbortError" })
+  const deleted = assert.rejects(second, /ancestry changed/)
+  await settle(); abort.abort(); f.modes.deleted("deleted"); await canceled
+  assert.equal(f.active(), 2)
+  f.finish(0); f.finish(1); await deleted; await Promise.all([first.settled, second.settled])
+  const fresh = f.modes.root("deleted", signal()); await settle()
+  assert.equal(f.calls.length, 3); f.finish(2); assert.equal(await fresh, "deleted")
+})
+
+test("ancestry cancellation before dispatch reserves no abandoned read", async t => {
+  const f = ancestryFixture(t), abort = new AbortController()
+  const read = f.modes.root("root", abort.signal)
+  const canceled = assert.rejects(read, { name: "AbortError" }); abort.abort()
+  await canceled; await read.settled
+  assert.equal(f.calls.length, 0)
+  const next = f.modes.root("root", signal()); await settle(); f.finish(0)
+  assert.equal(await next, "root")
+})

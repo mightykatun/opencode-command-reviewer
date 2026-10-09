@@ -233,3 +233,28 @@ test("polling does not starve reads slower than its cadence and selection is sna
   assert.equal(queries[1].root, "root")
   refresh.dispose(); second.resolve({ total: 2 })
 })
+
+test("legacy escaped metadata baseline cannot block affected and unrelated roots in the admitted FIFO", async t => {
+  const db = new DatabaseSync(":memory:"), seed = new HistorySQL(db)
+  seed.apply("seed", 1, encodeEvent({ type: "attemptFinalized", context, at: 1, attempt: "old",
+    reportedModel: "x" + "\u0001".repeat(4095), usage: { input: 7, output: 2 } }))
+  db.exec("DROP TABLE conversation_totals")
+  const sql = new HistorySQL(db), applied: number[] = []
+  const store = new HistoryStore("/state", { transport: () => ({ async call(m) {
+    if (m.type === "apply") {
+      const result = sql.apply(m.writer as string, m.sequence as number, m.event as string)
+      applied.push(m.sequence as number); return result
+    }
+    if (m.type === "query") return sql.query(m.query as any)
+    return {}
+  }, async terminate() {} }) })
+  t.after(async () => { await store.dispose(performance.now() - 3500); sql.close() })
+  assert.equal(store.admit(event), true)
+  assert.equal(store.admit({ ...event, context: { ...context, root: "other", session: "other", permission: "other", review: "other" } }), true)
+  await turn()
+  assert.deepEqual(applied, [1, 2])
+  assert.equal(store.pendingOperations, 0)
+  assert.equal(store.admit({ type: "attemptFinalized", context, at: 2, attempt: "new", usage: { input: 3, output: 1 } }), true)
+  await turn()
+  assert.equal((await store.query({ type: "totals" }) as any).totals.input, 10)
+})

@@ -2,7 +2,7 @@ import type { HistoryScope } from "./history-records.js"
 import type { HistorySessions } from "./history-schema.js"
 import type { HistoryStore } from "./history-store.js"
 
-type Store = Pick<HistoryStore, "query" | "admit" | "maintenanceRevision" | "maintenanceReconciled" | "markMaintenanceDirty">
+type Store = Pick<HistoryStore, "query" | "admit" | "maintenanceRevision" | "maintenanceScanRevision" | "maintenancePending" | "maintenanceReconciled" | "markMaintenanceDirty">
 export type SessionRead = (session: string, signal: AbortSignal) => Promise<unknown>
 
 /** session.get in the pinned public SDK uses the legacy NotFoundError envelope,
@@ -32,7 +32,10 @@ export class HistoryMaintenance {
   private page: HistoryScope[] = []
   private after?: string
   private revision = -1
+  private scanRevision = -1
   private healthy = true
+  private cleaned = false
+  private ending = false
   private turn?: AbortController
   constructor(private scope: string, private store: Store, private get: SessionRead,
     private invalidate: (session: string) => void = () => {}) {}
@@ -47,17 +50,20 @@ export class HistoryMaintenance {
     const turn = this.turn = new AbortController()
     const deadline = setTimeout(() => turn.abort(), 5000)
     try {
-      if (this.revision !== this.store.maintenanceRevision) {
-        this.revision = this.store.maintenanceRevision; this.after = undefined; this.page = []; this.healthy = true
+      if (this.scanRevision !== this.store.maintenanceScanRevision) {
+        this.scanRevision = this.store.maintenanceScanRevision
+        this.revision = this.store.maintenanceRevision
+        this.after = undefined; this.page = []; this.healthy = true; this.cleaned = false; this.ending = false
       }
+      if (this.ending) { this.finishPass(); return }
       if (!this.page.length) {
         const read = this.store.query({ type: "sessions", scope: this.scope, after: this.after, limit: 100 }, turn.signal)
         let result: HistorySessions
         try { result = await read as HistorySessions } finally { await read.settled?.catch(() => {}) }
         if (this.stopped || turn.signal.aborted) { this.healthy = false; return }
         if (!result.sessions.length) {
-          if (this.healthy) this.store.maintenanceReconciled(this.revision)
-          this.after = undefined; this.healthy = true
+          this.ending = true
+          this.finishPass()
           return
         }
         this.page = result.sessions; this.after = result.after
@@ -80,9 +86,18 @@ export class HistoryMaintenance {
     finally { clearTimeout(deadline); this.turn = undefined; this.active = false }
   }
   private remove(context: HistoryScope) {
-    this.store.markMaintenanceDirty()
+    // Every deletion still invalidates in-flight history reads. Only an external
+    // invalidation restarts this pass; our own cleanup needs one final healthy pass.
+    this.revision = this.store.markMaintenanceDirty("cleanup")
+    this.cleaned = true
     this.invalidate(context.session)
     if (!this.store.admit({ type: "sessionDeleted", context, at: Date.now() })) this.healthy = false
+    else this.page = this.page.filter(row => context.session === context.root ? row.root !== context.root : row.session !== context.session)
+  }
+  private finishPass() {
+    if (this.scanRevision !== this.store.maintenanceScanRevision || this.store.maintenancePending) return
+    if (this.healthy && !this.cleaned && !this.store.maintenanceReconciled(this.revision)) return
+    this.after = undefined; this.healthy = true; this.cleaned = false; this.ending = false
   }
   private async presence(session: string) {
     const abort = new AbortController()

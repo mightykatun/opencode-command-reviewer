@@ -338,3 +338,20 @@ test("symlinked ancestors are rejected before creating directories in their targ
   assert.throws(() => privateDatabase(path.join(alias, "new", "private", "history-v1.sqlite")))
   assert.equal(existsSync(path.join(target, "new")), false)
 })
+
+test("serialized bounds cover maximum escaped context and payload shapes without weakening decoded limits", t => {
+  const f = fixture(t), text = "x" + "\u0001".repeat(4095)
+  const c = { ...context, scope: "/" + "\u0001".repeat(4095), root: text, session: text,
+    permission: text, review: text, configuredModel: text, provider: "https://example.com/" + "x".repeat(4076) }
+  assert.equal(Buffer.byteLength(c.provider), 4096)
+  f.apply(resolve(c))
+  assert.equal((f.sql.query({ type: "history", scope: c.scope, root: c.root }) as HistorySelection).record?.context.configuredModel, text)
+  const p = { ...payload, reportedModel: text, desc: "\u0001".repeat(65536),
+    timing: { fullReportMs: Number.MAX_VALUE, ratingMs: Number.MIN_VALUE },
+    usage: { input: Number.MAX_SAFE_INTEGER, output: Number.MAX_SAFE_INTEGER, cost: Number.MAX_VALUE } }
+  f.apply(resolve(context, p))
+  assert.deepEqual(f.history().record?.payload, p)
+  assert.throws(() => encodeEvent(resolve(context, { ...p, desc: p.desc + "x" })))
+  assert.throws(() => encodeEvent(resolve({ ...context, configuredModel: text + "x" })))
+  assert.throws(() => encodeEvent(resolve(c, p)), "the independent event admission ceiling still bounds combined envelopes")
+})

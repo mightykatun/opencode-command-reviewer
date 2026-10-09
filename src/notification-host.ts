@@ -7,6 +7,7 @@ import { notificationClock, type NotificationClock } from "./notification-types.
 import { notificationBlockers, type PendingInteraction } from "./notification-order.js"
 import { withDeadline } from "./deadline.js"
 import type { HistoryTarget } from "./history-records.js"
+import type { AncestryRead, AncestryReader } from "./session-mode.js"
 
 type Target = { root: string; sessionID: string; title: string }
 interface Request {
@@ -53,7 +54,7 @@ export class NotificationHost {
   private pendingClick?: { sessionID: string; history: HistoryTarget; route: string }
   private clickWait?: () => void
   constructor(private api: HostApi, private policy: NotificationPolicy,
-    private resolveRoot: (id: string, signal: AbortSignal) => Promise<string>,
+    private resolveRoot: AncestryReader,
     private readQuestions: (signal: AbortSignal) => Promise<readonly QuestionRequest[]>,
     private clock: NotificationClock = notificationClock,
     private openHistory?: (sessionID: string, target: HistoryTarget) => void) {
@@ -157,8 +158,14 @@ export class NotificationHost {
     if (pending) return pending
     if (this.lookups >= 2 || this.stopped) return
     this.lookups++
-    const worker = Promise.resolve().then(() => this.resolveRoot(id, this.api.lifecycle.signal))
-      .finally(() => { this.ancestry.delete(id); this.lookups-- })
+    let read: AncestryRead | undefined
+    const worker = Promise.resolve().then(() => read = this.resolveRoot(id, AbortSignal.any([this.abort.signal, this.api.lifecycle.signal])))
+    const release = async () => {
+      await read?.settled?.catch(() => {})
+      if (this.ancestry.get(id) === worker) this.ancestry.delete(id)
+      this.lookups--
+    }
+    void worker.then(release, release)
     this.ancestry.set(id, worker)
     return worker
   }

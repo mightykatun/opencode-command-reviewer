@@ -74,6 +74,7 @@ export class HistoryStore {
   private disposal?: Promise<void>
   private dirty = false
   private dirtyRevision = 0
+  private scanRevision = 0
   private maintenanceListeners = new Set<() => unknown>()
   private readonly now: () => number
   private readonly schedule: NonNullable<HistoryStoreOptions["schedule"]>
@@ -87,9 +88,15 @@ export class HistoryStore {
   /** Saturated deletion admission leaves one bounded reconciliation signal, never an ID side queue. */
   get maintenanceDirty() { return this.dirty }
   get maintenanceRevision() { return this.dirtyRevision }
-  markMaintenanceDirty() {
-    if (this.stopped) return
-    this.dirty = true; this.dirtyRevision++; this.notify(this.maintenanceListeners)
+  get maintenanceScanRevision() { return this.scanRevision }
+  get maintenancePending() { return this.queue.length > 0 || this.blocked }
+  markMaintenanceDirty(origin?: "cleanup") {
+    if (this.stopped) return this.dirtyRevision
+    this.dirty = true
+    const revision = ++this.dirtyRevision
+    if (origin !== "cleanup") this.scanRevision++
+    this.notify(this.maintenanceListeners)
+    return revision
   }
   maintenanceReconciled(revision = this.dirtyRevision) {
     if (revision !== this.dirtyRevision || this.queue.length || this.blocked) return false

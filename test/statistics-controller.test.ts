@@ -6,6 +6,8 @@ import { empty } from "../src/lifetime.js"
 import type { HistoryRead } from "../src/history-store.js"
 import type { HistoryResult } from "../src/history-schema.js"
 import type { HistoryQuery } from "../src/history-records.js"
+import { SessionModes } from "../src/session-mode.js"
+import { HistoryCoordinator } from "../src/history-coordinator.js"
 
 function deferred<T>() {
   let resolve!: (value: T) => void, reject!: (error: Error) => void
@@ -104,4 +106,48 @@ test("write failures and actual read cleanup guard scoped snapshots and recover 
   assert.equal(f.controller.state.unavailable, true); assert.equal(f.controller.state.conversation, undefined)
   f.commit(); f.finish(4, 40); await settle()
   assert.equal(f.controller.state.unavailable, false); assert.equal(f.state().conversation?.totals.input, 40)
+})
+
+test("production ancestry composition retains physical ownership through statistics reopen storms", async t => {
+  const pending: { id: string; resolve: (v: { id: string }) => void }[] = []
+  const modes = new SessionModes({ read: async () => { throw Error("must not load mode") }, write: async () => {}, flush: async () => {} },
+    id => new Promise(resolve => pending.push({ id, resolve })))
+  const h = new HistoryCoordinator("/host", { admit: () => true, query: async () => ({}), onCommit: () => () => {} }, (id, signal) => modes.root(id, signal))
+  const f = fixture(t, (id, signal) => h.root(id, signal))
+  try {
+    f.finish(0); await settle()
+    f.controller.open("old"); f.controller.select("conversation"); await settle()
+    for (let n = 0; n < 25; n++) { f.controller.open(`new-${n}`); f.controller.select("conversation"); await settle() }
+    assert.equal(pending.length, 1, "deadline wrapper settlement is not actual metadata settlement")
+    pending[0]!.resolve({ id: "old" }); await settle()
+    assert.deepEqual(pending.map(p => p.id), ["old", "new-24"])
+    pending[1]!.resolve({ id: "new-24" }); await settle()
+    f.finish(1); await settle()
+    assert.deepEqual(f.queries[2], { type: "totals", conversation: { scope: "/host", root: "new-24" } })
+  } finally {
+    f.controller.dispose(); h.dispose()
+    for (const p of pending) p.resolve({ id: p.id })
+    await settle()
+  }
+})
+
+for (const outcome of ["resolve", "reject"] as const) test(`production statistics deadline and disposal retain actual ancestry through late ${outcome}`, async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] })
+  const actual = deferred<{ id: string }>(), cleanup = deferred<void>(); let calls = 0
+  const modes = new SessionModes({ read: async () => true, write: async () => {}, flush: async () => {} }, async () => {
+    calls++; try { return await actual.promise } finally { await cleanup.promise }
+  })
+  const h = new HistoryCoordinator("/host", { admit: () => true, query: async () => ({}), onCommit: () => () => {} }, (id, signal) => modes.root(id, signal))
+  const f = fixture(t, (id, signal) => h.root(id, signal))
+  try {
+    f.finish(0); await settle(); f.controller.open("old"); f.controller.select("conversation"); await settle()
+    t.mock.timers.tick(5000); await settle(); assert.equal(f.state().ancestry, "unavailable")
+    for (let n = 0; n < 10; n++) { f.controller.select("conversation"); t.mock.timers.tick(5000); await settle() }
+    assert.equal(calls, 1)
+    if (outcome === "resolve") actual.resolve({ id: "old" }); else actual.reject(Error("late failure"))
+    await settle(); assert.equal(calls, 1)
+    f.controller.dispose(); cleanup.resolve(); await settle()
+    assert.equal(calls, 1); assert.equal(f.state().conversation, undefined)
+    assert.equal(f.queries.some(q => q.type === "totals" && q.conversation), false)
+  } finally { f.controller.dispose(); h.dispose(); actual.resolve({ id: "old" }); cleanup.resolve(); await settle() }
 })

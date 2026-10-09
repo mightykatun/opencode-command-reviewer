@@ -9,9 +9,10 @@ import { parseNotificationConfig } from "../src/notification-config.js"
 import type { NotificationMessage } from "../src/notification-types.js"
 import type { HistoryTarget } from "../src/history-records.js"
 import type { View } from "../src/controller.js"
+import { SessionModes, type AncestryReader } from "../src/session-mode.js"
 
 const request = (id = "p", sessionID = "root"): PermissionRequest => ({ id, sessionID, permission: "bash", patterns: [], always: [], metadata: {} })
-function fixture(resolve: (id: string) => Promise<string> = async id => id, options: Record<string, unknown> = {},
+function fixture(resolve: AncestryReader = async id => id, options: Record<string, unknown> = {},
   readQuestions?: (signal: AbortSignal) => Promise<readonly QuestionRequest[]>) {
   const listeners = new Map<string, Set<(event: Event) => void>>()
   const sessions = new Map<string, { id: string; parentID?: string; title: string }>([
@@ -335,4 +336,30 @@ test("host publishes queue and review outcomes atomically across a snapshot-only
   f.host.snapshot([{ request: b, status: "analyzing", autoApproval: { status: "cancelled" } }])
   await f.advance(5000); assert.equal(f.banners.length, 1)
   await f.host.dispose()
+})
+
+test("notification ancestry admission owns actual metadata reads after deadline and disposal", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const pending: { id: string; signal: AbortSignal; release: (v: { id: string }) => void }[] = []
+  const modes = new SessionModes({ read: async () => true, write: async () => {}, flush: async () => {} },
+    (id, signal) => new Promise(resolve => pending.push({ id, signal, release: resolve })))
+  let admissions = 0
+  const f = fixture((id, signal) => { admissions++; return modes.root(id, signal) })
+  try {
+    f.host.visit("unknown-a"); f.host.visit("unknown-b"); await settle()
+    t.mock.timers.tick(5000); await settle()
+    for (let n = 0; n < 30; n++) { f.host.visit(`unknown-${n}`); await settle() }
+    assert.equal(pending.length, 2)
+    assert.equal(admissions, 2, "host capacity remains occupied, not merely rejected by the lower layer")
+    pending[0]!.release({ id: "unknown-a" }); await settle()
+    f.host.visit("recovered"); await settle()
+    assert.equal(admissions, 3); assert.equal(pending.length, 3)
+    await f.host.dispose()
+    assert.equal(pending[2]!.signal.aborted, true)
+    assert.equal(f.banners.length, 0)
+  } finally {
+    await f.host.dispose()
+    for (const p of pending) p.release({ id: p.id })
+    await settle()
+  }
 })

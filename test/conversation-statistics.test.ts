@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { HistorySQL, type HistoryConversationTotals, type HistoryTotals } from "../src/history-schema.js"
-import { encodeEvent, type HistoryEvent, type HistoryReview } from "../src/history-records.js"
+import { encodeEvent, HISTORY_RECORD_BYTES, type HistoryEvent, type HistoryReview } from "../src/history-records.js"
 import { add, empty, lifetimeReport } from "../src/lifetime.js"
 
 const context: HistoryReview = { scope: "/project", root: "root", session: "root", permission: "p", review: "r",
@@ -123,4 +123,36 @@ test("historical baseline pages beyond 100 reviews and rejects corrupt attributi
   f.db.exec("UPDATE attempts SET finalized='bad JSON' WHERE id=(SELECT id FROM attempts LIMIT 1)")
   assert.throws(() => conversation(migrated))
   assert.deepEqual((migrated.query({ type: "totals" }) as HistoryTotals).totals, before)
+})
+
+for (const kind of ["accepted", "finalized"] as const) test(`legacy ${kind} maximum escaped metadata migrates without changing lifetime`, t => {
+  const f = fixture(t), reportedModel = "x" + "\u0001".repeat(4095)
+  const event: HistoryEvent = kind === "accepted"
+    ? { type: "reviewAccepted", context, at: 1, accepted: { safe: true, completedAt: 1, reportedModel, timing: { fullReportMs: 12, ratingMs: 6 } } }
+    : { type: "attemptFinalized", context, at: 1, attempt: "a", reportedModel, usage: { input: 7, output: 2, cost: 0.1 } }
+  f.apply(event)
+  const before = conversation(f.sql).totals, lifetime = f.sql.query({ type: "totals" })
+  f.db.exec("DROP TABLE conversation_totals")
+  const migrated = f.reopen()
+  assert.deepEqual(conversation(migrated).totals, before)
+  assert.equal(f.db.prepare("SELECT count(*) n FROM conversation_totals").get()!.n, 0)
+  migrated.apply("new", 1, encodeEvent({ type: "attemptFinalized", context, at: 2, attempt: "next", usage: { input: 3, output: 1 } }))
+  assert.equal(conversation(migrated).totals.input, before.input + 3)
+  assert.equal(conversation(migrated).partialHistory, true)
+  assert.equal((lifetime as HistoryTotals).totals.input, before.input)
+  assert.equal((migrated.query({ type: "totals" }) as HistoryTotals).totals.input, before.input + 3)
+  const oversized = structuredClone(event)
+  if (oversized.type === "reviewAccepted") oversized.accepted.reportedModel = reportedModel + "x"
+  else if (oversized.type === "attemptFinalized") oversized.reportedModel = reportedModel + "x"
+  assert.throws(() => encodeEvent(oversized))
+  // Decoded one-over corruption must still fail even below the serialized cap.
+  const column = kind === "accepted" ? "accepted" : "finalized", table = kind === "accepted" ? "reviews" : "attempts"
+  const stored = kind === "accepted" ? (oversized as any).accepted : { at: 1, reportedModel: reportedModel + "x", usage: { input: 7, output: 2 } }
+  f.db.exec("DELETE FROM conversation_totals")
+  f.db.prepare(`UPDATE ${table} SET ${column}=?`).run(JSON.stringify(stored))
+  assert.throws(() => conversation(migrated))
+  // The pre-decode guard also rejects oversized serialization of an otherwise valid shape.
+  f.db.prepare(`UPDATE ${table} SET ${column}=?`).run(" ".repeat(HISTORY_RECORD_BYTES[column] + 1) + "{}")
+  assert.throws(() => conversation(migrated))
+  assert.equal((migrated.query({ type: "totals" }) as HistoryTotals).totals.input, before.input + 3)
 })

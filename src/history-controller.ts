@@ -2,6 +2,7 @@ import { HistoryRefresh } from "./history-refresh.js"
 import type { HistoryStore } from "./history-store.js"
 import type { HistorySelection } from "./history-schema.js"
 import { opaque, type HistoryQuery, type HistoryTarget } from "./history-records.js"
+import type { AncestryRead, AncestryReader } from "./session-mode.js"
 
 export interface HistoryViewState {
   open: boolean; status: "loading" | "ready" | "error"; selection?: HistorySelection; reset: number
@@ -18,12 +19,14 @@ export class HistoryController {
   private abort?: AbortController
   private retry?: ReturnType<typeof setTimeout>
   private stopped = false
+  private lookup = false
+  private lookupAgain = false
   private target?: HistoryTarget & { entry: string; until: number; ready: () => void }
   private targetTimeout?: ReturnType<typeof setTimeout>
   private deletedEntries = new Set<string>()
   private unsubscribeMaintenance?: () => void
   constructor(private scope: string, private store: Pick<HistoryStore, "query" | "onCommit" | "onWriteFailure"> & Partial<Pick<HistoryStore, "onMaintenance" | "maintenanceDirty">>,
-    private ancestry: (session: string, signal: AbortSignal) => Promise<string>, private publish: (state: HistoryViewState) => void) {
+    private ancestry: AncestryReader, private publish: (state: HistoryViewState) => void) {
     this.unsubscribeMaintenance = store.onMaintenance?.(() => {
       if ((!this.state.open && !this.target) || this.stopped) return
       if (store.maintenanceDirty) this.update({ status: "loading" })
@@ -53,8 +56,13 @@ export class HistoryController {
     void this.resolve(this.generation, session, this.abort.signal)
   }
   private async resolve(generation: number, session: string, signal: AbortSignal) {
+    if (this.stopped || signal.aborted || generation !== this.generation) return
+    if (this.lookup) { this.lookupAgain = true; return }
+    this.lookup = true; this.lookupAgain = false
+    let read: AncestryRead | undefined
     try {
-      const root = await this.ancestry(session, signal)
+      read = this.ancestry(session, signal)
+      const root = await read
       if (generation !== this.generation || signal.aborted) return
       this.root = root
       this.refresh = new HistoryRefresh(this.store, this.query(), result => {
@@ -88,6 +96,13 @@ export class HistoryController {
       if (generation !== this.generation || signal.aborted) return
       if (!this.target) this.update({ status: "error" })
       this.retry = setTimeout(() => void this.resolve(generation, session, signal), 2000)
+    } finally {
+      await read?.settled?.catch(() => {})
+      this.lookup = false
+      if (!this.stopped && this.lookupAgain && this.session && this.abort && !this.abort.signal.aborted) {
+        clearTimeout(this.retry)
+        void this.resolve(this.generation, this.session, this.abort.signal)
+      }
     }
   }
   private query(): HistoryQuery {
@@ -109,6 +124,7 @@ export class HistoryController {
     this.refresh?.refresh()
   }
   close() {
+    this.lookupAgain = false
     this.generation++; this.abort?.abort(); this.refresh?.dispose(); this.refresh = undefined
     clearTimeout(this.retry); this.root = undefined; this.session = undefined
     clearTimeout(this.targetTimeout); this.target = undefined

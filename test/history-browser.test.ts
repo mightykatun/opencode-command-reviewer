@@ -9,6 +9,7 @@ import { historyLayout, historyMetadata } from "../src/history-layout.js"
 import { uiText } from "../src/ui-text.js"
 import { historyCommands } from "../src/history-commands.js"
 import { SessionModes } from "../src/session-mode.js"
+import { HistoryCoordinator } from "../src/history-coordinator.js"
 
 const tick = async () => { for (let n = 0; n < 8; n++) await Promise.resolve() }
 const entry = "a".repeat(64)
@@ -238,4 +239,48 @@ test("targeted history waits through maintenance and retains actual read cleanup
   dirty = false; onMaintenance(); commit(); await tick(); assert.equal(reads, 1)
   settleRead(); await tick()
   assert.equal(reads, 2); assert.equal(c.state.open, true); assert.equal(ready, 1)
+})
+
+test("production ancestry composition coalesces history reopen storms until the actual read settles", async t => {
+  const pending: { id: string; resolve: (v: { id: string }) => void }[] = []
+  const modes = new SessionModes({ read: async () => { throw Error("must not load mode") }, write: async () => {}, flush: async () => {} },
+    id => new Promise(resolve => pending.push({ id, resolve })))
+  const h = new HistoryCoordinator("/project", { admit: () => true, query: async () => ({}), onCommit: () => () => {} }, (id, signal) => modes.root(id, signal))
+  const f = fixture(t, (id, signal) => h.root(id, signal))
+  try {
+    f.controller.open("old"); await settle()
+    for (let n = 0; n < 25; n++) { f.controller.open(`new-${n}`); await settle() }
+    assert.equal(pending.length, 1, "caller abort must not release physical ancestry ownership")
+    pending[0]!.resolve({ id: "old" }); await settle()
+    assert.deepEqual(pending.map(p => p.id), ["old", "new-24"])
+    pending[1]!.resolve({ id: "new-24" }); await settle()
+    assert.equal((f.pending[0]!.query as any).root, "new-24")
+  } finally {
+    f.controller.dispose(); h.dispose()
+    for (const p of pending) p.resolve({ id: p.id })
+    await settle()
+  }
+})
+
+for (const outcome of ["resolve", "reject"] as const) test(`production history deadline retries retain ancestry cleanup through late ${outcome} and close`, async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] })
+  let release!: (v: { id: string }) => void, reject!: (e: Error) => void, cleanup!: () => void, calls = 0
+  const actual = new Promise<{ id: string }>((yes, no) => { release = yes; reject = no })
+  const cleaning = new Promise<void>(yes => { cleanup = yes })
+  const modes = new SessionModes({ read: async () => true, write: async () => {}, flush: async () => {} }, async () => {
+    calls++; try { return await actual } finally { await cleaning }
+  })
+  const h = new HistoryCoordinator("/project", { admit: () => true, query: async () => ({}), onCommit: () => () => {} }, (id, signal) => modes.root(id, signal))
+  const f = fixture(t, (id, signal) => h.root(id, signal))
+  try {
+    f.controller.open("old"); await settle(); t.mock.timers.tick(5000); await settle()
+    assert.equal(f.controller.state.status, "error")
+    for (let n = 0; n < 10; n++) { t.mock.timers.tick(2000); await settle() }
+    assert.equal(calls, 1)
+    if (outcome === "resolve") release({ id: "old" }); else reject(Error("late failure"))
+    await settle(); assert.equal(calls, 1)
+    f.controller.close(); cleanup(); await settle()
+    t.mock.timers.tick(10000); await settle()
+    assert.equal(calls, 1); assert.equal(f.pending.length, 0); assert.equal(f.controller.state.open, false)
+  } finally { f.controller.dispose(); h.dispose(); release({ id: "old" }); cleanup(); await settle() }
 })

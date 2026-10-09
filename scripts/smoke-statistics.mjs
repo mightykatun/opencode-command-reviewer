@@ -19,12 +19,46 @@ const artifacts = path.join(root, ".runtime/statistics")
 await mkdir(project); await mkdir(path.join(temp, "config")); await mkdir(artifacts, { recursive: true })
 execFileSync("git", ["init", "--quiet", project])
 const bundle = path.join(temp, "bundle.mjs"), wrapper = path.join(temp, "wrapper.mjs"), info = path.join(temp, "sessions.json")
+const ancestryControl = path.join(temp, "ancestry-control.json"), ancestryProbe = path.join(temp, "ancestry.json")
+await writeFile(ancestryControl, JSON.stringify({ release: false }))
 await copyFile(path.join(root, "dist/tui.js"), bundle)
 await writeFile(wrapper, `import plugin from ${JSON.stringify(pathToFileURL(bundle).href)};
-import { writeFile, readFile } from 'node:fs/promises';
+import { writeFile, readFile, rename } from 'node:fs/promises';
 export default { id: 'statistics-fixture', tui: async (api, options) => {
-  await plugin.tui(api, options);
   let ids = await readFile(${JSON.stringify(info)}, 'utf8').then(JSON.parse).catch(() => ({}));
+  const facts = { reads: {}, active: 0, maximum: 0, aborted: 0 };
+  let publication = Promise.resolve();
+  const probe = () => {
+    const text = JSON.stringify(facts);
+    return publication = publication.then(async () => {
+      await writeFile(${JSON.stringify(ancestryProbe + ".tmp")}, text);
+      await rename(${JSON.stringify(ancestryProbe + ".tmp")}, ${JSON.stringify(ancestryProbe)});
+    });
+  };
+  const held = id => id && (id === ids.stalled || id === ids.historyStalled);
+  const sessions = new Proxy(api.state.session, { get(target, key) {
+    if (key === 'get') return id => held(id) ? undefined : target.get(id);
+    return Reflect.get(target, key);
+  }});
+  const state = new Proxy(api.state, { get(target, key) { return key === 'session' ? sessions : Reflect.get(target, key); }});
+  const session = new Proxy(api.client.session, { get(target, key) {
+    if (key !== 'get') return Reflect.get(target, key);
+    return async (params, opts) => {
+      if (!held(params.sessionID)) return target.get(params, opts);
+      facts.reads[params.sessionID] = (facts.reads[params.sessionID] || 0) + 1;
+      facts.active++; facts.maximum = Math.max(facts.maximum, facts.active); await probe();
+      try {
+        // Deliberately ignores abort until released, like a noncooperative host transport.
+        while (!(JSON.parse(await readFile(${JSON.stringify(ancestryControl)}, 'utf8'))).release)
+          await new Promise(resolve => setTimeout(resolve, 50));
+        if (opts.signal.aborted) facts.aborted++;
+        return { data: api.state.session.get(params.sessionID) };
+      } finally { facts.active--; await probe(); }
+    };
+  }});
+  const client = new Proxy(api.client, { get(target, key) { return key === 'session' ? session : Reflect.get(target, key); }});
+  const adapted = new Proxy(api, { get(target, key) { return key === 'client' ? client : key === 'state' ? state : Reflect.get(target, key); }});
+  await plugin.tui(adapted, options);
   let permissions = 0, replies = 0;
   api.event.on('permission.asked', () => permissions++); api.event.on('permission.replied', () => replies++);
   const save = () => writeFile(${JSON.stringify(info)}, JSON.stringify({...ids, permissions, replies}));
@@ -33,12 +67,14 @@ export default { id: 'statistics-fixture', tui: async (api, options) => {
       ids.root = api.route.current.params.sessionID;
       const create = async (title, parentID) => (await api.client.session.create({directory:api.state.path.directory, title, parentID}, {throwOnError:true})).data.id;
       ids.child = await create('Statistics child', ids.root); ids.deep = await create('Statistics deep child', ids.child);
-      ids.other = await create('Statistics other root'); await save();
+       ids.other = await create('Statistics other root');
+       for (const name of ['stalled','latest','historyStalled','historyLatest']) ids[name] = await create('Ownership ' + name);
+       await save();
     }},
-    ...['root','child','deep','other'].map(name => ({name:'fixture.'+name, namespace:'palette', title:'Fixture: '+name,
+     ...['root','child','deep','other','stalled','latest','historyStalled','historyLatest'].map(name => ({name:'fixture.'+name, namespace:'palette', title:'Fixture: '+name,
       run:() => api.route.navigate('session', {sessionID:ids[name]})}))
   ]});
-  api.lifecycle.onDispose(async () => { off(); await save(); });
+   api.lifecycle.onDispose(async () => { off(); await save(); await publication; });
 } };`)
 const { HistorySQL } = await tsImport("../src/history-schema.ts", import.meta.url)
 const { encodeEvent } = await tsImport("../src/history-records.ts", import.meta.url)
@@ -137,12 +173,57 @@ try {
   assert.equal(calls, modelCalls, "statistics browsing and resume do not invoke models")
   const facts = JSON.parse(await readFile(info, "utf8"))
   assert.equal(facts.permissions, 0); assert.equal(facts.replies, 0)
+  // Actual production controller -> coordinator -> SessionModes composition,
+  // driven through public UI commands while its host metadata read ignores abort.
+  seed(ids.latest, ids.latest, 777, false)
+  const ancestry = async () => JSON.parse(await readFile(ancestryProbe, "utf8"))
+  const releaseAncestry = async release => {
+    const temporary = ancestryControl + ".tmp"
+    await writeFile(temporary, JSON.stringify({ release }))
+    const { rename } = await import("node:fs/promises")
+    await rename(temporary, ancestryControl)
+  }
+  await close(); await palette("Fixture: stalled")
+  for (let n = 0; n < 4; n++) {
+    await open(); send("Tab"); await until(s => s.includes("[Conversation]") && s.includes("Loading"))
+    await close()
+  }
+  await palette("Fixture: latest"); await open(); send("Tab")
+  await until(s => s.includes("[Conversation]") && s.includes("Loading"))
+  assert.equal((await ancestry()).reads[ids.stalled], 1)
+  assert.equal((await ancestry()).active, 1)
+  await releaseAncestry(true)
+  await check(["Reviews: 1", "Tokens: 1574 in 30 out", "Unsafe: 1 (100.0%)"], "Conversation")
+  await save("ancestry-statistics-recovered"); await close()
+  await until(async () => (await ancestry()).active === 0)
+  await releaseAncestry(false)
+  const context = { scope: project, root: ids.historyLatest, session: ids.historyLatest, review: 'ownership-report',
+    permission: 'ownership-permission', category: 'bash', configuredModel: 'fixture', provider: 'https://fixture.invalid/v1' }
+  sql.apply("ownership-fixture", 1, encodeEvent({ type: 'permissionResolved', context, at: 3, outcome: 'manual',
+    payload: { safe: false, completedAt: 3, desc: 'Newest ancestry history report' } }))
+  await palette("Fixture: historyStalled")
+  const openHistory = async () => { await palette("Reviewer: Report history"); await until(s => s.includes("Analysis history")) }
+  for (let n = 0; n < 4; n++) {
+    await openHistory(); await until(s => s.includes("Loading history"))
+    send("Escape"); await until(s => !s.includes("Analysis history"))
+  }
+  await palette("Fixture: historyLatest"); await openHistory()
+  assert.equal((await ancestry()).reads[ids.historyStalled], 1)
+  assert.equal((await ancestry()).active, 1)
+  await releaseAncestry(true)
+  await until(s => s.includes("Newest ancestry history report"))
+  await save("ancestry-history-recovered")
+  const ownership = await ancestry()
+  assert.equal(ownership.maximum, 1); assert.equal(ownership.active, 0); assert.equal(ownership.aborted, 2)
+  assert.equal(calls, modelCalls)
+  await writeFile(path.join(artifacts, "ancestry.json"), JSON.stringify(ownership, null, 2))
   await writeFile(path.join(artifacts, "results.json"), JSON.stringify({ temp, ids, calls, status: "passed" }, null, 2))
-  console.log(`PASS statistics: both scopes, root/child/deep ancestry, independent roots, Tab/click, disabled mode, restart, shared persistence, partial v1 baseline; ${temp}`)
+  console.log(`PASS statistics: both scopes, root/child/deep ancestry, independent roots, Tab/click, disabled mode, restart, shared persistence, partial v1 baseline, held ancestry reopen storms and newest-selection recovery in statistics/history; ${temp}`)
 } catch (error) {
   await save("failed").catch(() => {})
   await writeFile(path.join(artifacts, "failure.txt"), `${error.stack}\n${temp}`)
   throw error
 } finally {
+  await writeFile(ancestryControl, JSON.stringify({ release: true }))
   sql?.close(); await runtime.dispose(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve))
 }

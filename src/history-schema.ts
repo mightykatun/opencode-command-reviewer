@@ -1,6 +1,6 @@
 import { add, empty, validate } from "./lifetime.js"
 import type { LifetimeTotals } from "./lifetime.js"
-import { count, decodeEvent, entryID, HistoryInvalid, opaque, reviewID, rootID, sessionID, validateEvent, validatePayload, validateQuery, validateReview, validateScope } from "./history-records.js"
+import { count, decodeEvent, entryID, HISTORY_RECORD_BYTES as bytes, HISTORY_TEXT_BYTES, HistoryInvalid, opaque, reviewID, rootID, sessionID, validateEvent, validatePayload, validateQuery, validateReview, validateScope } from "./history-records.js"
 import { historyDelta } from "./history-statistics.js"
 import type { HistoryEvent, HistoryOutcome, HistoryPayload, HistoryQuery, HistoryReview, HistoryScope, HistoryOrder } from "./history-records.js"
 
@@ -60,7 +60,7 @@ export class HistorySQL {
         db.exec(schema)
         db.prepare("INSERT INTO meta VALUES (1,1,0,?)").run(JSON.stringify(empty()))
       }
-      const meta = db.prepare("SELECT version,revision,CASE WHEN length(CAST(totals AS BLOB))<=4096 THEN totals END AS totals FROM meta WHERE id=1").get()
+      const meta = db.prepare(`SELECT version,revision,CASE WHEN length(CAST(totals AS BLOB))<=${bytes.totals} THEN totals END AS totals FROM meta WHERE id=1`).get()
       if (meta?.version !== 1 || !count(meta.revision)) throw new HistoryInvalid("Unsupported history schema")
       this.parseTotals(meta.totals)
       // Additive v1 indexes, serialized with initialization on both adapters.
@@ -90,7 +90,7 @@ export class HistorySQL {
     catch (error) { this.db.exec("ROLLBACK"); throw error }
   }
   private parseTotals(text: string): LifetimeTotals {
-    if (typeof text !== "string" || Buffer.byteLength(text) > 4096) throw new HistoryInvalid("Invalid history totals")
+    if (typeof text !== "string" || Buffer.byteLength(text) > bytes.totals) throw new HistoryInvalid("Invalid history totals")
     return validate(JSON.parse(text))
   }
   private revision(root: string) {
@@ -117,7 +117,7 @@ export class HistorySQL {
    * Reads are pure; the next actual event materializes the baseline transactionally.
    */
   private conversation(root: string): { totals: LifetimeTotals; partialHistory: boolean } {
-    const saved = this.get("SELECT CASE WHEN length(CAST(totals AS BLOB))<=4096 THEN totals END AS totals,partial FROM conversation_totals WHERE id=?", root)
+    const saved = this.get(`SELECT CASE WHEN length(CAST(totals AS BLOB))<=${bytes.totals} THEN totals END AS totals,partial FROM conversation_totals WHERE id=?`, root)
     if (saved) {
       if (saved.partial !== 0 && saved.partial !== 1) throw new HistoryInvalid("Invalid conversation coverage")
       return { totals: this.parseTotals(saved.totals), partialHistory: saved.partial === 1 }
@@ -125,8 +125,8 @@ export class HistorySQL {
     let totals = empty(), after = "", partialHistory = !!this.get("SELECT id FROM roots WHERE id=?", root)
     const include = (event: HistoryEvent) => { validateEvent(event); totals = add(totals, historyDelta(event)) }
     for (;;) {
-      const reviews = this.all(`SELECT id,CASE WHEN length(CAST(context AS BLOB))<=262144 THEN context END AS context,
-        CASE WHEN length(CAST(accepted AS BLOB))<=16384 THEN accepted END AS accepted,accepted IS NOT NULL AS hasAccepted
+      const reviews = this.all(`SELECT id,CASE WHEN length(CAST(context AS BLOB))<=${bytes.context} THEN context END AS context,
+        CASE WHEN length(CAST(accepted AS BLOB))<=${bytes.accepted} THEN accepted END AS accepted,accepted IS NOT NULL AS hasAccepted
         FROM reviews WHERE root=? AND id>? ORDER BY id LIMIT 100`, root, after)
       if (!reviews.length) break
       partialHistory = true
@@ -141,8 +141,8 @@ export class HistorySQL {
           let cursor = ""
           for (;;) {
             const rows = table === "attempts" ? this.all(`SELECT id,
-              CASE WHEN length(CAST(dispatched AS BLOB))<=16384 THEN dispatched END AS dispatched,
-              CASE WHEN length(CAST(finalized AS BLOB))<=16384 THEN finalized END AS finalized,
+              CASE WHEN length(CAST(dispatched AS BLOB))<=${bytes.dispatched} THEN dispatched END AS dispatched,
+              CASE WHEN length(CAST(finalized AS BLOB))<=${bytes.finalized} THEN finalized END AS finalized,
               dispatched IS NOT NULL AS hasDispatched,finalized IS NOT NULL AS hasFinalized
               FROM attempts WHERE review=? AND id>? ORDER BY id LIMIT 100`, row.id, cursor)
               : this.all("SELECT id,root,session,at,state,automatic FROM approvals WHERE review=? AND id>? ORDER BY id LIMIT 100", row.id, cursor)
@@ -175,7 +175,7 @@ export class HistorySQL {
   }
   private contribute(key: string, delta: LifetimeTotals, root: string) {
     if (this.get("SELECT id FROM contributions WHERE id=?", key)) return
-    const meta = this.get("SELECT CASE WHEN length(CAST(totals AS BLOB))<=4096 THEN totals END AS totals,revision FROM meta WHERE id=1")!
+    const meta = this.get(`SELECT CASE WHEN length(CAST(totals AS BLOB))<=${bytes.totals} THEN totals END AS totals,revision FROM meta WHERE id=1`)!
     const totals = add(this.parseTotals(meta.totals), delta)
     const conversation = add(this.conversation(root).totals, delta)
     if (!count(meta.revision + 1)) throw new HistoryInvalid("History revision overflow")
@@ -281,7 +281,7 @@ export class HistorySQL {
     validateQuery(q)
     return this.transaction(() => {
       if (q.type === "totals") {
-        const row = this.get("SELECT revision,CASE WHEN length(CAST(totals AS BLOB))<=4096 THEN totals END AS totals FROM meta WHERE id=1")!
+        const row = this.get(`SELECT revision,CASE WHEN length(CAST(totals AS BLOB))<=${bytes.totals} THEN totals END AS totals FROM meta WHERE id=1`)!
         if (!count(row.revision)) throw new HistoryInvalid("Invalid aggregate revision")
         return { revision: row.revision, totals: this.parseTotals(row.totals),
           ...(q.conversation ? { conversation: this.conversation(rootID(q.conversation)) } : {}) }
@@ -293,8 +293,8 @@ export class HistorySQL {
       }
       if (q.type === "sessions") {
         const rows = this.all(`SELECT CASE WHEN length(id)=64 THEN id END AS id,scope,
-          CASE WHEN length(CAST(root AS BLOB))<=4096 THEN root END AS root,
-          CASE WHEN length(CAST(session AS BLOB))<=4096 THEN session END AS session
+          CASE WHEN length(CAST(root AS BLOB))<=${HISTORY_TEXT_BYTES} THEN root END AS root,
+          CASE WHEN length(CAST(session AS BLOB))<=${HISTORY_TEXT_BYTES} THEN session END AS session
           FROM sessions WHERE scope=? AND id>? ORDER BY id LIMIT ?`, q.scope, q.after ?? "", q.limit ?? 100)
         return { sessions: rows.map(row => {
           validateScope(row as any)
@@ -303,9 +303,9 @@ export class HistorySQL {
         }), after: rows.at(-1)?.id }
       }
       if (q.type === "session") {
-        const row = this.get(`SELECT CASE WHEN length(CAST(scope AS BLOB))<=4096 THEN scope END AS scope,
-          CASE WHEN length(CAST(session AS BLOB))<=4096 THEN session END AS session,
-          CASE WHEN length(CAST(root AS BLOB))<=4096 THEN root END AS root
+        const row = this.get(`SELECT CASE WHEN length(CAST(scope AS BLOB))<=${HISTORY_TEXT_BYTES} THEN scope END AS scope,
+          CASE WHEN length(CAST(session AS BLOB))<=${HISTORY_TEXT_BYTES} THEN session END AS session,
+          CASE WHEN length(CAST(root AS BLOB))<=${HISTORY_TEXT_BYTES} THEN root END AS root
           FROM sessions WHERE id=?`, opaque(q.scope, q.session))
         if (!row) return {}
         validateScope(row as HistoryScope)
@@ -338,8 +338,8 @@ export class HistorySQL {
       // Validate indexed scalar types without loading report bodies or all index rows into JS.
       const invalid = this.get(`SELECT id FROM history WHERE scope=? AND root=? AND
         (typeof(completed)!='integer' OR completed<0 OR completed>8640000000000000 OR length(id)!=64 OR length(session)!=64
-        OR length(review)!=64 OR typeof(permission)!='text' OR length(CAST(permission AS BLOB))>4096
-        OR typeof(tie)!='text' OR length(tie)=0 OR length(CAST(tie AS BLOB))>4096
+        OR length(review)!=64 OR typeof(permission)!='text' OR length(CAST(permission AS BLOB))>${HISTORY_TEXT_BYTES}
+        OR typeof(tie)!='text' OR length(tie)=0 OR length(CAST(tie AS BLOB))>${HISTORY_TEXT_BYTES}
         OR length(CAST(resolution AS BLOB))>16 OR length(approving)>64
         OR outcome NOT IN ('auto','manual','rejected','cancelled')) LIMIT 1`, q.scope, root)
       const invalidOwner = this.get(`SELECT h.id FROM history h LEFT JOIN reviews r ON r.id=h.review
@@ -360,14 +360,14 @@ export class HistorySQL {
       const rank = this.get(`SELECT count(*) AS n FROM history WHERE ${base} AND (completed,tie,id)<=(?,?,?)`, q.scope, root, s.completed, s.tie, s.id)!.n
       if (!count(rank) || rank < 1 || rank > total) throw new HistoryInvalid("Invalid history rank")
       const result: HistorySelection = { revision, total, rank, entry: s.id, order: { completed: s.completed, tie: s.tie, id: s.id }, older: adjacent(s, false)?.id, newer: adjacent(s, true)?.id }
-      const contextRow = this.get("SELECT CASE WHEN length(CAST(context AS BLOB))<=262144 THEN context END AS context FROM reviews WHERE id=? AND root=? AND session=?", s.review, root, s.session)
+      const contextRow = this.get(`SELECT CASE WHEN length(CAST(context AS BLOB))<=${bytes.context} THEN context END AS context FROM reviews WHERE id=? AND root=? AND session=?`, s.review, root, s.session)
       if (typeof contextRow?.context !== "string") throw new HistoryInvalid("Invalid history ownership")
       const context: HistoryReview = JSON.parse(contextRow.context); validateReview(context)
       if (rootID(context) !== root || sessionID(context) !== s.session || entryID(context) !== s.id || reviewID(context) !== s.review) throw new HistoryInvalid("Invalid history ownership")
       result.session = context.session
       try {
-        const body = this.get("SELECT CASE WHEN length(CAST(body AS BLOB))<=524288 THEN body END AS body FROM payloads WHERE id=?", s.id)?.body
-        if (typeof body !== "string" || Buffer.byteLength(body) > 512 * 1024) throw new Error()
+        const body = this.get(`SELECT CASE WHEN length(CAST(body AS BLOB))<=${bytes.payload} THEN body END AS body FROM payloads WHERE id=?`, s.id)?.body
+        if (typeof body !== "string" || Buffer.byteLength(body) > bytes.payload) throw new Error()
         const payload = validatePayload(JSON.parse(body))
         if (payload.completedAt !== s.completed) throw new Error()
         result.record = { context, payload, outcome: s.outcome, approvingReview: s.approving ?? undefined }

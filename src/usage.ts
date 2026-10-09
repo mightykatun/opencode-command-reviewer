@@ -1,5 +1,6 @@
 import type { Model, Provider } from "@opencode-ai/sdk/v2"
 import { uiText } from "./ui-text.js"
+import { HISTORY_TEXT_BYTES } from "./history-records.js"
 
 /** Token counts are a pair; cost is independently available. */
 export interface Usage { input?: number; output?: number; cost?: number }
@@ -11,7 +12,7 @@ const count = (value: unknown): value is number => typeof value === "number" && 
 const rate = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0
 /** Bounded historical metadata, independent of assessment validation and pricing. */
 export const reportedModel = (value: unknown): string | undefined => typeof value === "string" && value.trim()
-  && !value.includes("\0") && Buffer.byteLength(value) <= 4096 ? value : undefined
+  && !value.includes("\0") && Buffer.byteLength(value) <= HISTORY_TEXT_BYTES ? value : undefined
 const endpoint = (value: unknown) => {
   if (typeof value !== "string") return
   try { return new URL(value).href.replace(/\/+$/, "") } catch { return }

@@ -3,6 +3,7 @@ import type { HistoryStore } from "./history-store.js"
 import type { ConversationTotals } from "./history-schema.js"
 import type { LifetimeTotals } from "./lifetime.js"
 import { withDeadline } from "./deadline.js"
+import type { AncestryRead, AncestryReader } from "./session-mode.js"
 
 export type StatisticsScope = "conversation" | "lifetime"
 export interface StatisticsState {
@@ -22,7 +23,7 @@ export class StatisticsController {
   private abort?: AbortController
   private stopped = false
   constructor(private scope: string, store: Pick<HistoryStore, "query" | "onCommit" | "onWriteFailure">,
-    private ancestry: (session: string, signal: AbortSignal) => Promise<string>, private publish: (state: StatisticsState) => void) {
+    private ancestry: AncestryReader, private publish: (state: StatisticsState) => void) {
     this.refresh = new HistoryRefresh(store, { type: "totals" }, value => {
       if (value && "totals" in value) this.update({ totals: value.totals, conversation: value.conversation, unavailable: false })
       else this.update({ unavailable: true })
@@ -57,9 +58,10 @@ export class StatisticsController {
     this.lookupAgain = false
     const generation = this.generation, session = this.session, abort = this.abort = new AbortController()
     let worker: Promise<string> | undefined
+    let read: AncestryRead | undefined
     try {
       const root = await withDeadline(abort.signal, 5000, signal => {
-        worker = Promise.resolve().then(() => { signal.throwIfAborted(); return this.ancestry(session, signal) })
+        worker = Promise.resolve().then(() => { signal.throwIfAborted(); return read = this.ancestry(session, signal) })
         return worker
       })
       if (!this.current(generation) || abort.signal.aborted) return
@@ -70,6 +72,7 @@ export class StatisticsController {
       // A timed-out lookup retains actual ownership. Rapid reopen/scope changes
       // coalesce to the newest session instead of spawning abandoned host reads.
       await worker?.catch(() => {})
+      await read?.settled?.catch(() => {})
       this.lookup = false
       if (!this.stopped && this.state.open && !this.root && this.state.view === "conversation"
         && (generation !== this.generation || this.lookupAgain)) void this.resolve()

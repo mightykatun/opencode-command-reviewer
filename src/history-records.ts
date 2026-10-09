@@ -7,6 +7,30 @@ export const HISTORY_EVENT_BYTES = 512 * 1024
 export const HISTORY_QUEUE_BYTES = 64 * 1024 * 1024
 export const HISTORY_OPERATION_OVERHEAD = 512
 export const HISTORY_RETRY_MS = 2000
+export const HISTORY_TEXT_BYTES = 4096
+export const HISTORY_DESCRIPTION_BYTES = 65536
+// JSON can expand one UTF-8 byte into six ASCII bytes (e.g. U+0001).
+// These are serialized ceilings, not replacements for decoded shape validation.
+const stringBytes = (bytes: number) => 2 + 6 * bytes
+const objectBytes = (fields: Record<string, number>) => 2 + Object.entries(fields)
+  .reduce((sum, [key, bytes]) => sum + JSON.stringify(key).length + 1 + bytes + 1, 0)
+const numberBytes = 24 // Covers every finite nonnegative JSON number, including exponents.
+const textBytes = stringBytes(HISTORY_TEXT_BYTES)
+const usageBytes = objectBytes({ input: numberBytes, output: numberBytes, cost: numberBytes })
+const acceptedFields = { safe: 5, completedAt: numberBytes, reportedModel: textBytes,
+  timing: objectBytes({ fullReportMs: numberBytes, ratingMs: numberBytes }) }
+export const HISTORY_RECORD_BYTES = {
+  context: objectBytes({ scope: textBytes, root: textBytes, session: textBytes, permission: textBytes,
+    review: textBytes, category: JSON.stringify("external_directory").length, configuredModel: textBytes, provider: textBytes }),
+  accepted: objectBytes(acceptedFields),
+  dispatched: objectBytes({ at: numberBytes, retry: JSON.stringify("transport").length }),
+  finalized: objectBytes({ at: numberBytes, usage: usageBytes, reportedModel: textBytes }),
+  payload: objectBytes({ ...acceptedFields, desc: stringBytes(HISTORY_DESCRIPTION_BYTES), usage: usageBytes }),
+  totals: objectBytes({ requests: numberBytes, tokenRequests: numberBytes, input: numberBytes, output: numberBytes,
+    priced: numberBytes, cost: numberBytes, since: numberBytes, safe: numberBytes, unsafe: numberBytes, ratingsSince: numberBytes,
+    activity: objectBytes({ reviews: numberBytes, usageRequests: numberBytes, retries: numberBytes, autoApproved: numberBytes,
+      timedReviews: numberBytes, meanFullReportMs: numberBytes, meanRatingMs: numberBytes, since: numberBytes }) }),
+} as const
 export class HistoryInvalid extends Error {}
 export interface HistoryScope { scope: string; root: string; session: string }
 export interface HistoryReview extends HistoryScope {
@@ -54,7 +78,7 @@ function object(v: unknown, keys: string[]): asserts v is Record<string, unknown
     return typeof k === "string" && keys.includes(k) && descriptor.enumerable && "value" in descriptor
   }))
 }
-function text(v: unknown, max = 4096): asserts v is string {
+function text(v: unknown, max = HISTORY_TEXT_BYTES): asserts v is string {
   requireValue(typeof v === "string" && v.trim().length > 0 && Buffer.byteLength(v) <= max && !v.includes("\0"))
 }
 function timestamp(v: unknown) { requireValue(count(v) && v <= 8.64e15) }
@@ -88,7 +112,7 @@ export function validatePayload(v: HistoryPayload): HistoryPayload {
   accepted(v, true)
   // Accepted assessment text may contain decoded controls. Preserve it verbatim;
   // displayText escapes those controls when either live or stored reports render.
-  requireValue(typeof v.desc === "string" && v.desc.trim().length > 0 && Buffer.byteLength(v.desc) <= 65536)
+  requireValue(typeof v.desc === "string" && v.desc.trim().length > 0 && Buffer.byteLength(v.desc) <= HISTORY_DESCRIPTION_BYTES)
   if (v.usage !== undefined) usage(v.usage)
   return v
 }

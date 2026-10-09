@@ -4,10 +4,11 @@ import { lifetimeCost, lifetimeReport } from "./lifetime.js"
 import { StatisticsController, type StatisticsState } from "./statistics-controller.js"
 import type { HistoryStore } from "./history-store.js"
 import { uiText } from "./ui-text.js"
+import type { AncestryReader } from "./session-mode.js"
 
 /** Independent accounting UI: no session writes and no dependency on review visibility. */
 export function lifetimeTracker(api: TuiPluginApi, store: Pick<HistoryStore, "query" | "onCommit" | "onWriteFailure">,
-  root: (session: string, signal: AbortSignal) => Promise<string>) {
+  root: AncestryReader) {
   const [state, setState] = createSignal<StatisticsState>({ open: false, view: "lifetime", unavailable: false, ancestry: "none" })
   const controller = new StatisticsController(api.state.path.directory, store, root, setState)
   const stop = () => controller.dispose()

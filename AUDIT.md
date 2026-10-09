@@ -21,12 +21,13 @@ Implementation starts from `0aaf9d6`. Checkboxes require passing evidence, not a
   - [x] Preserve quoted skill paths, consume link destinations whole, and compare main-file identity canonically.
   - [x] Enforce atomic no-follow prompt overrides with valid-link and swap regressions.
   - [x] Pass focused evidence tests and required real shell/skill fixtures after build; record outputs.
-  - [ ] Commit the verified W2 checkpoint.
-- [ ] W3: persistence and actual operation ownership (A07, A08, A09)
-  - [ ] Derive compatible serialized metadata bounds; prove legacy baseline and unrelated-root FIFO recovery.
-  - [ ] Separate local maintenance progress from external invalidation; prove linear cleanup and healthy reconciliation.
-  - [ ] Bound/coalesce actual ancestry operations through timeout, reopen, late settlement, and disposal.
-  - [ ] Pass SQLite/controller composition tests and storage/maintenance/statistics/mode host fixtures; record outputs and commit.
+  - [x] Commit the verified W2 checkpoint: `e03426e`.
+- [x] W3: persistence and actual operation ownership (A07, A08, A09)
+  - [x] Derive compatible serialized metadata bounds; prove legacy baseline and unrelated-root FIFO recovery.
+  - [x] Separate local maintenance progress from external invalidation; prove linear cleanup and healthy reconciliation.
+  - [x] Bound/coalesce actual ancestry operations through timeout, reopen, late settlement, and disposal.
+  - [x] Pass SQLite/controller composition tests and storage/maintenance/statistics/mode host fixtures; record outputs.
+  - [ ] Commit the verified W3 checkpoint.
 - [ ] W4: notification admission, delivery, and navigation (A10-A15)
   - [ ] Own icon-worker rejection immediately and retain eventual cleanup.
   - [ ] Recover only eligible event-born question admission after metadata/capacity recovery.
@@ -84,6 +85,19 @@ node scripts/smoke-skills.mjs root                  PASS host skill catalog/supp
 node scripts/smoke-skills.mjs subagent              PASS resumed delegation/skill evidence
 node scripts/smoke.mjs stalled-file                 PASS bounded omission and responsive TUI
 ```
+
+**W3:** all six targeted fail-before regressions failed at baseline. Final focused storage/browser/controller/ancestry/notification-host/usage suite passed **251/251**. `npm run check` passed typecheck, **955 source tests**, **77 helpers**, and build; diff checks passed. The 110-root/10-missing case now completes in **210 lookups, 212 turns**, including final healthy confirmation. Logs: `.runtime/w3-fail-before.log`, `.runtime/w3-focused.log`, `.runtime/w3-check.log`.
+
+```text
+node scripts/smoke-history-storage.mjs              PASS .runtime/w3-host-storage.log
+node scripts/smoke-history-maintenance.mjs          PASS .runtime/w3-host-maintenance.log
+node scripts/smoke-statistics.mjs                   PASS .runtime/w3-host-statistics.log
+node scripts/smoke-history.mjs browse               PASS .runtime/w3-host-browse.log
+node scripts/smoke-session-mode.mjs                 PASS .runtime/w3-host-session-mode.log
+node scripts/smoke-history-auto.mjs notification     PASS .runtime/w3-host-history-auto-notification.log
+```
+
+W3 interface contract: `AncestryRead = Promise<string> & { settled?: Promise<void> }` preserves caller deadlines separately from actual traversal cleanup; forwarding functions retain the original handle. `SessionModes` allows two actual traversals, coalesces same-session reads, and does not release ownership on caller timeout. Browser/statistics retain one active lookup and the newest replacement. The extended statistics host fixture recorded one read per held session, maximum concurrency one, two aborted callers, and zero outstanding reads after recovery (`.runtime/statistics/ancestry.json`). Maintenance now distinguishes publication invalidation from external scan invalidation; local cleanup preserves its cursor and requires durable deletion plus a healthy confirming pass.
 
 ## 1. Scope, provenance, and status
 
