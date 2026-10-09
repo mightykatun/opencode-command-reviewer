@@ -6,7 +6,7 @@ import type { PermissionRequest } from "@opencode-ai/sdk/v2"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { approvalTransport, type ApprovalTransport } from "../src/approval.js"
 import { parseConfig } from "../src/config.js"
-import { Controller, visibleReview, type ApprovalClock, type View } from "../src/controller.js"
+import { Controller, visibleReview, type ApprovalClock, type ApprovalFact, type View } from "../src/controller.js"
 import type { Assessment } from "../src/types.js"
 import { HistoryCover } from "../src/history-cover.js"
 
@@ -56,12 +56,15 @@ function fixture(t: TestContext, settings: {
   transport?: ApprovalTransport
   changed?: (views: View[], controller: Controller) => void
   presentation?: () => boolean
+  observer?: (fact: ApprovalFact, controller: Controller) => void
 } = {}) {
   const clock = new FakeClock()
   const reads: AbortSignal[] = []
   const writes: { request: PermissionRequest; signal: AbortSignal }[] = []
   const evaluated: string[] = []
   const publications: View[][] = []
+  const facts: ApprovalFact[] = []
+  let enabled = true
   const host = { pending: [] as PermissionRequest[], shown: true, extra: [] as View[] }
   const getSession = (id: string) => ({ id, ...(id === "child" ? { parentID: "root" } : {}) })
   const visible = (): string | undefined => host.shown && (settings.presentation?.() ?? true)
@@ -82,7 +85,9 @@ function fixture(t: TestContext, settings: {
     visibleID: visible,
     list: (signal) => { reads.push(signal); return transport.list(signal) },
     once: (req, signal) => { writes.push({ request: req, signal }); return transport.once(req, signal) },
-  }, clock)
+  }, clock, { root: async () => "root", load: async () => {}, enabled: () => enabled }, fact => {
+    facts.push(fact); settings.observer?.(fact, controller)
+  })
   t.after(() => controller.dispose())
   const view = (id = "b-review") => controller.views.find((item) => item.request.id === id)
   const add = async (req = request()) => {
@@ -91,7 +96,8 @@ function fixture(t: TestContext, settings: {
     await settle()
   }
   const present = () => controller.presented(visible())
-  return { controller, clock, reads, writes, evaluated, publications, host, visible, view, add, present }
+  return { controller, clock, reads, writes, facts, evaluated, publications, host, visible, view, add, present,
+    mode: (value: boolean) => { enabled = value; controller.modeChanged("root") } }
 }
 
 test("production history hit-grid handoff preserves the original countdown through same-frame navigation and close", async t => {
@@ -558,11 +564,12 @@ for (const [name, change] of changedScopes) test(`same-ID changed ${name} invali
   assert.equal(f.writes.length, 0)
 })
 
-for (const event of ["new request", "unknown reply", "unknown deletion"] as const) test(`${event} invalidates an outstanding fresh snapshot by revision`, async (t) => {
+for (const event of ["new request", "unknown reply", "unknown deletion"] as const) test(`${event} rejects stale snapshots and recovers through bounded fresh verification`, async (t) => {
   const fresh = deferred<PermissionRequest[]>()
   const recovery = deferred<PermissionRequest[]>()
+  const latest = deferred<PermissionRequest[]>()
   let reads = 0
-  const f = fixture(t, { transport: { list: () => ++reads === 1 ? fresh.promise : recovery.promise, once: async () => {} } })
+  const f = fixture(t, { transport: { list: () => [fresh, recovery, latest][reads++]!.promise, once: async () => {} } })
   await f.add()
   f.present()
   const operation = f.controller.approveNow("b-review")
@@ -574,16 +581,23 @@ for (const event of ["new request", "unknown reply", "unknown deletion"] as cons
   assert.ok(f.controller.revision > revision)
   fresh.resolve([request()])
   await settle()
-  assert.equal(f.view()?.autoApproval?.status, "failed")
+  assert.equal(f.view()?.autoApproval?.status, "checking")
   assert.equal(f.writes.length, 0)
   assert.equal(f.reads.length, 2)
   if (event === "new request") assert.ok(f.view("z-new"), "stale verification cannot erase the newer request")
   // Even the recovery read is revision guarded; it must not erase this new event.
   f.controller.asked(request("z-recovery-event"))
   recovery.resolve([request()])
-  await operation
+  await settle()
   assert.ok(f.view("z-recovery-event"))
-  assert.equal(f.view()?.autoApproval?.status, "failed")
+  assert.equal(f.view()?.autoApproval?.status, "checking")
+  assert.equal(f.reads.length, 3)
+  latest.resolve(f.controller.views.map(view => structuredClone(view.request)))
+  await operation
+  assert.equal(f.writes.length, 1)
+  assert.ok(f.view("z-recovery-event"))
+  if (event === "new request") assert.ok(f.view("z-new"))
+  assert.deepEqual(f.facts.map(fact => fact.type), ["dispatched", "confirmed", "settled"])
 })
 
 for (const source of ["fresh list", "native visibility"] as const) test(`post-list native-first blocker from ${source} prevents once despite stale presentation`, async (t) => {
@@ -620,12 +634,10 @@ for (const effect of ["hide", "reply", "delete", "dispose"] as const) test(`sync
   else assert.deepEqual(f.controller.views, [])
 })
 
-test("five-second verification deadline aborts a noncooperative list and bounds its read-only recovery", async (t) => {
+test("five-second verification deadline retains noncooperative list ownership without overlapping recovery", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] })
   const fresh = deferred<PermissionRequest[]>()
-  const recovery = deferred<PermissionRequest[]>()
-  let reads = 0
-  const f = fixture(t, { transport: { list: () => ++reads === 1 ? fresh.promise : recovery.promise, once: async () => {} } })
+  const f = fixture(t, { transport: { list: () => fresh.promise, once: async () => {} } })
   await f.add()
   f.present()
   const operation = f.controller.approveNow("b-review")
@@ -638,19 +650,195 @@ test("five-second verification deadline aborts a noncooperative list and bounds 
   await settle()
   assert.equal(f.view()?.autoApproval?.status, "failed")
   assert.equal(f.reads[0]?.aborted, true)
-  assert.equal(f.reads.length, 2)
-  t.mock.timers.tick(5000)
+  assert.equal(f.reads.length, 1, "a timed-out unsettled read still owns the read slot")
   await operation
-  assert.equal(f.reads[1]?.aborted, true)
   const publications = f.publications.length
   fresh.resolve([request()])
-  recovery.resolve([])
   await settle()
   assert.equal(f.publications.length, publications)
   assert.equal(f.view()?.assessment, safe)
   assert.equal(f.view()?.autoApproval?.status, "failed")
   assert.equal(f.writes.length, 0)
 })
+
+test("stale-read retry shares the original five-second budget and never overlaps an unsettled read", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const first = deferred<PermissionRequest[]>(), second = deferred<PermissionRequest[]>()
+  let reads = 0, active = 0, maximum = 0
+  const f = fixture(t, { transport: {
+    list: async () => {
+      maximum = Math.max(maximum, ++active)
+      try { return await (++reads === 1 ? first.promise : second.promise) }
+      finally { active-- }
+    }, once: async () => {},
+  } })
+  await f.add(); f.present()
+  const operation = f.controller.approveNow("b-review", true)
+  await settle(); t.mock.timers.tick(4000)
+  f.controller.replied("unrelated")
+  first.resolve([request()]); await settle()
+  assert.equal(reads, 2)
+  assert.equal(maximum, 1)
+  assert.equal(f.view()?.autoApproval?.status, "checking")
+  assert.equal(f.reads[1], f.reads[0], "retry uses the original verification signal/deadline")
+  t.mock.timers.tick(999); await settle()
+  assert.equal(f.reads[1]!.aborted, false)
+  t.mock.timers.tick(1); await operation
+  assert.equal(f.reads[1]!.aborted, true)
+  assert.equal(reads, 2, "timeout cannot launch a recovery read over unsettled I/O")
+  assert.equal(active, 1)
+  assert.equal(f.writes.length, 0)
+  second.resolve([request()]); await settle()
+  assert.equal(active, 0)
+  assert.equal(f.writes.length, 0, "late settlement cannot dispatch")
+})
+
+for (const outcome of ["resolve", "reject"] as const) test(`canceled verification owns its read across a newer approval until late ${outcome}`, async t => {
+  const first = deferred<PermissionRequest[]>()
+  let reads = 0, active = 0, maximum = 0
+  const f = fixture(t, { transport: {
+    list: async () => {
+      maximum = Math.max(maximum, ++active)
+      try { return ++reads === 1 ? await first.promise : [request("c-new")] }
+      finally { active-- }
+    }, once: async () => {},
+  } })
+  await f.add(); f.present()
+  const old = f.controller.approveNow("b-review", true)
+  await settle(); f.controller.replied("b-review"); await old
+  await f.add(request("c-new")); f.present()
+  const next = f.controller.approveNow("c-new", true)
+  await settle()
+  assert.equal(reads, 1)
+  assert.equal(active, 1)
+  if (outcome === "resolve") first.resolve([request()])
+  else first.reject(Error("late read error"))
+  await next
+  assert.equal(reads, 2)
+  assert.equal(maximum, 1)
+  assert.equal(active, 0)
+  assert.deepEqual(f.writes.map(write => write.request.id), ["c-new"])
+})
+
+for (const effect of ["hide", "blocker", "disable", "reply", "delete", "dispose", "cancel", "changed scope"] as const) {
+  test(`fresh retry after unrelated churn still prevents dispatch on ${effect}`, async t => {
+    const first = deferred<PermissionRequest[]>(), next = deferred<PermissionRequest[]>()
+    let reads = 0
+    const f = fixture(t, { transport: {
+      list: () => ++reads === 1 ? first.promise : next.promise, once: async () => {},
+    } })
+    await f.add(); f.present()
+    const operation = f.controller.approveNow("b-review", true)
+    await settle(); f.controller.replied("unrelated"); first.resolve([request()]); await settle()
+    assert.equal(f.reads.length, 2)
+    assert.equal(f.view()?.autoApproval?.status, "checking")
+    if (effect === "hide") { f.host.shown = false; f.present() }
+    else if (effect === "blocker") f.controller.asked(request("z-child", "read", "child"))
+    else if (effect === "disable") f.mode(false)
+    else if (effect !== "changed scope") remove(f.controller, effect)
+    const current = request()
+    if (effect === "changed scope") current.metadata.command = "different command"
+    next.resolve([current]); await operation
+    assert.equal(f.writes.length, 0)
+    assert.equal(f.facts.some(fact => fact.type === "dispatched" || fact.type === "confirmed"), false)
+    if (effect === "changed scope") {
+      assert.equal(f.view()?.autoApproval?.status, "failed")
+      f.present(); await f.controller.approveNow("b-review", true)
+      assert.equal(f.writes.length, 0)
+    }
+  })
+}
+
+test("an unrelated event in the deferred dispatch gap requires another fresh list before once", async t => {
+  const next = deferred<PermissionRequest[]>()
+  let queued = false, reads = 0
+  const f = fixture(t, {
+    changed: views => {
+      if (queued || !views.some(view => view.autoApproval?.status === "allowing")) return
+      queued = true
+      queueMicrotask(() => f.controller.asked(request("z-later")))
+    },
+    transport: { list: () => ++reads === 1 ? Promise.resolve([request()]) : next.promise, once: async () => {} },
+  })
+  await f.add(); f.present()
+  const operation = f.controller.approveNow("b-review", true)
+  await settle()
+  assert.equal(reads, 2)
+  assert.equal(f.writes.length, 0)
+  assert.ok(f.view("z-later"))
+  assert.equal(f.view()?.autoApproval?.status, "checking")
+  next.resolve([request(), request("z-later")]); await operation
+  assert.equal(f.writes.length, 1)
+  assert.deepEqual(f.facts.map(fact => fact.type), ["dispatched", "confirmed", "settled"])
+})
+
+test("a synchronous once throw is a single uncertain invocation, even when its observer reenters", async t => {
+  const observed: number[] = []
+  const f = fixture(t, { transport: { list: async () => [request()], once: () => { throw Error("uncertain") } },
+    observer: fact => {
+      if (fact.type !== "dispatched") return
+      observed.push(f.writes.length); f.controller.cancelAutoApproval("b-review")
+    },
+  })
+  await f.add(); f.present(); await f.controller.approveNow("b-review", true)
+  assert.deepEqual(observed, [1])
+  assert.deepEqual(f.facts.map(fact => [fact.type, fact.result]), [["dispatched", undefined], ["settled", "uncertain"]])
+  f.mode(false); f.mode(true); f.controller.reconcile([request()], f.controller.revision); await settle()
+  f.present(); await f.controller.approveNow("b-review", true)
+  assert.equal(f.writes.length, 1)
+  assert.equal(f.view()?.autoApproval?.status, "failed")
+})
+
+for (const effect of ["hide", "blocker", "disable", "reply", "delete", "dispose", "cancel"] as const) {
+  test(`dispatch reservation: microtask ${effect} before once sends nothing and emits no dispatch facts`, async t => {
+    let queued = false
+    const f = fixture(t, { changed: views => {
+      if (queued || !views.some(view => view.autoApproval?.status === "allowing")) return
+      queued = true
+      queueMicrotask(() => {
+        if (effect === "hide") { f.host.shown = false; f.present() }
+        else if (effect === "blocker") f.controller.asked(request("z-child", "read", "child"))
+        else if (effect === "disable") f.mode(false)
+        else remove(f.controller, effect)
+      })
+    } })
+    await f.add(); f.present(); await f.controller.approveNow("b-review", true); await settle()
+    assert.equal(queued, true)
+    assert.equal(f.writes.length, 0)
+    assert.equal(f.facts.some(fact => fact.type === "dispatched" || fact.type === "confirmed"), false)
+    assert.ok(f.facts.every(fact => fact.type === "settled" && fact.result === "not-sent"))
+    assert.ok(f.controller.views.every(view => !view.retained))
+    if (["hide", "blocker", "cancel"].includes(effect)) {
+      assert.equal(f.view()?.autoApproval?.status, "cancelled")
+      f.host.shown = true; f.controller.replied("z-child"); f.present()
+      await f.controller.approveNow("b-review", true)
+      assert.equal(f.writes.length, 0, "actual cancellation stays durable")
+    }
+    if (effect === "disable") {
+      f.mode(true); f.controller.reconcile([request()], f.controller.revision); await settle(); f.present()
+      assert.equal(f.view()?.autoApproval?.status, "cancelled", "reservation is canceled, never an uncertain write")
+    }
+  })
+}
+
+for (const effect of ["hide", "disable", "reply", "delete", "dispose"] as const) {
+  test(`dispatch observer sees an actual invocation before synchronous ${effect}`, async t => {
+    const observations: number[] = []
+    const f = fixture(t, { observer: fact => {
+      if (fact.type !== "dispatched") return
+      observations.push(f.writes.length)
+      if (effect === "hide") { f.host.shown = false; f.present() }
+      else if (effect === "disable") f.mode(false)
+      else remove(f.controller, effect)
+    } })
+    await f.add(); f.present(); await f.controller.approveNow("b-review", true); await settle()
+    assert.deepEqual(observations, [1], "a dispatch observer must never describe a merely reserved write")
+    assert.equal(f.writes.length, 1)
+    assert.equal(f.facts.filter(fact => fact.type === "dispatched").length, 1)
+    assert.equal(f.facts.some(fact => fact.result === "not-sent"), false)
+    assert.equal(f.facts.filter(fact => fact.type === "confirmed").length, ["hide", "reply"].includes(effect) ? 1 : 0)
+  })
+}
 
 test("fresh read and once share one five-second deadline; a timed-out write is never retried", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] })

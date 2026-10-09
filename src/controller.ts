@@ -8,7 +8,7 @@ import { withDeadline } from "./reviewer.js"
 import { candidateEnabled, type ReviewOptions } from "./classification.js"
 import type { SessionModeGate } from "./session-mode.js"
 import { SCANNER_INTERVAL_MS } from "./appearance.js"
-import { remainingTime } from "./deadline.js"
+import { remainingTime, reviewStage } from "./deadline.js"
 import { uiText } from "./ui-text.js"
 import type { HistoryTarget } from "./history-records.js"
 
@@ -37,6 +37,7 @@ interface Entry {
   startedAt?: number; ratingAt?: number
   review: string
   approvalDispatched?: boolean
+  approvalRefresh?: boolean
   fastApproval?: "pending" | "confirmed"
 }
 
@@ -75,6 +76,7 @@ export class Controller {
   private workers = new Set<Promise<unknown>>()
   private acknowledgements = new Map<AbortController, { request: PermissionRequest; root?: string }>()
   private approvalWorkers = new Set<Promise<unknown>>()
+  private approvalRead?: Promise<PermissionRequest[]>
   constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
     private options: Options = { reviewBash: true, reviewEdits: true },
     private approval?: Approval, private time: ApprovalClock = clock, private modes?: SessionModeGate,
@@ -113,7 +115,8 @@ export class Controller {
     const state = entry.view.autoApproval?.status
     if (state === "countdown" || state === "checking" || (state === "allowing" && !entry.approvalDispatched))
       this.lifecycleFact({ type: "cancelled", request: entry.view.request, reason: "mode" })
-    if (state) this.manual.set(id, state === "failed" || state === "allowing" ? "failed" : "cancelled")
+    const uncertain = state === "failed" || (state === "allowing" && entry.approvalDispatched)
+    if (state) this.manual.set(id, uncertain ? "failed" : "cancelled")
     entry.cancelTimer?.()
     this.clearProgress(entry)
     entry.approvalAbort?.abort()
@@ -123,7 +126,7 @@ export class Controller {
       // Suspension hides the report, but cannot turn an uncertain/dispatched
       // approval into a confirmed manual wait. Read-only reconciliation still
       // owns that confirmation, and the existing tombstone still forbids retry.
-      ...(state === "failed" || state === "allowing" ? { autoApproval: { status: "failed" as const },
+      ...(uncertain ? { autoApproval: { status: "failed" as const },
         ...(state === "failed" && entry.view.approvalPendingConfirmed ? { approvalPendingConfirmed: true } : {}) } : {}),
     }
   }
@@ -156,7 +159,7 @@ export class Controller {
 
   cancelAutoApproval(id: string, reason: "explicit" | "visibility" = "explicit") {
     const entry = this.entries.get(id)
-    if (!entry || !["countdown", "checking"].includes(entry.view.autoApproval?.status ?? "")) return
+    if (!entry || entry.approvalDispatched || !["countdown", "checking", "allowing"].includes(entry.view.autoApproval?.status ?? "")) return
     this.lifecycleFact({ type: "cancelled", request: entry.view.request, reason })
     entry.cancelTimer?.()
     entry.cancelTimer = undefined
@@ -253,9 +256,22 @@ export class Controller {
     })
   }
 
+  /** A deadline can stop waiting, but only actual list settlement frees the slot. */
+  private async approvalList(signal: AbortSignal) {
+    while (this.approvalRead) {
+      await this.approvalRead.catch(() => {})
+      reviewStage(signal, "Approval verification")
+    }
+    reviewStage(signal, "Approval verification")
+    const read = this.approval!.list(signal)
+    this.approvalRead = read
+    try { return await read }
+    finally { if (this.approvalRead === read) this.approvalRead = undefined }
+  }
+
   async approveNow(id: string, automatic = false) {
     const entry = this.entries.get(id)
-    if (!entry || !this.approval || !(entry.view.autoApproval?.status === "countdown"
+    if (!entry || !this.approval || entry.approvalRefresh || !(entry.view.autoApproval?.status === "countdown"
       || (this.options.fastMode && automatic && entry.view.autoApproval?.status === "checking" && !entry.approvalAbort))) return
     if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
     entry.cancelTimer?.()
@@ -271,68 +287,87 @@ export class Controller {
       ...(type === "settled" && !confirmed ? { result: dispatched ? "uncertain" as const : "not-sent" as const } : {}) })
     try {
       await withDeadline(AbortSignal.any([entry.abort.signal, entry.approvalAbort.signal]), 5000, async (signal) => {
-        const revision = this.version
-        const pending = await this.approval!.list(signal)
-        signal.throwIfAborted()
-        if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
-        if (revision !== this.version) throw new Error("Pending permissions changed during verification")
-        const current = pending.find((request) => request.id === id)
-        if (!current) { this.replied(id, true, "reconciled"); return }
-        if (!isDeepStrictEqual(current, entry.view.request)) throw new Error("Pending request changed")
-        this.reconcile(pending, revision)
-        if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
-        entry.view = { ...entry.view, autoApproval: { status: "allowing" } }
-        this.publish()
-        // Publishing can synchronously trigger native resolution or visibility loss.
-        signal.throwIfAborted()
-        if (!this.eligible(entry)) {
-          this.lifecycleFact({ type: "cancelled", request: entry.view.request, reason: "visibility" })
-          this.manual.set(id, "cancelled")
-          entry.view = { ...entry.view, autoApproval: { status: "cancelled" } }
+        // Three sequential reads bound churn without accepting a stale snapshot
+        // or replenishing the original five-second read/write budget.
+        for (let reads = 0; reads < 3; reads++) {
+          reviewStage(signal, "Approval verification")
+          if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
+          const revision = this.version
+          const pending = await this.approvalList(signal)
+          reviewStage(signal, "Approval verification")
+          if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
+          if (revision !== this.version) continue
+          const current = pending.find((request) => request.id === id)
+          if (!current) { this.replied(id, true, "reconciled"); return }
+          if (!isDeepStrictEqual(current, entry.view.request)) throw new Error("Pending request changed")
+          const verified = structuredClone(current)
+          this.reconcile(pending, revision)
+          const verifiedRevision = this.version
+          if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
+          // This is only a cancellable reservation. Publication may schedule
+          // microtasks that change eligibility before the deferred write callback.
+          entry.view = { ...entry.view, autoApproval: { status: "allowing" } }
           this.publish()
-          return
-        }
-        this.manual.set(id, "failed") // A dispatched write must never be tried again after a mode switch.
-        const remaining = remainingTime(signal)
-        fact("dispatched")
-        signal.throwIfAborted()
-        dispatched = true
-        entry.approvalDispatched = true
-        if (this.options.fastMode && automatic) {
-          entry.fastApproval = "pending"
-          entry.view = { ...entry.view, retained: true }
-        }
-        const acknowledgement = new AbortController()
-        this.acknowledgements.set(acknowledgement, { request: entry.view.request, root: entry.root })
-        const abort = () => { if (signal.reason !== permissionResolved) acknowledgement.abort(signal.reason) }
-        signal.addEventListener("abort", abort, { once: true })
-        if (signal.aborted) abort()
-        // Native reply events are confirmation of resolution, not attribution.
-        // Keep this same dispatched POST's acknowledgement alive through the
-        // remaining original deadline, never resend or infer success from idle.
-        const write = withDeadline(acknowledgement.signal, remaining, async (bounded) => {
-          try {
-            await this.approval!.once(entry.view.request, bounded)
-            if (!bounded.aborted) {
-              confirmed = true
-              if (entry.fastApproval && this.active(entry)) {
-                entry.fastApproval = "confirmed"
-                entry.view = { ...entry.view, resolved: true, autoApproval: { status: "approved" } }
-              }
-              fact("confirmed")
-              if (entry.fastApproval && this.active(entry)) { this.publish(); this.finishFast(entry) }
+          const remaining = remainingTime(signal)
+          const acknowledgement = new AbortController()
+          const abort = () => { if (!dispatched || signal.reason !== permissionResolved) acknowledgement.abort(signal.reason) }
+          signal.addEventListener("abort", abort, { once: true })
+          if (signal.aborted) abort()
+          const write = withDeadline(acknowledgement.signal, remaining, async (bounded) => {
+            reviewStage(signal, "Approval verification")
+            reviewStage(bounded, "Approval acknowledgement")
+            if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
+            if (verifiedRevision !== this.version) return
+            if (!isDeepStrictEqual(verified, entry.view.request)) throw new Error("Pending request changed")
+            reviewStage(signal, "Approval verification")
+            reviewStage(bounded, "Approval acknowledgement")
+            // No observer, publication or await may separate this guard and once.
+            // Mark actual invocation first so synchronous native resolution inside
+            // the transport keeps the same bounded acknowledgement/fast response.
+            this.manual.set(id, "failed")
+            dispatched = true
+            entry.approvalDispatched = true
+            if (this.options.fastMode && automatic) {
+              entry.fastApproval = "pending"
+              entry.view = { ...entry.view, retained: true }
             }
-          } finally {
+            this.acknowledgements.set(acknowledgement, { request: entry.view.request, root: entry.root })
+            try {
+              let response: Promise<void>
+              try { response = this.approval!.once(entry.view.request, bounded) }
+              finally { fact("dispatched") } // Even a synchronous throw is an invoked, uncertain write.
+              await response
+              if (!bounded.aborted) {
+                confirmed = true
+                if (entry.fastApproval && this.active(entry)) {
+                  entry.fastApproval = "confirmed"
+                  entry.view = { ...entry.view, resolved: true, autoApproval: { status: "approved" } }
+                }
+                fact("confirmed")
+                if (entry.fastApproval && this.active(entry)) { this.publish(); this.finishFast(entry) }
+              }
+            } finally { fact("settled") }
+          }).finally(() => {
             this.acknowledgements.delete(acknowledgement)
             signal.removeEventListener("abort", abort)
-            fact("settled")
-          }
-        })
-        this.approvalWorkers.add(write)
-        void write.then(() => this.approvalWorkers.delete(write), () => this.approvalWorkers.delete(write))
-        await write
-        signal.throwIfAborted()
-        this.replied(id)
+          })
+          this.approvalWorkers.add(write)
+          void write.then(() => this.approvalWorkers.delete(write), () => this.approvalWorkers.delete(write))
+          await write
+          signal.throwIfAborted()
+          if (dispatched) { this.replied(id); return }
+          if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
+          entry.view = { ...entry.view, autoApproval: { status: "checking" } }
+          this.publish()
+        }
+        // Exhausted stale snapshots are neither cancellation nor uncertain writes.
+        // Stay silent until ordinary fresh reconciliation releases this reservation;
+        // repeated frames/clicks cannot create an unbounded verification loop.
+        if (this.active(entry)) {
+          entry.approvalRefresh = true
+          entry.view = { ...entry.view, autoApproval: { status: "checking" } }
+          this.publish()
+        }
       })
     } catch {
       // A native reply may abort our in-flight HTTP response after accepting it.
@@ -347,9 +382,10 @@ export class Controller {
       if (entry.root !== undefined && this.modes && !this.modes.enabled(entry.root)) this.suspend(entry)
       this.publish()
       // Reconcile an uncertain outcome, without ever retrying the write.
+      if (this.approvalRead) return // Timeout is not physical list settlement.
       const revision = this.version
       try {
-        const pending = await withDeadline(entry.abort.signal, 5000, (signal) => this.approval!.list(signal))
+        const pending = await withDeadline(entry.abort.signal, 5000, (signal) => this.approvalList(signal))
         this.reconcile(pending, revision)
       } catch { /* Periodic read-only reconciliation remains active. */ }
     } finally { if (!dispatched) fact("settled") }
@@ -470,6 +506,12 @@ export class Controller {
     for (const [id, entry] of this.entries) if (!ids.has(id) && !entry.view.resolved) this.replied(id, true, "reconciled")
     for (const request of requests) {
       const entry = this.entries.get(request.id)
+      if (entry?.approvalRefresh && entry.view.autoApproval?.status === "checking") {
+        entry.approvalRefresh = false
+        entry.approvalAbort = undefined
+        entry.view = { ...entry.view, autoApproval: undefined }
+        this.publish()
+      }
       if (entry?.view.autoApproval?.status === "failed" && !entry.view.approvalPendingConfirmed) {
         entry.view = { ...entry.view, approvalPendingConfirmed: true }
         this.publish()

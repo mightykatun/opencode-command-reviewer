@@ -35,6 +35,7 @@ import { HistoryCover } from "./history-cover.js"
 import type { HistoryTarget } from "./history-records.js"
 import { historyCommands } from "./history-commands.js"
 import { ReviewDescription } from "./review-description.js"
+import { ReviewGeometryProof } from "./review-geometry.js"
 export type { DiagnosticEvent, DiagnosticObserver } from "./diagnostics.js"
 
 function ReviewLoading(props: { api: TuiPluginApi; retrying: boolean }) {
@@ -93,12 +94,12 @@ function ReviewButton(props: { api: TuiPluginApi; label: string; selected?: bool
   </box>
 }
 
-function ReviewFooter(props: { api: TuiPluginApi; view: View; controller: Controller; enabled: boolean }) {
+function ReviewFooter(props: { api: TuiPluginApi; view: View; controller: Controller; enabled: boolean; ref?: (value: BoxRenderable) => void }) {
   const [selected, setSelected] = createSignal<"approve" | "cancel">("approve")
   const state = () => props.view.autoApproval
   const label = () => { const current = state(); return current?.status === "countdown" ? uiText.autoApproval.countdown(current.seconds) : uiText.autoApproval.checking }
   return <Show when={props.enabled && (props.view.assessment?.safe || !!state())}>
-    <box marginTop={1} paddingTop={1} minHeight={3} flexShrink={0} border={["top"]} borderColor={props.api.theme.current.borderSubtle}>
+    <box ref={props.ref} marginTop={1} paddingTop={1} minHeight={3} flexShrink={0} border={["top"]} borderColor={props.api.theme.current.borderSubtle}>
       <Switch>
         <Match when={state()?.status === "countdown" || state()?.status === "checking"}>
           <box flexDirection="row" gap={1}>
@@ -409,6 +410,9 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
               const initial = current()!
               const view = () => views().find((item) => item.request.id === id) ?? initial
               let panel: BoxRenderable | undefined
+              let heading: Renderable | undefined
+              let ratingRegion: BoxRenderable | undefined
+              let footer: BoxRenderable | undefined
               let description: MarkdownRenderable | undefined
               let scroll: ScrollBoxRenderable | undefined
               let attempt = 0
@@ -423,6 +427,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
               const report = () => view().assessment?.desc ?? (view().status === "analyzing" ? view().progress?.preview?.desc : undefined) ?? ""
               let paintedAssessment: View["assessment"]
               let readyAssessment: View["assessment"]
+              const geometry = new ReviewGeometryProof()
               const ownsPanelProbes = (owner: Renderable | undefined) => !!panel && !!owner && !owner.isDestroyed && owner.visible
                 && ownsHit(owner, api.renderer.hitTest(panel.x + 2, panel.y + 1))
                 && ownsHit(owner, api.renderer.hitTest(panel.x + 2, panel.y + panel.height - 3))
@@ -452,9 +457,9 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                   if (pending) void Promise.resolve(pending).catch(() => {})
                 } catch { /* Fixture observations cannot change approval behavior. */ }
               }
-              const visible = () => {
-                if (!panel || panel.isDestroyed || !panel.visible || panel.width < 4 || panel.height < 4
-                  || select()?.request.id !== id) return
+              const visible = (frame = false) => {
+                if (!geometry.visible({ width: api.renderer.width, height: api.renderer.height, fast: config?.fastMode === true,
+                  panel, heading, rating: ratingRegion, report: scroll, footer }, frame) || select()?.request.id !== id) return
                 // Fast mode needs the current native blocker physically visible,
                 // but never waits for final Markdown or a completed assessment.
                 if (config?.fastMode) return ownsPanelProbes(panel) ? id : undefined
@@ -481,7 +486,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                   // Expire the previous hit-grid handoff before proving this
                   // frame. Keep the new proof for transitions before next paint.
                   historyCover.frame()
-                  const presented = visible()
+                  const presented = visible(true)
                   const trace = traces?.get(view().request)
                   if (trace) {
                     // Preview visibility probes the status row, not an as-yet absent
@@ -524,8 +529,8 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                   position="absolute" top={0} right={0} bottom={0} width={42} zIndex={1}
                   paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2}
                   backgroundColor={api.theme.current.backgroundPanel}>
-                  <text fg={api.theme.current.text} flexShrink={0}><b>{uiText.review.heading}</b></text>
-                  <box marginTop={1} flexShrink={0}>
+                  <text ref={(value: Renderable) => { heading = value }} fg={api.theme.current.text} flexShrink={0}><b>{uiText.review.heading}</b></text>
+                  <box ref={(value: BoxRenderable) => { ratingRegion = value }} marginTop={1} flexShrink={0}>
                     <Show when={rating() !== undefined}>
                       <text fg={rating() ? api.theme.current.success : api.theme.current.error}>
                         <b>{rating() ? uiText.review.safe : uiText.review.unsafe}</b>
@@ -556,7 +561,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                       }</Show>
                     </>}</Show>
                   </scrollbox>
-                  <ReviewFooter api={api} view={view()} controller={controller} enabled={config?.autoApprove === true} />
+                  <ReviewFooter ref={(value) => { footer = value }} api={api} view={view()} controller={controller} enabled={config?.autoApprove === true} />
                 </box>
               )
             }}

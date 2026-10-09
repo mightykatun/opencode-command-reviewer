@@ -3,7 +3,7 @@ import { test, type TestContext } from "node:test"
 import { setImmediate as settle } from "node:timers/promises"
 import { DatabaseSync } from "node:sqlite"
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
-import { Controller, visibleReview, type ApprovalFact } from "../src/controller.js"
+import { Controller, visibleReview, type ApprovalFact, type View } from "../src/controller.js"
 import { parseConfig } from "../src/config.js"
 import { HistoryCoordinator } from "../src/history-coordinator.js"
 import { HistorySQL, type HistorySelection, type HistoryTotals } from "../src/history-schema.js"
@@ -18,7 +18,9 @@ function deferred<T>() {
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
   return { promise, resolve, reject }
 }
-async function fixture(t: TestContext, options: Record<string, unknown> = {}) {
+async function fixture(t: TestContext, options: Record<string, unknown> = {}, hooks: {
+  changed?: (views: View[]) => void; approval?: (fact: ApprovalFact) => void
+} = {}) {
   const config = parseConfig({ baseURL: "https://example.com/v1", model: "fixture", stream: true, autoApprove: true,
     fastMode: true, autoApproveDelaySeconds: 999, notifySound: false, staleReminderSeconds: 0, ...options })
   const db = new DatabaseSync(":memory:"), sql = new HistorySQL(db)
@@ -56,6 +58,7 @@ async function fixture(t: TestContext, options: Record<string, unknown> = {}) {
     const views = controller.pendingViews
     const first = pending[0]
     policy.snapshot(views, first ? new Map([["root", { kind: "permission", id: first.id }]]) : new Map())
+    hooks.changed?.(controller.views)
   }, config, {
     visibleID: () => shown ? visibleReview(controller.views, shown, id => ({ id }))?.request.id : undefined,
     list: signal => list(signal),
@@ -63,6 +66,7 @@ async function fixture(t: TestContext, options: Record<string, unknown> = {}) {
   }, undefined, { root: async () => "root", load: async () => {}, enabled: () => enabled }, fact => {
     facts.push(fact); history.approval(fact)
     if (fact.type === "confirmed" && fact.automatic) policy.approved(fact.request, target)
+    hooks.approval?.(fact)
   }, undefined, history.lifecycle)
   const ask = async (req: PermissionRequest) => {
     pending.push(req); policy.permission(req, target, true); controller.asked(req); await settle()
@@ -238,4 +242,55 @@ test("disable while a dispatched fast write settles retains only confirmed appro
       assert.equal(f.saved().total, 0); assert.equal(f.banners.filter(m => m.kind === "approved").length, 0)
     }
   }
+})
+
+for (const effect of ["hide", "blocker", "disable", "resolve", "delete", "dispose", "cancel"] as const) {
+  test(`fast dispatch reservation: microtask ${effect} produces no write, retained report, history attribution or approval banner`, async t => {
+    let queued = false
+    const f = await fixture(t, {}, { changed: views => {
+      if (queued || !views.some(view => view.autoApproval?.status === "allowing")) return
+      queued = true
+      queueMicrotask(() => {
+        if (effect === "hide") f.hide()
+        if (effect === "blocker") void f.ask({ ...request("0"), permission: "read" })
+        if (effect === "disable") f.mode(false)
+        if (effect === "resolve") f.resolved()
+        if (effect === "delete") f.controller.deleted("root")
+        if (effect === "dispose") void f.controller.dispose()
+        if (effect === "cancel") f.controller.cancelAutoApproval("a")
+      })
+    } })
+    f.rate(); await settle()
+    for (const write of f.writes) write.ack.resolve()
+    await settle()
+    assert.equal(queued, true)
+    assert.equal(f.writes.length, 0)
+    assert.equal(f.facts.some(fact => fact.type === "dispatched" || fact.type === "confirmed"), false)
+    assert.ok(f.facts.every(fact => fact.type === "settled" && fact.result === "not-sent"))
+    assert.ok(f.controller.views.every(view => !view.retained))
+    f.workers.get("a")!.finish(); await settle()
+    assert.equal(f.saved().total, 0)
+    assert.equal(f.events.some(event => ["approvalDispatched", "approvalConfirmed", "permissionResolved"].includes(event.type)), false)
+    assert.equal(f.totals().activity.autoApproved, 0)
+    assert.equal(f.banners.some(message => message.kind === "approved"), false)
+  })
+}
+
+test("fast dispatch observer reentrancy follows actual once and retains post-dispatch disable/navigation lifecycle", async t => {
+  const observed: number[] = []
+  const f = await fixture(t, {}, { approval: fact => {
+    if (fact.type !== "dispatched") return
+    observed.push(f.writes.length)
+    f.hide(); f.mode(false); f.resolved()
+  } })
+  f.rate(); await settle()
+  assert.deepEqual(observed, [1])
+  assert.equal(f.workers.get("a")!.signal.aborted, false)
+  assert.equal(f.writes[0]!.signal.aborted, false)
+  f.writes[0]!.ack.resolve(); await settle()
+  f.workers.get("a")!.finish(); await settle()
+  assert.equal(f.saved().record?.outcome, "auto")
+  assert.equal(f.saved().total, 1)
+  assert.deepEqual(f.facts.map(fact => fact.type), ["dispatched", "confirmed", "settled"])
+  assert.deepEqual(f.banners.map(message => message.kind), ["approved"])
 })

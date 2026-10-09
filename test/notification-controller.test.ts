@@ -128,3 +128,75 @@ test("manual footer confirmation is tagged manual, and a rejected acknowledgemen
     assert.ok(facts.every(f => f.automatic === false)); await controller.dispose()
   }
 })
+
+for (const fastMode of [false, true]) for (const event of ["unrelated root", "later same root"] as const) {
+  test(`${fastMode ? "fast" : "normal"} ${event} during verification recovers once without an attention episode`, async t => {
+    let release!: (requests: PermissionRequest[]) => void, reads = 0, writes = 0
+    const messages: NotificationMessage[] = [], facts: ApprovalFact[] = []
+    const target = { root: "root", sessionID: "root", title: "Fixture" }
+    const policy = new NotificationPolicy(parseNotificationConfig({ staleReminderSeconds: 0 }), true, {
+      async show(message) { messages.push(message); return { close() {} } }, dispose() {},
+    })
+    const pending = [request]
+    const controller = new Controller(async () => ({ safe: true, desc: "fixture" }),
+      views => policy.snapshot(views, new Map([["root", { kind: "permission", id: "p" }]])),
+      { reviewBash: true, reviewEdits: true, autoApprove: true, fastMode }, {
+        visibleID: () => "p",
+        list: () => ++reads === 1 ? new Promise(resolve => { release = resolve }) : Promise.resolve([...pending]),
+        once: async () => { writes++ },
+      }, undefined, undefined, fact => {
+        facts.push(fact)
+        if (fact.type === "confirmed") policy.approved(fact.request, target)
+      })
+    t.after(async () => { await controller.dispose(); await policy.dispose() })
+    controller.asked(request); policy.permission(request, target, true)
+    await settle(); controller.presented("p")
+    const operation = controller.approveNow("p", true)
+    await settle()
+    const other = { ...request, id: "z", sessionID: event === "unrelated root" ? "other" : "root" }
+    pending.push(other); controller.asked(other)
+    release([request]); await operation; await settle()
+    assert.equal(reads, 2)
+    assert.equal(writes, 1)
+    assert.deepEqual(messages.map(message => message.kind), ["approved"], "no transient attention sound/banner")
+    assert.deepEqual(facts.map(fact => fact.type), ["dispatched", "confirmed", "settled"])
+    assert.ok(controller.views.some(view => view.request.id === "z"), "stale list must not erase new work")
+  })
+}
+
+for (const fastMode of [false, true]) test(`${fastMode ? "fast" : "normal"} sustained unrelated churn caps verification reads, stays silent, and fresh reconciliation can rearm`, async t => {
+  let churn = true, reads = 0, writes = 0
+  const messages: NotificationMessage[] = []
+  const policy = new NotificationPolicy(parseNotificationConfig({ staleReminderSeconds: 0 }), true, {
+    async show(message) { messages.push(message); return { close() {} } }, dispose() {},
+  })
+  const controller = new Controller(async () => ({ safe: true, desc: "fixture" }),
+    views => policy.snapshot(views, new Map([["root", { kind: "permission", id: "p" }]])),
+    { reviewBash: true, reviewEdits: true, autoApprove: true, fastMode }, {
+      visibleID: () => "p",
+      list: async () => { reads++; if (churn) controller.replied("unrelated"); return [request] },
+      once: async () => { writes++ },
+    }, { now: () => 0, after: () => () => {} })
+  t.after(async () => { await controller.dispose(); await policy.dispose() })
+  controller.asked(request)
+  policy.permission(request, { root: "root", sessionID: "root", title: "Fixture" }, true)
+  await settle(); controller.presented("p"); await controller.approveNow("p", true); await settle()
+  assert.equal(reads, 3, "bounded sequential verification, with no extra failure recovery read")
+  assert.equal(writes, 0)
+  assert.equal(controller.views[0]?.autoApproval?.status, "checking")
+  for (let frame = 0; frame < 20; frame++) {
+    controller.presented("p"); await controller.approveNow("p", true)
+  }
+  assert.equal(reads, 3, "frames and clicks cannot replenish the exhausted reservation")
+  assert.deepEqual(messages, [])
+  const revision = controller.revision
+  controller.replied("unknown")
+  controller.reconcile([request], revision)
+  assert.equal(controller.views[0]?.autoApproval?.status, "checking", "a stale poll cannot release the reservation")
+  churn = false
+  controller.reconcile([request], controller.revision)
+  controller.presented("p"); await controller.approveNow("p", true); await settle()
+  assert.equal(reads, 4)
+  assert.equal(writes, 1, "read churn did not install a manual tombstone")
+  assert.deepEqual(messages, [])
+})
