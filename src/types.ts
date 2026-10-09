@@ -12,12 +12,20 @@ export interface FileEvidence {
   warning?: string
 }
 
-export type ReviewKind = "shell" | "edit" | "mcp" | "custom" | "external-directory"
+export type ReviewKind = "shell" | "edit" | "mcp" | "custom" | "external-directory" | "skill"
+
+export interface DelegationContext {
+  sessionID: string
+  parentSessionID: string
+  messageID: string | null
+  prompt: string | null
+}
 
 export interface Evidence {
   kind: "shell"
   command: string
   cwd: string | null
+  delegation?: DelegationContext
   userPrompt: string | null
   files: FileEvidence[]
   limitations: string[]
@@ -59,6 +67,7 @@ export interface EditChange {
 export interface EditEvidence {
   kind: "edit"
   tool: "edit" | "write" | "apply_patch"
+  delegation?: DelegationContext
   userPrompt: string | null
   session?: Evidence["session"]
   location: { instanceDirectory: string | null; instanceWorktree: string | null }
@@ -85,6 +94,7 @@ export interface ToolContext {
   definition?: ToolDefinition
   permission: PermissionEvidence
   location: InvocationLocation
+  delegation?: DelegationContext
   userPrompt: string | null
   session?: Evidence["session"]
   limitations: string[]
@@ -103,6 +113,7 @@ export interface DirectoryContext {
   native: boolean
   permission: PermissionEvidence
   location: InvocationLocation
+  delegation?: DelegationContext
   userPrompt: string | null
   session?: Evidence["session"]
   limitations: string[]
@@ -120,7 +131,22 @@ export interface DirectoryEvidence extends Omit<DirectoryContext, "input" | "per
   partial: boolean
 }
 
-export type ReviewEvidence = Evidence | EditEvidence | ToolEvidence | DirectoryEvidence
+export interface SkillDefinition { name: string; description?: string; location: string; content: string }
+export interface SkillContext {
+  kind: "skill"
+  tool: "skill"
+  input: Record<string, unknown>
+  skill: SkillDefinition
+  permission: PermissionEvidence
+  location: InvocationLocation
+  delegation?: DelegationContext
+  userPrompt: string | null
+  session?: Evidence["session"]
+  limitations: string[]
+}
+export interface SkillEvidence extends SkillContext { files: FileEvidence[]; partial: boolean }
+
+export type ReviewEvidence = Evidence | EditEvidence | ToolEvidence | DirectoryEvidence | SkillEvidence
 
 export interface SessionLocation {
   id: string
@@ -148,7 +174,8 @@ export interface ReviewTiming {
   ratingMs: number
 }
 
-/** Provisional transport observations only. Never an assessment or approval eligibility.
+/** Provisional transport observations, not an accepted assessment. Only opt-in
+ * fast mode may use a parsed Safe preview for early approval.
  * Attempts are zero-based; evaluating/retrying (and absent preview) clear prior content.
  * The display layer must sanitize prefixes before rendering.
  */

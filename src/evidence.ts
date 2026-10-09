@@ -8,7 +8,12 @@ import { reviewStage } from "./deadline.js"
 
 export { discover } from "./shell-discovery.js"
 
-async function capture(reference: Reference, budget: number, signal: AbortSignal, scope: FileScope): Promise<FileEvidence> {
+export function withinDirectory(directory: string, filename: string): boolean {
+  const relative = path.relative(directory, filename)
+  return relative !== ".." && !relative.startsWith("../") && !path.isAbsolute(relative)
+}
+
+export async function captureFile(reference: Reference, budget: number, signal: AbortSignal, scope: FileScope, directory?: string): Promise<FileEvidence> {
   const result: FileEvidence = { filename: reference.filename, status: "unavailable" }
   if (!reference.cwd && !path.isAbsolute(reference.filename)) return { ...result, status: "working directory unresolved; contents not provided" }
   // Do not normalize `..` before the filesystem traverses preceding symlinks.
@@ -19,10 +24,18 @@ async function capture(reference: Reference, budget: number, signal: AbortSignal
     const canonical = await scope.canonical(filename)
     signal.throwIfAborted()
     if (!canonical.path) return { ...result, status: `cannot read file (${canonical.reason}); contents not provided` }
+    if (directory && !withinDirectory(directory, canonical.path)) return { ...result, status: "outside the skill directory; contents not provided" }
     return await scope.capture(async (signal, io) => {
       const handle = await io.open(canonical.path!, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW)
       try {
         signal.throwIfAborted()
+        if (directory) {
+          // The final component's O_NOFOLLOW does not protect ancestor directories.
+          // Verify the opened descriptor before reading if a parent was swapped.
+          const opened = await io.realpath(`/proc/self/fd/${handle.fd}`)
+          signal.throwIfAborted()
+          if (!withinDirectory(directory, opened)) return { ...result, status: "opened file is outside the skill directory; contents not provided" }
+        }
         const before = await handle.stat()
         signal.throwIfAborted()
         if (!before.isFile()) return { ...result, status: "not a regular file; contents not provided" }
@@ -110,7 +123,7 @@ export async function collectEvidence(
       // A different canonical alias used as an interpreter/reader operand can
       // qualify an earlier direct executable. Never retry failed/timed-out I/O.
       if (promote && previous.withinLimit && previous.file.status === "direct executable is not identifiable as Python/shell source; contents not provided") {
-        const file = await capture(previous.reference, remaining, signal, scope)
+        const file = await captureFile(previous.reference, remaining, signal, scope)
         Object.assign(previous.file, file)
         if (file.contents !== undefined) { delete previous.file.warning; remaining -= Buffer.byteLength(file.contents) }
       }
@@ -118,7 +131,7 @@ export async function collectEvidence(
     }
     // Capture each newly admitted candidate before a later path probe can spend
     // the shared filesystem allowance or occupy its outstanding transaction slots.
-    const file = withinLimit ? await capture(reference, remaining, signal, scope)
+    const file = withinLimit ? await captureFile(reference, remaining, signal, scope)
       : { filename: reference.filename, ...(filename ? { path: filename } : {}), status: "file-count limit reached" }
     if (file.contents === undefined) file.warning = omittedFile(file.path ?? file.filename)
     selected.set(key, { reference, filename, withinLimit, aliases: new Set(), file })
@@ -234,7 +247,7 @@ export async function collectEditEvidence(input: EditContext, limits: Limits, si
   if (countsBudget.exhausted) limitations.push("Some omitted-diff line counts exceeded the shared 16 MiB/65,536-line/250 ms counting allowance; valid host counts were used when available.")
   reviewStage(signal, "Evidence collection")
   return {
-    kind: "edit", tool: input.tool, userPrompt: input.userPrompt, session: input.session,
+    kind: "edit", tool: input.tool, ...(input.delegation ? { delegation: input.delegation } : {}), userPrompt: input.userPrompt, session: input.session,
     location: input.location, changes, partial, limitations,
     permission: { ...permissionScope, metadataStatus: "Host change metadata normalized into changes; raw metadata and tool input are omitted to avoid duplicate or unbounded change text." },
   }

@@ -65,9 +65,9 @@ async function fixture(t: TestContext) {
 test("palette fetches committed totals without replacing or resurrecting a dismissed dialog", async t => {
   const f = await fixture(t)
   f.finish(0, totals(1)); await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0100\n1 ✓ 0 ✗")
+  assert.equal(f.tracker.text(), "lifetime: $0.0100\nratings: 1 ✓ 0 ✗")
   f.command.run(); f.dismiss(); f.finish(1, totals(2)); await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0200\n2 ✓ 0 ✗")
+  assert.equal(f.tracker.text(), "lifetime: $0.0200\nratings: 2 ✓ 0 ✗")
   assert.equal(f.counts().replacements, 1); assert.equal(f.counts().open, false)
 })
 
@@ -80,7 +80,7 @@ test("write failure invalidates active and queued snapshots; a local commit imme
   assert.equal(f.tracker.text(), "lifetime: usage unavailable")
   f.commit(); assert.equal(f.counts().reads, 2)
   f.finish(1, totals(2)); await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0200\n2 ✓ 0 ✗")
+  assert.equal(f.tracker.text(), "lifetime: $0.0200\nratings: 2 ✓ 0 ✗")
 })
 
 test("two-second polling refreshes shared totals without invalidating a slow healthy read", async t => {
@@ -89,13 +89,13 @@ test("two-second polling refreshes shared totals without invalidating a slow hea
   t.mock.timers.tick(2000); await settle()
   assert.equal(f.counts().reads, 1)
   f.finish(0, totals(1)); await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0100\n1 ✓ 0 ✗")
+  assert.equal(f.tracker.text(), "lifetime: $0.0100\nratings: 1 ✓ 0 ✗")
   assert.equal(f.counts().reads, 2)
   f.finish(1, totals(2)); await settle()
   t.mock.timers.tick(1999); assert.equal(f.counts().reads, 2)
   t.mock.timers.tick(1); assert.equal(f.counts().reads, 3)
   f.finish(2, totals(3)); await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0300\n3 ✓ 0 ✗")
+  assert.equal(f.tracker.text(), "lifetime: $0.0300\nratings: 3 ✓ 0 ✗")
 })
 
 test("expired reads retain actual cleanup ownership through storms and disposal", async t => {
@@ -121,5 +121,5 @@ test("rating-only totals remain available to the dialog without standalone inlin
   f.finish(0, { ...totals(0), safe: 1, unsafe: 1, ratingsSince: 1 }); await settle()
   assert.equal(f.tracker.text(), undefined)
   f.commit(); f.finish(1, { ...totals(1), unsafe: 1 }); await settle()
-  assert.equal(f.tracker.text(), "lifetime: $0.0100\n1 ✓ 1 ✗")
+  assert.equal(f.tracker.text(), "lifetime: $0.0100\nratings: 1 ✓ 1 ✗")
 })

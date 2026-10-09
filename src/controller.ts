@@ -10,8 +10,9 @@ import type { SessionModeGate } from "./session-mode.js"
 import { SCANNER_INTERVAL_MS } from "./appearance.js"
 import { remainingTime } from "./deadline.js"
 import { uiText } from "./ui-text.js"
+import type { HistoryTarget } from "./history-records.js"
 
-export type AutoApproval = { status: "countdown"; seconds: number } | { status: "checking" | "allowing" | "cancelled" | "failed" }
+export type AutoApproval = { status: "countdown"; seconds: number } | { status: "checking" | "allowing" | "cancelled" | "failed" | "approved" }
 
 export interface View {
   request: PermissionRequest
@@ -21,6 +22,9 @@ export interface View {
   error?: string
   autoApproval?: AutoApproval
   approvalPendingConfirmed?: boolean
+  /** Fast-mode dispatched review retained independently of native permission lifetime. */
+  retained?: boolean
+  resolved?: boolean
 }
 
 type Evaluate = (request: PermissionRequest, signal: AbortSignal, onIdentified: () => void, onProgress: (progress: ReviewProgress) => void,
@@ -33,6 +37,7 @@ interface Entry {
   startedAt?: number; ratingAt?: number
   review: string
   approvalDispatched?: boolean
+  fastApproval?: "pending" | "confirmed"
 }
 
 export interface ApprovalClock {
@@ -44,7 +49,7 @@ const clock: ApprovalClock = {
   after: (ms, callback) => { const timer = setTimeout(callback, ms); return () => clearTimeout(timer) },
 }
 const permissionResolved = Object.freeze({ reason: "permission resolved" })
-type Options = ReviewOptions & Partial<Pick<Config, "autoApprove" | "autoApproveDelaySeconds" | "stream">>
+type Options = ReviewOptions & Partial<Pick<Config, "autoApprove" | "fastMode" | "autoApproveDelaySeconds" | "stream">>
 export interface Approval extends ApprovalTransport {
   /** Recompute actual presentation/order, rather than trusting a stale UI effect. */
   visibleID(): string | undefined
@@ -77,6 +82,12 @@ export class Controller {
     private lifecycleObserver?: ReviewLifecycleObserver) {}
   get revision() { return this.version }
   get views() { return [...this.entries.values()].map((entry) => entry.view) }
+  get pendingViews() { return this.views.filter(view => !view.resolved) }
+  retained(root: string, target: HistoryTarget) {
+    const entry = this.entries.get(target.permission)
+    return entry?.fastApproval === "confirmed" && entry.view.status === "analyzing"
+      && entry.view.request.sessionID === target.session && entry.root === root ? entry.view : undefined
+  }
   private publish() { if (!this.stopped) this.changed(this.views) }
   private approvalFact(fact: ApprovalFact) {
     if (this.stopped) return
@@ -95,6 +106,9 @@ export class Controller {
   }
 
   private suspend(entry: Entry, reason: "mode" | "unavailable" = "mode") {
+    // A dispatched fast approval cannot be unsent. Finish its acknowledgement and
+    // assessment even if review is disabled while the POST is settling.
+    if (entry.fastApproval) return
     const id = entry.view.request.id
     const state = entry.view.autoApproval?.status
     if (state === "countdown" || state === "checking" || (state === "allowing" && !entry.approvalDispatched))
@@ -114,7 +128,7 @@ export class Controller {
     }
   }
 
-  /** Called only after the assessment has actually been rendered, or to hide it. */
+  /** Normal mode requires final rendering; fast mode requires physical panel visibility. */
   presented(id?: string) {
     if (this.stopped) return
     if (id !== this.visibleID) {
@@ -124,6 +138,12 @@ export class Controller {
     }
     const entry = id ? this.entries.get(id) : undefined
     if (!entry || entry.view.autoApproval || !this.eligible(entry)) return
+    if (this.options.fastMode) {
+      entry.view = { ...entry.view, autoApproval: { status: "checking" } }
+      this.publish()
+      void this.approveNow(entry.view.request.id, true)
+      return
+    }
     const seconds = this.options.autoApproveDelaySeconds ?? 15
     // Hold the configured starting number for one extra second so the first
     // rendered countdown value is observable. Zero remains an immediate attempt.
@@ -152,7 +172,7 @@ export class Controller {
 
   private reviewing(entry: Entry) {
     return this.active(entry) && entry.view.status === "analyzing"
-      && (!this.modes || (entry.root !== undefined && this.modes.enabled(entry.root)
+      && (!!entry.fastApproval || !this.modes || (entry.root !== undefined && this.modes.enabled(entry.root)
         && (this.modeChanges.get(entry.root) ?? 0) <= entry.gateRevision))
   }
 
@@ -192,6 +212,7 @@ export class Controller {
       entry.view = { ...entry.view, progress: { attempt: value.attempt, phase: "streaming",
         preview: { ...(preview.safe === undefined ? {} : { safe: preview.safe }), ...(desc === undefined ? {} : { desc }) } } }
       this.publish() // Rating is immediate; text remains on the coalesced cadence.
+      if (this.options.fastMode && preview.safe === true) this.presented(this.visibleID)
     }
     if (!this.reviewing(entry) || entry.cancelProgress || !entry.pendingProgress) return
     const generation = entry.progressGeneration
@@ -206,9 +227,11 @@ export class Controller {
   }
 
   private eligible(entry: Entry) {
-    return this.active(entry) && this.options.autoApprove === true && entry.view.status === "complete"
+    const safe = entry.view.status === "complete" ? entry.view.assessment?.safe === true
+      : this.options.fastMode === true && entry.view.status === "analyzing" && entry.view.progress?.preview?.safe === true
+    return this.active(entry) && !entry.view.resolved && !entry.fastApproval && this.options.autoApprove === true && safe
       && (!this.modes || (entry.root !== undefined && this.modes.enabled(entry.root)))
-      && entry.view.assessment?.safe === true && this.visibleID === entry.view.request.id
+      && this.visibleID === entry.view.request.id
       && this.approval?.visibleID() === entry.view.request.id
   }
 
@@ -232,7 +255,8 @@ export class Controller {
 
   async approveNow(id: string, automatic = false) {
     const entry = this.entries.get(id)
-    if (!entry || entry.view.autoApproval?.status !== "countdown" || !this.approval) return
+    if (!entry || !this.approval || !(entry.view.autoApproval?.status === "countdown"
+      || (this.options.fastMode && automatic && entry.view.autoApproval?.status === "checking" && !entry.approvalAbort))) return
     if (!this.eligible(entry)) { this.cancelAutoApproval(id, "visibility"); return }
     entry.cancelTimer?.()
     entry.cancelTimer = undefined
@@ -274,6 +298,10 @@ export class Controller {
         signal.throwIfAborted()
         dispatched = true
         entry.approvalDispatched = true
+        if (this.options.fastMode && automatic) {
+          entry.fastApproval = "pending"
+          entry.view = { ...entry.view, retained: true }
+        }
         const acknowledgement = new AbortController()
         this.acknowledgements.set(acknowledgement, { request: entry.view.request, root: entry.root })
         const abort = () => { if (signal.reason !== permissionResolved) acknowledgement.abort(signal.reason) }
@@ -285,7 +313,15 @@ export class Controller {
         const write = withDeadline(acknowledgement.signal, remaining, async (bounded) => {
           try {
             await this.approval!.once(entry.view.request, bounded)
-            if (!bounded.aborted) { confirmed = true; fact("confirmed") }
+            if (!bounded.aborted) {
+              confirmed = true
+              if (entry.fastApproval && this.active(entry)) {
+                entry.fastApproval = "confirmed"
+                entry.view = { ...entry.view, resolved: true, autoApproval: { status: "approved" } }
+              }
+              fact("confirmed")
+              if (entry.fastApproval && this.active(entry)) { this.publish(); this.finishFast(entry) }
+            }
           } finally {
             this.acknowledgements.delete(acknowledgement)
             signal.removeEventListener("abort", abort)
@@ -301,8 +337,14 @@ export class Controller {
     } catch {
       // A native reply may abort our in-flight HTTP response after accepting it.
       if (!this.active(entry) || entry.view.autoApproval?.status === "cancelled") return
+      if (entry.fastApproval) {
+        entry.fastApproval = undefined
+        if (entry.view.resolved) { this.replied(id); return }
+        entry.view = { ...entry.view, retained: undefined }
+      }
       this.manual.set(id, "failed")
       entry.view = { ...entry.view, autoApproval: { status: "failed" } }
+      if (entry.root !== undefined && this.modes && !this.modes.enabled(entry.root)) this.suspend(entry)
       this.publish()
       // Reconcile an uncertain outcome, without ever retrying the write.
       const revision = this.version
@@ -373,12 +415,14 @@ export class Controller {
           } catch {}
         }
         this.publish()
+        this.finishFast(entry)
       }
     }, (error: unknown) => {
       this.clearProgress(entry)
       if (active()) {
         entry.view = { ...entry.view, status: entry.view.status === "identifying" ? "unidentified" : "unavailable", progress: undefined, error: error instanceof Error ? error.message : uiText.review.failed }
         this.publish()
+        this.finishFast(entry)
       }
     })
     this.workers.add(worker)
@@ -391,11 +435,23 @@ export class Controller {
     this.version++
     this.entries.get(id)?.cancelTimer?.()
     const entry = this.entries.get(id)
+    if (entry?.fastApproval && resolved) {
+      entry.view = { ...entry.view, resolved: true }
+      this.publish()
+      this.finishFast(entry)
+      return
+    }
     if (entry) this.lifecycleFact({ type: "removed", request: entry.view.request, reason: resolved ? reason : "deleted" })
     if (entry) this.clearProgress(entry)
     this.entries.get(id)?.abort.abort(resolved ? permissionResolved : undefined)
     this.manual.delete(id)
     if (this.entries.delete(id)) this.publish()
+  }
+
+  private finishFast(entry: Entry) {
+    if (!this.active(entry) || entry.fastApproval !== "confirmed" || entry.view.status === "analyzing") return
+    entry.fastApproval = undefined
+    this.replied(entry.view.request.id)
   }
 
   deleted(sessionID: string) {
@@ -411,7 +467,7 @@ export class Controller {
   reconcile(requests: readonly PermissionRequest[], revision: number) {
     if (this.stopped || this.version !== revision) return
     const ids = new Set(requests.map((request) => request.id))
-    for (const id of this.entries.keys()) if (!ids.has(id)) this.replied(id, true, "reconciled")
+    for (const [id, entry] of this.entries) if (!ids.has(id) && !entry.view.resolved) this.replied(id, true, "reconciled")
     for (const request of requests) {
       const entry = this.entries.get(request.id)
       if (entry?.view.autoApproval?.status === "failed" && !entry.view.approvalPendingConfirmed) {
@@ -452,14 +508,17 @@ export function visibleReview(
   const session = getSession(sessionID)
   if (!session || session.parentID) return
   let first: View | undefined
+  let retained: View | undefined
   for (const view of views) {
     const request = view.request
     if (request.sessionID !== sessionID && getSession(request.sessionID)?.parentID !== sessionID) continue
+    if (view.retained) { retained ??= view; continue }
+    if (view.resolved) continue
     // Match native code-unit ordering; hidden requests still participate in selection.
     if (!first || request.sessionID < first.request.sessionID ||
       (request.sessionID === first.request.sessionID && request.id < first.request.id)) first = view
   }
-  return first && first.status !== "unrelated" && first.status !== "identifying" && first.status !== "unidentified" && first.status !== "suspended" ? first : undefined
+  return retained ?? (first && first.status !== "unrelated" && first.status !== "identifying" && first.status !== "unidentified" && first.status !== "suspended" ? first : undefined)
 }
 
 export function displayText(text: string): string {

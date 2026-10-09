@@ -371,7 +371,7 @@ try {
   const assertUsage = async () => {
     const input = correction ? 1000 : 500, output = correction ? 40 : 20
     if (scenario === "correction" || scenario === "auto-scroll") {
-      for (let i = 0; i < 30 && !capture().includes("1 ✓ 0 ✗"); i++) { mouse(65, 140, 20); await sleep(40) }
+      for (let i = 0; i < 30 && !capture().includes("ratings: 1 ✓ 0 ✗"); i++) { mouse(65, 140, 20); await sleep(40) }
     }
     await until((s) => s.includes(`token: ${input} in ${output} out`), 5000)
     const ansi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
@@ -380,7 +380,7 @@ try {
     if (knownPricing) assert.match(sidebarText, correction ? /cost: \$0\.0011/ : /cost: \$0\.0005/)
     else assert.doesNotMatch(sidebarText, /cost:\s*\$/, "unknown pricing must not invent a cost")
     await until((s) => s.includes(knownPricing ? "lifetime: $" : "lifetime: cost unavailable"), 5000)
-    await until((s) => s.includes(scenario === "patch" ? "0 ✓ 1 ✗" : "1 ✓ 0 ✗"), 5000)
+    await until((s) => s.includes(scenario === "patch" ? "ratings: 0 ✓ 1 ✗" : "ratings: 1 ✓ 0 ✗"), 5000)
     const lifetimeAnsi = tmux("capture-pane", "-p", "-e", "-t", "smoke")
     assert.equal(styleAt(lifetimeAnsi, "lifetime:").fg, styleAt(lifetimeAnsi, "fullscreen").fg)
     if (knownPricing) {

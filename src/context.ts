@@ -1,6 +1,6 @@
 import path from "node:path"
 import type { AssistantMessage, Message, OpencodeClient, Part, PermissionRequest, Project, Session } from "@opencode-ai/sdk/v2"
-import type { EditContext, Evidence, ProjectLocation, SessionLocation, ToolDefinition } from "./types.js"
+import type { DelegationContext, EditContext, Evidence, ProjectLocation, SessionLocation, SkillDefinition, ToolDefinition } from "./types.js"
 import { fileAccess, type FileScope } from "./file-access.js"
 import { DeadlineError, remainingTime, withDeadline } from "./deadline.js"
 
@@ -12,6 +12,7 @@ export interface ContextReader {
   toolIDs?(signal: AbortSignal): Promise<readonly string[]>
   definition?(info: AssistantMessage, tool: string, signal: AbortSignal): Promise<ToolDefinition | undefined>
   mcpServers?(): readonly { name: string; status: string }[]
+  skills?(signal: AbortSignal): Promise<readonly SkillDefinition[]>
 }
 
 export async function loadInvocation(request: PermissionRequest, reader: ContextReader, signal: AbortSignal) {
@@ -125,7 +126,7 @@ export async function loadContext(request: PermissionRequest, reader: ContextRea
   }
   // Finish optional host lookups before the first filesystem probe starts its
   // shared budget. Slow conversation reads must not starve healthy source I/O.
-  const conversation = await loadConversationContext(request, reader, signal)
+  const conversation = await loadConversationContext(request, reader, signal, invocation)
   if (cwd) {
     const canonical = await scope.canonical(cwd)
     execution.canonicalCwd = canonical.path
@@ -153,7 +154,7 @@ export async function loadEditContext(request: PermissionRequest, reader: Contex
     throw new Error("Pending native edit arguments unavailable or unsupported tool")
   }
   const location = invocation.location
-  const conversation = await loadConversationContext(request, reader, signal)
+  const conversation = await loadConversationContext(request, reader, signal, invocation)
   if (!location.instanceDirectory) conversation.limitations.push("Edit invocation directory unavailable; session origin is not substituted.")
   if (!location.instanceWorktree) conversation.limitations.push("Edit invocation worktree unavailable.")
   // Borrow host metadata until the collector projects its known fields. Never
@@ -161,12 +162,13 @@ export async function loadEditContext(request: PermissionRequest, reader: Contex
   return { ...conversation, kind: "edit", tool: invocation.tool, location, permission: permissionContext(request, false) }
 }
 
-export async function loadConversationContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal) {
+export async function loadConversationContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal, invocation?: Invocation) {
   signal.throwIfAborted()
   const limitations: string[] = []
   let current: Session | undefined
   let root: Session | undefined
   let prompt: string | null = null
+  let delegation: DelegationContext | undefined
   const contextEnd = performance.now() + Math.min(5000, remainingTime(signal) / 3)
   const contextMs = () => Math.max(0, contextEnd - performance.now())
   const ancestry = async (contextSignal: AbortSignal) => {
@@ -174,22 +176,51 @@ export async function loadConversationContext(request: PermissionRequest, reader
     contextSignal.throwIfAborted()
     if (loaded?.id !== request.sessionID) throw new Error("Session mismatch")
     current = loaded
-    let ancestor = current
-    const seen = new Set<string>()
-    while (ancestor.parentID) {
-      contextSignal.throwIfAborted()
-      if (seen.has(ancestor.id) || seen.size >= 16) throw new Error("Parent chain incomplete")
-      seen.add(ancestor.id)
-      const expected: string = ancestor.parentID
-      const parent = await reader.session(expected, contextSignal)
-      contextSignal.throwIfAborted()
-      if (parent?.id !== expected) throw new Error("Parent session unavailable")
-      ancestor = parent
+    const delegated = async () => {
+      if (!loaded.parentID) return
+      const messageID = invocation?.info.parentID
+      delegation = { sessionID: loaded.id, parentSessionID: loaded.parentID, messageID: messageID ?? null, prompt: null }
+      try {
+        if (!messageID || !invocation || invocation.info.sessionID !== loaded.id) throw new Error("Delegation linkage unavailable")
+        invocationFor(request, invocation)
+        // Bind to this assistant invocation's user message, not a later queued
+        // resume prompt or a parent task for another sibling. No older fallback.
+        const message = await reader.message(loaded.id, messageID, contextSignal)
+        contextSignal.throwIfAborted()
+        if (!message || message.info.role !== "user" || message.info.id !== messageID || message.info.sessionID !== loaded.id
+          || !Array.isArray(message.parts) || message.parts.length > 4096) throw new Error("Delegation message unavailable")
+        let bytes = 0, parts = 0
+        for (const part of message.parts) if (part.type === "text" && part.sessionID === loaded.id && part.messageID === messageID
+          && !part.synthetic && !part.ignored && !part.metadata?.source) {
+          if (part.text.length > 65536 || (bytes += Buffer.byteLength(part.text) + (parts++ ? 1 : 0)) > 65536) throw new Error("Delegation exceeds context budget")
+        }
+        const text = latestUserPrompt([message], loaded.id)
+        if (!text) throw new Error("Delegation text unavailable")
+        delegation.prompt = text
+      } catch {
+        contextSignal.throwIfAborted()
+        limitations.push("Latest immediate subagent prompt unavailable or exceeds the 64 KiB context limit; no older delegation was substituted.")
+      }
     }
-    root = ancestor
-    const messages = await reader.messages(root.id, contextSignal)
-    contextSignal.throwIfAborted()
-    prompt = latestUserPrompt(messages, root.id)
+    const rootPrompt = async () => {
+      let ancestor = loaded
+      const seen = new Set<string>()
+      while (ancestor.parentID) {
+        contextSignal.throwIfAborted()
+        if (seen.has(ancestor.id) || seen.size >= 16) throw new Error("Parent chain incomplete")
+        seen.add(ancestor.id)
+        const expected: string = ancestor.parentID
+        const parent = await reader.session(expected, contextSignal)
+        contextSignal.throwIfAborted()
+        if (parent?.id !== expected) throw new Error("Parent session unavailable")
+        ancestor = parent
+      }
+      root = ancestor
+      const messages = await reader.messages(root.id, contextSignal)
+      contextSignal.throwIfAborted()
+      prompt = latestUserPrompt(messages, root.id)
+    }
+    await Promise.all([rootPrompt(), delegated()])
   }
   try { await withDeadline(signal, contextMs(), ancestry, "Conversation context lookup") }
   catch (error) {
@@ -212,6 +243,7 @@ export async function loadConversationContext(request: PermissionRequest, reader
   }
   signal.throwIfAborted()
   return {
+    ...(delegation ? { delegation } : {}),
     userPrompt: prompt, limitations,
     session: { current: sessionLocation(current), root: sessionLocation(root), currentProject: projectLocation(current), rootProject: projectLocation(root) },
   }

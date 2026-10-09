@@ -7,6 +7,7 @@ import { NotificationHost } from "../src/notification-host.js"
 import { NotificationPolicy } from "../src/notification-policy.js"
 import { parseNotificationConfig } from "../src/notification-config.js"
 import type { NotificationMessage } from "../src/notification-types.js"
+import type { HistoryTarget } from "../src/history-records.js"
 import type { View } from "../src/controller.js"
 
 const request = (id = "p", sessionID = "root"): PermissionRequest => ({ id, sessionID, permission: "bash", patterns: [], always: [], metadata: {} })
@@ -19,8 +20,10 @@ function fixture(resolve: (id: string) => Promise<string> = async id => id, opti
   ])
   const messages = new Map<string, Message[]>(), pending = new Map<string, PermissionRequest[]>()
   const banners: NotificationMessage[] = [], navigated: string[] = []
+  const opened: { sessionID: string; history: HistoryTarget }[] = []
   const timers = new Set<{ at: number; callback: () => void }>()
   let now = 1, dialog = false, status: "idle" | "busy" | "retry" = "idle"
+  let current = "root"
   const clock = { now: () => now, after(ms: number, callback: () => void) {
     const timer = { at: now + ms, callback }; timers.add(timer); return () => { timers.delete(timer) }
   } }
@@ -36,14 +39,16 @@ function fixture(resolve: (id: string) => Promise<string> = async id => id, opti
       permission: (id: string) => pending.get(id) ?? [],
       question: () => [], status: () => ({ type: status }),
     } },
-    route: { navigate(_name: string, params: { sessionID: string }) { navigated.push(params.sessionID) } },
+    route: { get current() { return { name: "session", params: { sessionID: current } } },
+      navigate(_name: string, params: { sessionID: string }) { current = params.sessionID; navigated.push(params.sessionID) } },
     ui: { dialog: { get open() { return dialog } } }, lifecycle: { signal: new AbortController().signal },
   } as unknown as TuiPluginApi
   const questions = new Map<string, { id: string; sessionID: string; questions: [] }>()
   const policy = new NotificationPolicy(parseNotificationConfig({ notifySound: false, staleReminderSeconds: 0, ...options }), true, {
     async show(message) { banners.push(message); return { close() {} } }, dispose() {},
   }, clock)
-  const host = new NotificationHost(api, policy, resolve, readQuestions ?? (async () => [...questions.values()]), clock)
+  const host = new NotificationHost(api, policy, resolve, readQuestions ?? (async () => [...questions.values()]), clock,
+    (sessionID, history) => opened.push({ sessionID, history }))
   function emit(type: string, properties: unknown, id = "event") {
     const value = properties as { id: string; sessionID: string; questions: []; requestID: string }
     if (type === "question.asked") questions.set(value.id, value)
@@ -62,7 +67,8 @@ function fixture(resolve: (id: string) => Promise<string> = async id => id, opti
     for (const timer of [...timers]) if (timer.at <= now && timers.delete(timer)) timer.callback()
     await settle()
   }
-  return { host, policy, banners, navigated, listeners, sessions, pending, questions, timers, emit, message, advance,
+  return { host, policy, banners, navigated, opened, listeners, sessions, pending, questions, timers, emit, message, advance,
+    route: (session: string) => { current = session },
     dialog: (value: boolean) => { dialog = value }, status: (value: typeof status) => { status = value },
     tick: () => advance(2000) }
 }
@@ -113,7 +119,58 @@ test("zero-delay confirmation retains dispatched attribution after native resolu
     f.host.fact({ type: "settled", request: req, automatic })
   }
   await settle(); assert.deepEqual(f.banners.map(m => m.title), ["Reviewer approved a permission"])
+  assert.deepEqual(f.banners[0]?.history, { session: "root", permission: "automatic" })
   f.host.dispose()
+})
+
+test("approval notifications retain each child's permission target after native resolution", async () => {
+  const f = fixture(); f.host.visit("root")
+  for (const session of ["root", "child", "deep"]) {
+    const req = request("approved-" + session, session)
+    f.emit("permission.asked", req)
+    f.host.snapshot([{ request: req, status: "complete", assessment: { safe: true, desc: "fixture" } }])
+    f.host.fact({ type: "dispatched", request: req, automatic: true })
+    f.emit("permission.replied", { requestID: req.id, sessionID: session, reply: "once" })
+    f.host.snapshot([])
+    f.host.fact({ type: "confirmed", request: req, automatic: true })
+  }
+  await settle()
+  assert.deepEqual(f.banners.map(m => [m.sessionID, m.history]), ["root", "child", "deep"].map(session =>
+    ["root", { session, permission: "approved-" + session }]))
+  const first = f.banners[0]!
+  f.host.click(first.sessionID, first.history)
+  assert.deepEqual(f.opened, [{ sessionID: "root", history: { session: "root", permission: "approved-root" } }])
+  f.host.dispose()
+})
+
+test("latest approval click waits for dialogs, keeps its own target, and opens once", async () => {
+  const f = fixture(); f.dialog(true)
+  f.host.click("root", { session: "child", permission: "old" })
+  const staleClick = [...f.timers].find(timer => timer.at === 101)!
+  await f.advance(1000)
+  assert.deepEqual(f.navigated, []); assert.deepEqual(f.opened, [])
+  const target = { session: "other", permission: "new" }
+  f.host.click("other", target); target.permission = "mutated"
+  f.dialog(false); staleClick.callback(); assert.deepEqual(f.navigated, [])
+  await f.advance(100)
+  assert.deepEqual(f.navigated, ["other"])
+  assert.deepEqual(f.opened, [{ sessionID: "other", history: { session: "other", permission: "new" } }])
+  await f.advance(1000); assert.equal(f.opened.length, 1)
+  f.host.dispose()
+})
+
+test("deleted roots/children, route changes, newer ordinary clicks, and disposal cancel deferred history navigation", async () => {
+  for (const action of ["root", "child", "route", "ordinary", "dispose"]) {
+    const f = fixture(); f.dialog(true)
+    f.host.click("root", { session: "child", permission: "p" })
+    if (action === "dispose") f.host.dispose()
+    else if (action === "route") f.route("other")
+    else if (action === "ordinary") f.host.click("other")
+    else f.emit("session.deleted", { info: { id: action } })
+    f.dialog(false); await f.advance(1000)
+    assert.deepEqual(f.navigated, []); assert.deepEqual(f.opened, [])
+    f.host.dispose()
+  }
 })
 
 test("root completion requires a new turn and final message; retries, question pauses, tool steps and children stay silent", async () => {

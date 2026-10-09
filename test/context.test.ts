@@ -306,11 +306,12 @@ test("native loaders use the same strict invocation validation for duplicate cal
   }
 })
 
-test("verified native invocation handoff avoids a second read and rejects different linkage", async () => {
+test("verified native invocation handoff avoids a repeated invocation read and rejects different linkage", async () => {
   for (const name of ["bash", "edit"] as const) {
     const req = { ...request, permission: name }
-    let reads = 0
-    const host = reader({ message: async () => {
+    let reads = 0, delegationReads = 0
+    const host = reader({ message: async (_session, messageID) => {
+      if (messageID === assistant.parentID) { delegationReads++; return undefined }
       assert.equal(++reads, 1)
       return { info: assistant, parts: [{ ...tool, tool: name }] }
     } })
@@ -320,6 +321,7 @@ test("verified native invocation handoff avoids a second read and rejects differ
       : await loadEditContext(req, host, s, invocation)
     assert.equal(context?.userPrompt, "Actual user intent")
     assert.equal(reads, 1)
+    assert.equal(delegationReads, 1)
     const other = { ...req, tool: { ...req.tool!, callID: "another-call" } }
     await assert.rejects(name === "bash" ? loadContext(other, host, s, undefined, invocation)
       : loadEditContext(other, host, s, invocation), /linkage mismatched/)

@@ -4,10 +4,13 @@ import { usageText } from "./usage.js"
 import { uiText } from "./ui-text.js"
 
 export function historyMetadata(record: NonNullable<HistorySelection["record"]>): string {
+  const timing = record.payload.timing
   return displayText([
     ...(record.payload.usage ? [usageText(record.payload.usage)] : []),
     uiText.history.model(record.payload.reportedModel ?? record.context.configuredModel),
     uiText.history.provider(record.context.provider),
+    ...(timing ? [uiText.history.timeToRating((timing.ratingMs / 1000).toFixed(2)),
+      uiText.history.timeToReport((timing.fullReportMs / 1000).toFixed(2))] : []),
   ].join("\n"))
 }
 

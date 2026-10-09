@@ -66,7 +66,10 @@ const palette = async title => {
 }
 const open = async () => { await palette("Reviewer: Statistics"); await until(s => s.includes("Reviewer statistics") && s.includes("[Lifetime]")) }
 const close = async () => { send("Escape"); await until(s => !s.includes("Reviewer statistics")) }
-const check = async (lines, scope) => { await until(s => s.includes(`[${scope}]`) && lines.every(line => s.includes(line))) }
+const check = async (lines, scope) => {
+  await until(s => s.includes(`[${scope}]`) && lines.every(line => s.includes(line)))
+  assert.doesNotMatch(capture(), /Recorded Reviewer activity|Partial history:|\(partial history\)|before history tracking/)
+}
 const rootLines = ["Reviews: 3", "Retries: 3", "Tokens: 1260 in 90 out", "Cost: $0.0900", "Safe: 2 (66.7%)", "Unsafe: 1 (33.3%)",
   "Auto-approved: 2 (66.7%)", "Average time to full report: 0.20s", "Average time to rating: 0.10s"]
 const lifetimeLines = ["Reviews: 4", "Retries: 4", "Tokens: 3280 in 120 out", "Cost: $0.1200", "Safe: 3 (75.0%)", "Unsafe: 1 (25.0%)",
@@ -128,7 +131,7 @@ try {
   const old = new DatabaseSync(file); old.exec("DROP TABLE conversation_totals"); old.close()
   await start("--session", ids.root); await until(s => s.includes("tab agents"), 90000)
   await open(); send("Tab")
-  await check(["Reviews: 4", "Tokens: 2080 in 120 out", "Partial history:"], "Conversation"); await save("retained-v1-baseline")
+  await check(["Reviews: 4", "Tokens: 2080 in 120 out"], "Conversation"); await save("retained-v1-baseline")
   sql = new HistorySQL(new DatabaseSync(file))
   assert.deepEqual(sql.query({ type: "totals" }), persisted)
   assert.equal(calls, modelCalls, "statistics browsing and resume do not invoke models")

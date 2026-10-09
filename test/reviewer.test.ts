@@ -60,16 +60,18 @@ test("config defaults, URL handling, credentials, and invalid settings", () => {
   const cfg = parseConfig({ baseURL: "http://localhost:1234/v1/", model: "small" })
   assert.equal(cfg.baseURL, "http://localhost:1234/v1")
   assert.equal(cfg.timeoutMs, 30000)
-  assert.equal(cfg.maxOutputTokens, 2048)
+  assert.equal(cfg.maxOutputTokens, 4096)
   assert.equal(cfg.formatRetries, 1)
   assert.equal(cfg.maxFiles, 6)
   assert.equal(cfg.maxEvidenceBytes, 131072)
   assert.equal(cfg.reviewBash, true)
   assert.equal(cfg.reviewEdits, true)
+  assert.equal(cfg.reviewSkills, true)
   assert.equal(cfg.reviewMcp, false)
   assert.equal(cfg.reviewCustomTools, false)
   assert.equal(cfg.reviewExternalDirectories, false)
   assert.equal(cfg.autoApprove, false)
+  assert.equal(cfg.fastMode, false)
   assert.equal(cfg.extraCareful, true)
   assert.equal(cfg.stream, false)
   assert.equal(cfg.autoApproveDelaySeconds, 15)
@@ -256,8 +258,8 @@ test("review switches are independent strict booleans with enabled defaults", ()
     assert.equal(config.reviewBash, reviewBash)
     assert.equal(config.reviewEdits, reviewEdits)
   }
-  for (const name of ["reviewBash", "reviewEdits", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "extraCareful", "stream"] as const) {
-    assert.equal(parseConfig({ ...options, [name]: undefined })[name], name === "reviewBash" || name === "reviewEdits" || name === "extraCareful")
+  for (const name of ["reviewBash", "reviewEdits", "reviewSkills", "reviewMcp", "reviewCustomTools", "reviewExternalDirectories", "autoApprove", "fastMode", "extraCareful", "stream"] as const) {
+    assert.equal(parseConfig({ ...options, [name]: undefined })[name], name === "reviewBash" || name === "reviewEdits" || name === "reviewSkills" || name === "extraCareful")
     for (const value of [true, false]) assert.equal(parseConfig({ ...options, [name]: value })[name], value)
     for (const value of [null, 0, 1, "true", "false", {}, []]) {
       assert.throws(() => parseConfig({ ...options, [name]: value }), { message: `${name} must be a boolean` })
@@ -269,7 +271,7 @@ test("numeric settings default only on omission and enforce integer boundaries b
   for (const [name, fallback, min, max] of [
     ["formatRetries", 1, 0, 100],
     ["timeoutMs", 30000, 1, 3600000],
-    ["maxOutputTokens", 2048, 1, Number.MAX_SAFE_INTEGER],
+    ["maxOutputTokens", 4096, 1, Number.MAX_SAFE_INTEGER],
     ["maxFiles", 6, 1, 1000],
     ["maxEvidenceBytes", 131072, 1, 16 * 1024 * 1024],
     ["autoApproveDelaySeconds", 15, 0, 3600],
@@ -665,7 +667,7 @@ test("extra-careful guidance defaults on and can be omitted from native auto rev
       assert.equal(request.body.messages[0].content, [prompts[kind].instructions, ...(autoApprove && extraCareful !== false ? [prompts.extraCareful] : []), CONTRACT].join("\n\n"))
       assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
       assert.equal(request.body.stream, stream)
-      assert.equal(request.body.max_tokens, 2048)
+      assert.equal(request.body.max_tokens, 4096)
       assert.doesNotMatch(JSON.stringify(request.body), /"extraCareful"|autoApprove|countdown|automatic approval/)
     }
     assert.equal(requests.length - start, 2)
@@ -771,7 +773,7 @@ test("new review kinds select only their own instructions and share the fixed co
       assert.deepEqual(JSON.parse(request.body.messages[1].content), input)
       assert.equal(request.body.tools, undefined)
       assert.equal(request.body.stream, stream)
-      assert.equal(request.body.max_tokens, 2048)
+      assert.equal(request.body.max_tokens, 4096)
       assert.doesNotMatch(JSON.stringify(request.body), /"extraCareful"|autoApprove|countdown|automatic approval/)
     }
     assert.equal(requests[start + 1]!.body.messages[3].content, CORRECTION.replace("{{validationError}}", "Invalid JSON"))

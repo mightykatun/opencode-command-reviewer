@@ -6,7 +6,7 @@ const bytes = (text) => Buffer.byteLength(text, "utf8")
 const count = (value) => Number.isSafeInteger(value) && value >= 0
 
 /** Keep comparison data in memory only. Reports contain ordinals, sizes and numeric usage. */
-export function reviewerAudit({ stream = false, maxOutputTokens = 2048 } = {}) {
+export function reviewerAudit({ stream = false, maxOutputTokens = 4096 } = {}) {
   const permissions = new Map(), systems = new Map(), rows = []
   let verified = false
   return {

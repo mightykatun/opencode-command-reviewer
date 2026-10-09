@@ -3,13 +3,14 @@ import type { Config } from "./config.js"
 import type { Invocation } from "./context.js"
 import type { ReviewKind } from "./types.js"
 
-export type ReviewOptions = Pick<Config, "reviewBash" | "reviewEdits"> & Partial<Pick<Config, "reviewMcp" | "reviewCustomTools" | "reviewExternalDirectories">>
+export type ReviewOptions = Pick<Config, "reviewBash" | "reviewEdits"> & Partial<Pick<Config, "reviewSkills" | "reviewMcp" | "reviewCustomTools" | "reviewExternalDirectories">>
 // Native registry IDs in the supported host, not a heuristic list of tool names.
 export const nativeTools = new Set(["invalid", "question", "bash", "read", "glob", "grep", "edit", "write", "task", "webfetch", "todowrite", "websearch", "skill", "apply_patch", "execute", "lsp", "plan_exit"])
 const resources = new Set(["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"])
 const sanitize = (name: string) => name.replace(/[^a-zA-Z0-9_-]/g, "_")
 
 export function enabledKind(kind: ReviewKind, options: ReviewOptions): boolean {
+  if (kind === "skill") return options.reviewSkills !== false
   return (kind === "shell" ? options.reviewBash : kind === "edit" ? options.reviewEdits
     : kind === "mcp" ? options.reviewMcp : kind === "custom" ? options.reviewCustomTools : options.reviewExternalDirectories) === true
 }
@@ -18,6 +19,7 @@ export function enabledKind(kind: ReviewKind, options: ReviewOptions): boolean {
 export function candidateEnabled(request: PermissionRequest, options: ReviewOptions): boolean {
   if (request.permission === "external_directory") return options.reviewExternalDirectories === true
   return (request.permission === "bash" && options.reviewBash) || (request.permission === "edit" && options.reviewEdits)
+    || (request.permission === "skill" && options.reviewSkills !== false)
     || (!!request.tool && (options.reviewMcp === true || options.reviewCustomTools === true))
 }
 
@@ -35,6 +37,10 @@ export function classify(request: PermissionRequest, invocation: Invocation, ids
     if (!native) return
     if (id === "bash" && request.permission === "bash") return { kind: "shell", native, server: null }
     if (["edit", "write", "apply_patch"].includes(id) && request.permission === "edit") return { kind: "edit", native, server: null }
+    if (id === "skill" && request.permission === "skill" && typeof invocation.input.name === "string" && invocation.input.name.length > 0
+      && request.patterns.length === 1 && request.patterns[0] === invocation.input.name
+      && request.always.length === 1 && request.always[0] === invocation.input.name && Object.keys(request.metadata).length === 0)
+      return { kind: "skill", native, server: null }
     return
   }
   if (resources.has(id)) {

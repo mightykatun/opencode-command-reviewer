@@ -1,5 +1,5 @@
 import { createEffect, createMemo, createSignal, Index, Match, onCleanup, Show, Switch } from "solid-js"
-import { CliRenderEvents, CodeRenderable, RGBA, type BoxRenderable, type MarkdownRenderable, type Renderable, type ScrollBoxRenderable } from "@opentui/core"
+import { CliRenderEvents, CodeRenderable, RGBA, ScrollBoxRenderable, type BoxRenderable, type MarkdownRenderable, type Renderable } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { parseConfig, type Config } from "./config.js"
 import { loadRootMessages, type ContextReader } from "./context.js"
@@ -21,7 +21,7 @@ import { DiagnosticTrace, measured, type DiagnosticObserver } from "./diagnostic
 import { parseNotificationConfig } from "./notification-config.js"
 import { NotificationPolicy } from "./notification-policy.js"
 import { NotificationHost } from "./notification-host.js"
-import type { NotificationBackend } from "./notification-types.js"
+import type { NotificationBackend, NotificationClick } from "./notification-types.js"
 import { LinuxNotifications } from "./notification-linux.js"
 import type { NotificationConfig } from "./notification-config.js"
 import type { NotificationProcesses } from "./notification-process.js"
@@ -32,6 +32,7 @@ import { HistoryMaintenance } from "./history-maintenance.js"
 import { HistoryController, type HistoryViewState } from "./history-controller.js"
 import { HistoryView, type HistoryInput } from "./history-view.js"
 import { HistoryCover } from "./history-cover.js"
+import type { HistoryTarget } from "./history-records.js"
 import { historyCommands } from "./history-commands.js"
 import { ReviewDescription } from "./review-description.js"
 export type { DiagnosticEvent, DiagnosticObserver } from "./diagnostics.js"
@@ -67,7 +68,8 @@ function highlightingComplete(node: Renderable): boolean {
 }
 
 function ownsHit(node: Renderable, hit: number): boolean {
-  return node.num === hit || node.getChildren().some((child) => ownsHit(child, hit))
+  return node.num === hit || (node instanceof ScrollBoxRenderable && ownsHit(node.wrapper, hit))
+    || node.getChildren().some((child) => ownsHit(child, hit))
 }
 
 function ReviewButton(props: { api: TuiPluginApi; label: string; selected?: boolean; disabled?: boolean; onHover?: () => void; onClick: () => void }) {
@@ -95,7 +97,7 @@ function ReviewFooter(props: { api: TuiPluginApi; view: View; controller: Contro
   const [selected, setSelected] = createSignal<"approve" | "cancel">("approve")
   const state = () => props.view.autoApproval
   const label = () => { const current = state(); return current?.status === "countdown" ? uiText.autoApproval.countdown(current.seconds) : uiText.autoApproval.checking }
-  return <Show when={props.enabled && props.view.assessment?.safe}>
+  return <Show when={props.enabled && (props.view.assessment?.safe || !!state())}>
     <box marginTop={1} paddingTop={1} minHeight={3} flexShrink={0} border={["top"]} borderColor={props.api.theme.current.borderSubtle}>
       <Switch>
         <Match when={state()?.status === "countdown" || state()?.status === "checking"}>
@@ -109,6 +111,9 @@ function ReviewFooter(props: { api: TuiPluginApi; view: View; controller: Contro
         </Match>
         <Match when={state()?.status === "allowing"}>
           <ReviewButton api={props.api} label={uiText.autoApproval.allowing} disabled onClick={() => {}} />
+        </Match>
+        <Match when={state()?.status === "approved"}>
+          <text fg={props.api.theme.current.textMuted}>{uiText.autoApproval.finishing}</text>
         </Match>
         <Match when={state()?.status === "cancelled"}>
           <text fg={props.api.theme.current.textMuted}>{uiText.autoApproval.cancelled}</text>
@@ -153,10 +158,15 @@ function contextReader(api: TuiPluginApi, trace?: DiagnosticTrace): ContextReade
       return matches?.length === 1 ? matches[0] : undefined
     },
     mcpServers: () => api.state.mcp(),
+    skills: async signal => {
+      const result = await measured(trace, "context.skills", () => api.client.app.skills(location(), { signal, throwOnError: true }))
+      if (!Array.isArray(result.data) || result.data.length > 16384) throw new Error("Skill catalog unavailable or oversized")
+      return result.data
+    },
   }
 }
 
-export type NotificationBackendFactory = (click: (sessionID: string) => void, config: NotificationConfig) => NotificationBackend
+export type NotificationBackendFactory = (click: NotificationClick, config: NotificationConfig) => NotificationBackend
 
 /** Opt-in observations of real renderables, never a readiness override. */
 export interface HistoryRenderProbeEvent {
@@ -213,6 +223,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const history = new HistoryCoordinator(api.state.path.directory, historyStore, (id, signal) => modes.root(id, signal))
   const lifetime = lifetimeTracker(api, historyStore, (id, signal) => history.root(id, signal))
   const [historyState, setHistoryState] = createSignal<HistoryViewState>({ open: false, status: "loading", reset: 0 })
+  const [revealHistory, setRevealHistory] = createSignal<{ session: string; live?: HistoryTarget }>()
   const browser = new HistoryController(api.state.path.directory, historyStore, (id, signal) => history.root(id, signal), setHistoryState)
   const maintenance = new HistoryMaintenance(api.state.path.directory, historyStore,
     (sessionID, signal) => api.client.session.get({ sessionID, directory: history.scope }, { signal, throwOnError: false }),
@@ -224,7 +235,14 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   let notifications: NotificationHost | undefined
   if (notificationConfig?.notify) {
     try {
-      const click = (id: string) => notifications?.click(id)
+      const click: NotificationClick = (id, target) => {
+        // A newer approval click supersedes an older save wait or deferred reveal,
+        // even when its navigation must wait for the current native dialog.
+        setRevealHistory(undefined)
+        if (target) browser.close()
+        else browser.cancelPendingPermission()
+        notifications?.click(id, target)
+      }
       const backend = notificationBackend ? notificationBackend(click, notificationConfig) : new LinuxNotifications(notificationConfig, click)
       notifications = new NotificationHost(api,
         new NotificationPolicy(notificationConfig, reviewOptions?.autoApprove === true, backend),
@@ -232,6 +250,9 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
           const result = await api.client.question.list({ directory: api.state.path.directory }, { signal, throwOnError: true })
           if (!result.data) throw new Error("Pending questions unavailable")
           return result.data
+        }, undefined, (id, target) => {
+          if (controller.retained(id, target)) setRevealHistory({ session: id, live: target })
+          else browser.openPermission(id, target, () => setRevealHistory({ session: id }))
         })
     } catch { /* Desktop initialization cannot change review behavior. */ }
   }
@@ -262,7 +283,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
     setViews(views)
     // Solid cleanup can synchronously cancel an older countdown during this
     // publication. Read current controller state rather than replaying its input.
-    notifications?.snapshot(controller.views)
+    notifications?.snapshot(controller.pendingViews)
   }, reviewOptions, { ...(observer ? {
     list: (signal: AbortSignal) => {
       const pending = controller.views
@@ -345,6 +366,27 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
           const route = api.route.current
           browser.route(route.name === "session" ? route.params?.sessionID as string | undefined : undefined)
         })
+        createEffect(() => {
+          const requested = revealHistory()
+          if (!requested) return
+          const route = api.route.current
+          if (route.name !== "session" || route.params?.sessionID !== requested.session) {
+            setRevealHistory(undefined); return
+          }
+          if (api.ui.dialog.open) return
+          if (requested.live) {
+            views()
+            if (!controller.retained(requested.session, requested.live)) {
+              setRevealHistory(undefined)
+              browser.openPermission(requested.session, requested.live, () => setRevealHistory({ session: requested.session }))
+              return
+            }
+          } else if (!historyState().open) { setRevealHistory(undefined); return }
+          setRevealHistory(undefined)
+          // The explicit approval click is the sole history path that reveals a
+          // hidden sidebar, using the pinned host's public native command.
+          if (sidebar()?.sessionID !== requested.session) api.keymap.dispatchCommand("session.sidebar.toggle")
+        })
         if (notifications) createEffect(() => {
           const route = api.route.current
           notifications?.visit(route.name === "session" ? route.params?.sessionID as string | undefined : undefined)
@@ -412,7 +454,11 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
               }
               const visible = () => {
                 if (!panel || panel.isDestroyed || !panel.visible || panel.width < 4 || panel.height < 4
-                  || select()?.request.id !== id || !paintedAssessment || paintedAssessment !== view().assessment) return
+                  || select()?.request.id !== id) return
+                // Fast mode needs the current native blocker physically visible,
+                // but never waits for final Markdown or a completed assessment.
+                if (config?.fastMode) return ownsPanelProbes(panel) ? id : undefined
+                if (!paintedAssessment || paintedAssessment !== view().assessment) return
                 // Final Markdown can have measured height while its text
                 // is still hidden pending highlighting. Wait for it once;
                 // scrolling newly exposed code must not interrupt the countdown.
@@ -447,7 +493,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                         && description.getChildrenCount() && highlightingComplete(description)))) trace.once("first-display")
                     // Keep this physical-display diagnostic truthful under the
                     // history-only cover exception; readiness observations are separate.
-                    if (presented && ownsPanelProbes(panel)) trace.once("final-render")
+                    if (presented && paintedAssessment && paintedAssessment === view().assessment && ownsPanelProbes(panel)) trace.once("final-render")
                   }
                   if (config?.autoApprove) {
                     controller.presented(presented)

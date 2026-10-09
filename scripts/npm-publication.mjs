@@ -5,6 +5,10 @@ import { compareVersions, npmReleaseVersion } from "./release-version.mjs"
 
 export const archiveIntegrity = (bytes) => `sha512-${createHash("sha512").update(bytes).digest("base64")}`
 
+// npm processing can outlast ten minutes after an accepted upload. Keep the
+// publish job timeout longer than this read-only verification budget.
+export const PUBLICATION_TIMEOUT_MS = 60 * 60 * 1000
+
 // Cache-Control alone did not bypass cached 404s during the first automated release.
 export function freshRegistryURL(url) {
   const fresh = new URL(url)
@@ -74,7 +78,7 @@ export function registryReader({ fetcher = fetch, now = () => performance.now(),
  */
 export async function verifyPublication(pkg, bytes, tag, {
   fetcher = fetch, sleep = setTimeout, now = () => performance.now(),
-  timeoutMs = 600000, intervalMs = 10000, requestTimeoutMs = 15000, log = console.log,
+  timeoutMs = PUBLICATION_TIMEOUT_MS, intervalMs = 10000, requestTimeoutMs = 15000, log = console.log,
 } = {}) {
   npmReleaseVersion(pkg.version)
   assert.ok(tag === undefined || tag === "latest" || tag === "next", "Expected a primary npm channel or archive-only verification")

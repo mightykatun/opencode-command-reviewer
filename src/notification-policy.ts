@@ -5,6 +5,7 @@ import type { NotificationConfig } from "./notification-config.js"
 import { notificationClock, notificationText, type NotificationBackend, type NotificationClock,
   type NotificationHandle, type NotificationKind, type NotificationMessage, type NotificationInteraction } from "./notification-types.js"
 import { withDeadline } from "./deadline.js"
+import type { HistoryTarget } from "./history-records.js"
 
 interface Target { root: string; sessionID: string; title: string }
 interface Banner { abort: AbortController; handle?: NotificationHandle; target: Target; expire?: () => void }
@@ -122,10 +123,10 @@ export class NotificationPolicy {
     if (banner.handle) { try { void Promise.resolve(banner.handle.close()).catch(() => {}) } catch {} }
     this.banners.delete(banner)
   }
-  private show(kind: NotificationKind, title: string, target: Target): Banner | undefined {
+  private show(kind: NotificationKind, title: string, target: Target, history?: HistoryTarget): Banner | undefined {
     if (this.banners.size >= 64) return
     const message = this.message(kind, title, target)
-    return message ? this.dispatch(message, target) : undefined
+    return message ? this.dispatch(history ? { ...message, history: { ...history } } : message, target) : undefined
   }
   private message(kind: NotificationKind, title: string, target: Target): NotificationMessage | undefined {
     if (this.stopped || !this.config.notify) return
@@ -197,7 +198,8 @@ export class NotificationPolicy {
   approved(request: PermissionRequest, target?: Target) {
     if (!this.remember(`approved:${request.id}`)) return
     const current = this.permissions.get(request.id)
-    if (current || target) this.show("approved", uiText.notifications.approved, current?.target ?? target!)
+    if (current || target) this.show("approved", uiText.notifications.approved, current?.target ?? target!,
+      { session: request.sessionID, permission: request.id })
   }
   resolved(kind: "permission" | "question", id: string) {
     const entries = kind === "permission" ? this.permissions : this.questions

@@ -1,6 +1,6 @@
 /** Fixed labels plus monotonic milliseconds and local ordinals only. No host/model data. */
 export type DiagnosticPhase = "dispatch" | "headers" | "first-content" | "first-rating" | "final-validation"
-  | "context.session" | "context.message" | "context.messages" | "context.projects" | "context.tool-ids" | "context.definition"
+  | "context.session" | "context.message" | "context.messages" | "context.projects" | "context.tool-ids" | "context.definition" | "context.skills"
   | "approval-verification" | "approval-read" | "approval-reply" | "pending-refresh"
   | "first-display" | "final-render" | "approval-countdown"
 export interface DiagnosticEvent {

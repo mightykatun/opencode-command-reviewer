@@ -63,8 +63,6 @@ function StatisticsDialog(props: { api: TuiPluginApi; controller: StatisticsCont
           onMouseUp={() => props.controller.select("lifetime")}>{uiText.lifetime.scopeTab("lifetime", props.state.view === "lifetime")}</text>
       </box>
       <text fg={props.api.theme.current.text}>{message()}</text>
-      <text fg={props.api.theme.current.textMuted}>{props.state.view === "conversation" && props.state.conversation?.partialHistory
-        ? uiText.lifetime.partialConversation : uiText.lifetime.recordedCoverage}</text>
       <text fg={props.api.theme.current.textMuted}>{uiText.lifetime.switchScope}</text>
     </box>
 }

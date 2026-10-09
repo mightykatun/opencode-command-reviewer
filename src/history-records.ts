@@ -10,9 +10,11 @@ export const HISTORY_RETRY_MS = 2000
 export class HistoryInvalid extends Error {}
 export interface HistoryScope { scope: string; root: string; session: string }
 export interface HistoryReview extends HistoryScope {
-  permission: string; review: string; category: "bash" | "edit" | "mcp" | "custom" | "external_directory"
+  permission: string; review: string; category: "bash" | "edit" | "mcp" | "custom" | "external_directory" | "skill"
   configuredModel: string; provider: string
 }
+/** A saved entry is keyed by permission, independently of newer reviewer attempts. */
+export type HistoryTarget = Pick<HistoryReview, "session" | "permission">
 export interface HistoryAccepted { safe: boolean; completedAt: number; reportedModel?: string; timing?: ReviewTiming }
 export interface HistoryPayload extends HistoryAccepted { desc: string; usage?: Usage }
 export type HistoryOutcome = "auto" | "manual" | "rejected" | "cancelled"
@@ -62,7 +64,7 @@ export function validateScope(c: HistoryScope): void {
 export function validateReview(c: HistoryReview): void {
   object(c, ["scope", "root", "session", "permission", "review", "category", "configuredModel", "provider"])
   validateScope(c); text(c.permission); text(c.review); text(c.configuredModel); text(c.provider)
-  requireValue(["bash", "edit", "mcp", "custom", "external_directory"].includes(c.category))
+  requireValue(["bash", "edit", "mcp", "custom", "external_directory", "skill"].includes(c.category))
   const url = new URL(c.provider)
   requireValue(["http:", "https:"].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash
     && url.href.replace(/\/+$/, "") === c.provider)

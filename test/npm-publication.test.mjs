@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
 import { setTimeout as sleep } from "node:timers/promises"
-import { archiveIntegrity, registryReader, verifyPublication } from "../scripts/npm-publication.mjs"
+import { archiveIntegrity, PUBLICATION_TIMEOUT_MS, registryReader, verifyPublication } from "../scripts/npm-publication.mjs"
 import { publishRelease } from "../scripts/publish-release.mjs"
 
 const pkg = { name: "opencode-reviewer", version: "0.4.1", publishConfig: { access: "public", registry: "https://registry.npmjs.org/" } }
@@ -51,6 +51,36 @@ test("accepted publication waits for metadata, dist-tag and archive without repu
   assert.equal(polls, 4)
   assert.equal(options.now(), 30)
   assert.match(options.messages.at(-1), /Verified.*archive integrity matches/)
+})
+
+test("default verification survives long npm processing across metadata, channel and archive without another upload", async () => {
+  const options = clock(), minute = 60000
+  let publishes = 0
+  const result = await publishRelease("/tmp/verified.tgz", pkg, bytes, {
+    fetcher: async () => new Response(null, { status: 404 }),
+    run: () => { publishes++ },
+  })
+  await verifyPublication(pkg, bytes, result.tag, { ...options, timeoutMs: undefined, intervalMs: minute,
+    fetcher: async url => {
+      const pathname = new URL(url).pathname
+      if (pathname === versionPath && options.now() < 20 * minute) return new Response(null, { status: 404 })
+      if (pathname === tagsPath && options.now() < 40 * minute) return Response.json({ latest: "0.4.0" })
+      if (pathname.endsWith(".tgz") && options.now() < 50 * minute) return new Response(null, { status: 404 })
+      return ready(url)
+    },
+  })
+  assert.equal(publishes, 1)
+  assert.equal(options.now(), 50 * minute)
+  assert.match(options.messages.at(-1), /Verified.*archive integrity matches/)
+})
+
+test("default verification still stops after one hour when npm never becomes available", async () => {
+  const options = clock()
+  await assert.rejects(verifyPublication(pkg, bytes, "latest", { ...options, timeoutMs: undefined, intervalMs: 60000,
+    fetcher: async () => new Response(null, { status: 404 }),
+  }), /within 3600s: registry HTTP 404/)
+  assert.equal(options.now(), PUBLICATION_TIMEOUT_MS)
+  assert.ok(options.messages.every(message => !message.startsWith("Verified")))
 })
 
 test("metadata, channel and archive body failures after headers retry within the original deadline", async () => {

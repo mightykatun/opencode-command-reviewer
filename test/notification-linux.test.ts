@@ -9,6 +9,7 @@ import { NotificationAudio } from "../src/notification-audio.js"
 import { gnomeTerminalIdentity, activateGnomeTerminal } from "../src/notification-terminal.js"
 import { OwnedNotificationProcesses, type NotificationProcesses, type ProcessResult } from "../src/notification-process.js"
 import { fixtureWav } from "./notification-fixtures.js"
+import type { HistoryTarget } from "../src/history-records.js"
 
 const identity = { service: ":1.123", screen: "00000000-0000-0000-0000-000000000001" }
 const message = { kind: "attention" as const, title: "Session needs attention", body: "<root>&\u001b", sessionID: "root", banner: true, sound: false }
@@ -63,6 +64,25 @@ test("notify-send backslash decoding cannot turn literal session titles into mar
   await backend.show({ ...message, body: "literal \\074b\\076 \\033 title" }, new AbortController().signal)
   assert.equal(f.calls[0]?.args.at(-2), "Opencode (literal \\\\074b\\\\076 \\\\033 title)")
   assert.equal(f.calls[0]?.args.at(-1), "Session needs attention")
+  await backend.dispose()
+})
+
+test("approval actions keep per-banner history identity through out-of-order desktop activation", async () => {
+  const f = fakeProcesses(), clicks: { sessionID: string; history?: HistoryTarget }[] = []
+  const backend = new LinuxNotifications({ notify: true, notifySound: false },
+    (sessionID, history) => clicks.push({ sessionID, history }), f.processes, identity)
+  const first = { ...message, kind: "approved" as const, history: { session: "child", permission: "first" } }
+  await backend.show(first, new AbortController().signal)
+  await backend.show({ ...first, history: { session: "child", permission: "second" } }, new AbortController().signal)
+  first.history.permission = "changed-after-delivery"
+  const banners = f.calls.filter(call => call.command === "notify-send")
+  for (const i of [1, 0]) {
+    assert.ok(banners[i]!.args.includes("--action=default=Open review"))
+    banners[i]!.line!(String(42 + i)); banners[i]!.line!("default")
+    banners[i]!.finish({ code: 0, stdout: "" }); await settle()
+  }
+  assert.deepEqual(clicks, ["second", "first"].map(permission => ({ sessionID: "root", history: { session: "child", permission } })))
+  assert.ok(f.calls.some(call => call.args.includes("org.gnome.Shell.SearchProvider2.ActivateResult")))
   await backend.dispose()
 })
 

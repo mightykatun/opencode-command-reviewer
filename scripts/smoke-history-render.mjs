@@ -14,7 +14,7 @@ import { tsImport } from "tsx/esm/api"
 
 const scenario = process.argv[2] ?? "covered"
 const production = process.argv.includes("--production-history")
-assert.ok(["covered", "countdown", "navigation", "dialog", "fullscreen", "hide", "narrow", "manual", "mode", "error", "zero"].includes(scenario))
+assert.ok(["covered", "countdown", "navigation", "notification", "dialog", "fullscreen", "hide", "narrow", "manual", "mode", "error", "zero"].includes(scenario))
 assert.ok(production || ["covered", "countdown", "dialog", "fullscreen"].includes(scenario))
 const negative = production && ["dialog", "fullscreen", "hide", "narrow", "manual", "mode"].includes(scenario)
 const root = path.resolve(import.meta.dirname, "..")
@@ -42,7 +42,14 @@ import { writeFile, rename } from 'node:fs/promises'
 import { createEffect } from 'solid-js'
 const file = ${JSON.stringify(observations)}
 export default { id: 'history-render-probe', tui: async (api, options) => {
-  const records = { renders: [], diagnostics: [], toggles: [], replies: [], notifications: [], gates: [], dropped: 0 }
+  const records = { renders: [], diagnostics: [], toggles: [], replies: [], notifications: [], gates: [], clicks: [], dropped: 0 }
+  let approvalClick
+  const clickApproval = () => {
+    const approved = records.notifications.find(event => event.kind === 'approved')
+    if (!approved || !approvalClick) return
+    records.clicks.push({ sessionID: approved.sessionID, history: approved.history })
+    approvalClick(approved.sessionID, approved.history); void persist()
+  }
   let dirty = false, writing, last = new Map()
   function persist() {
     dirty = true
@@ -52,6 +59,7 @@ export default { id: 'history-render-probe', tui: async (api, options) => {
     return writing
   }
   createEffect(() => { records.gates.push({ at: performance.now(), dialog: api.ui.dialog.open }); void persist() })
+  createEffect(() => { records.route = api.route.current.name === 'session' ? api.route.current.params.sessionID : undefined; void persist() })
   ${production ? "let opened = false;" : `const cover = new BoxRenderable(api.renderer, { id: 'history-proof-cover', position: 'absolute', top: 0, right: 0, width: 42, height: '100%', zIndex: 2,
     padding: 2, backgroundColor: api.theme.current.backgroundPanel, visible: ${scenario !== "countdown"} })
   cover.add(new TextRenderable(api.renderer, { content: 'Analysis history\\n\\nOpaque fixture report\\n\\n1/1', fg: api.theme.current.text }))`}
@@ -61,8 +69,14 @@ export default { id: 'history-render-probe', tui: async (api, options) => {
     records.toggles.push({ at: performance.now(), visible: cover.visible })`}
     void persist()
   } }, { key: 'f7', cmd: () => api.keymap.dispatchCommand('opencode-reviewer.disable') },
-  { key: 'f8', cmd: () => api.keymap.dispatchCommand('opencode-reviewer.enable') }] })
-  api.event.on('permission.replied', event => { records.replies.push({ at: performance.now(), reply: event.properties.reply }); void persist() })
+  { key: 'f8', cmd: () => api.keymap.dispatchCommand('opencode-reviewer.enable') },
+  { key: 'f9', cmd: clickApproval },
+  { key: 'f10', cmd: async () => {
+    if (!records.other) records.other = (await api.client.session.create({ directory: api.state.path.directory, title: 'Other notification conversation' }, { throwOnError: true })).data.id
+    api.route.navigate('session', { sessionID: records.other }); void persist()
+  } }] })
+  const offClick = api.keymap.registerLayer({ priority: 200, mode: 'modal', bindings: [{ key: 'f9', cmd: clickApproval }] })
+  api.event.on('permission.replied', event => { records.replies.push({ at: performance.now(), ...event.properties }); void persist() })
   const observe = event => {
     records.session = api.route.current.params?.sessionID
     const { at, ...state } = event
@@ -76,12 +90,12 @@ export default { id: 'history-render-probe', tui: async (api, options) => {
     if (records.diagnostics.length < 512) records.diagnostics.push(event); else records.dropped++
     return persist()
   }
-  await ${production ? `withHistoryObservations(observe, diagnostic, () => ({
+  await ${production ? `withHistoryObservations(observe, diagnostic, click => { approvalClick = click; return {
     show: async event => { records.notifications.push({ ...event, at: performance.now() }); await persist(); return { close() {} } },
     dispose: async () => {}
-  }))` : "withHistoryRenderProbe({ cover: () => cover, observe }, diagnostic)"}(api, options)
+  } })` : "withHistoryRenderProbe({ cover: () => cover, observe }, diagnostic)"}(api, options)
   ${production ? "" : "api.slots.register({ slots: { app: () => cover } })"}
-  api.lifecycle.onDispose(async () => { off(); ${production ? "" : "cover.destroyRecursively();"} await writing })
+  api.lifecycle.onDispose(async () => { off(); offClick(); ${production ? "" : "cover.destroyRecursively();"} await writing })
 } }
 `)
 await writeFile(path.join(project, "fixture.py"), 'from pathlib import Path\nimport time\nwith Path("executions").open("a") as f:\n    f.write(str(time.time_ns() // 1000000) + "\\n")\n')
@@ -348,6 +362,37 @@ try {
     send("-l", "/reviewer-history"); await until(s => s.includes("Reviewer: Report history")); send("Enter")
     await until(s => s.includes(`${total}/${total}`))
     await sleep(2300)
+    if (scenario === "notification") {
+      const approved = before.find(event => event.kind === "approved")
+      assert.deepEqual(approved.history, { session: record.replies[0].sessionID, permission: record.replies[0].requestID })
+      const newer = Date.now() + 1000
+      await seed(newer)
+      send("F6"); await until(s => s.includes("Saved history " + newer) && s.includes("2/2"))
+      send("Escape"); await until(s => !s.includes("Analysis history"))
+      send("C-x", "b"); await until(s => !s.includes("Context"))
+      send("F10"); await until(async () => { const d = await data(); return d.other && d.route === d.other })
+      send("C-p"); await until(s => s.includes("Commands"))
+      send("F9"); await until(async () => (await data()).clicks.length === 1)
+      await sleep(350)
+      assert.match(capture(), /Commands/)
+      assert.equal((await data()).route, (await data()).other, "approval click waits without dismissing the dialog or navigating")
+      send("Escape")
+      await until(s => s.includes("Analysis history") && s.includes("COVERED LIVE REPORT") && s.includes("1/2"))
+      assert.equal((await data()).route, approved.sessionID)
+      assert.doesNotMatch(capture(), /Saved history/)
+      await save("notification-target")
+      // The old notification still selects its permission after another report is browsed.
+      send("Right"); await until(s => s.includes("2/2") && s.includes("Saved history " + newer))
+      send("F9"); await until(s => s.includes("1/2") && s.includes("COVERED LIVE REPORT"))
+      send("Escape"); await until(s => !s.includes("Analysis history"))
+      sql.db.prepare("DELETE FROM history WHERE permission=?").run(approved.history.permission)
+      send("F10"); await until(async () => (await data()).route === (await data()).other)
+      send("F9"); await until(async () => (await data()).route === approved.sessionID)
+      await sleep(5500)
+      assert.doesNotMatch(capture(), /Analysis history|Saved history/)
+      await save("notification-missing")
+      send("F6"); await until(s => s.includes("Saved history " + newer) && s.includes("1/1"))
+    }
     assert.deepEqual((await data()).notifications, before, "history replay creates no notification birth or sound")
     assert.equal(calls.length, callsBeforeReplay, "history keys, Close and slash create no model requests")
     assert.deepEqual((await data()).replies.map(event => event.reply), ["once"], "history controls never submit an approval")

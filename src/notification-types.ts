@@ -1,13 +1,16 @@
 import { uiText } from "./ui-text.js"
+import type { HistoryTarget } from "./history-records.js"
 
 export const notificationKinds = ["attention", "unsafe", "question", "approved", "error", "ended"] as const
 export type NotificationKind = typeof notificationKinds[number]
 export interface NotificationInteraction { kind: "permission" | "question"; id: string }
+export type NotificationClick = (sessionID: string, history?: HistoryTarget) => void
 export interface NotificationMessage {
   kind: NotificationKind
   title: string
   body: string
   sessionID: string
+  history?: HistoryTarget
   banner: boolean
   sound: boolean
 }

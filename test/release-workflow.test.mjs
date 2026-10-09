@@ -5,6 +5,7 @@ import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { archiveFixture, artifactFixture } from "./release-fixture.mjs"
+import { PUBLICATION_TIMEOUT_MS } from "../scripts/npm-publication.mjs"
 
 const workflow = await readFile(new URL("../.github/workflows/release.yml", import.meta.url), "utf8")
 const validate = workflow.split("\n  validate:\n")[1]?.split("\n  publish:\n")[0]
@@ -38,6 +39,12 @@ test("workflow pins every action to the remotely verified release commit", () =>
   const actions = [...workflow.matchAll(/uses: actions\/([\w-]+)@(\S+)/g)]
   assert.equal(actions.length, 7)
   for (const [, name, sha] of actions) assert.equal(sha, verified[name])
+})
+
+test("publish job allows the full npm verification window plus setup and release upload", () => {
+  const minutes = Number(publish.match(/^    timeout-minutes: (\d+)$/m)?.[1])
+  assert.ok(minutes * 60000 >= PUBLICATION_TIMEOUT_MS + 15 * 60000)
+  assert.doesNotMatch(step(publish, "Publish package and verify npm availability"), /timeout-minutes:|continue-on-error:/)
 })
 
 test("artifact transfer binds an immutable ID and manifest expectations to validation outputs", () => {

@@ -1,9 +1,15 @@
 # OpenCode Reviewer
 
 Reviews pending permissions in the OpenCode sidebar using a separate LLM. Covers
-shell commands, file edits, MCP calls, custom tools, and external-directory access.
+shell commands, file edits, skill loading, MCP calls, custom tools, and external-directory access.
 Supports streaming explanations, saved report history, auto-approval, and Linux
 desktop notifications with distinct sounds.
+
+This plugin is meant to enable you to run sessions with less frequent input in a safer way. Also giving the reviewer context of specific files the agent might want to run/see/... The review prompts are freely configurable, so you can determine the reviewers behavior very accurately.
+
+> ⚠️ **Disclaimer**
+>
+> This does not make running agents foolproof and safe! An actor running intrusive commands on your machine will always create attack surface! It just reduces risk, and enables you to get more insight into what your agent is doing.
 
 ![](./assets/recording.gif)
 
@@ -29,10 +35,12 @@ OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-revie
         "stream": false,
         "reviewBash": true,
         "reviewEdits": true,
+        "reviewSkills": true,
         "reviewMcp": false,
         "reviewCustomTools": false,
         "reviewExternalDirectories": false,
         "autoApprove": false,
+        "fastMode": false,
         "extraCareful": true,
         "autoApproveDelaySeconds": 15,
         "notify": true,
@@ -48,7 +56,7 @@ OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-revie
         },
         "notificationSoundDirectory": "/absolute/path/to/notification-sounds",
         "formatRetries": 1,
-        "maxOutputTokens": 2048,
+        "maxOutputTokens": 4096,
         "timeoutMs": 30000,
         "maxFiles": 6,
         "maxEvidenceBytes": 131072
@@ -88,25 +96,27 @@ inclusive, fractions are invalid, and the maximum safe integer is
 | `apiKey` | string | Unset | Nonempty Bearer token. Takes precedence over `apiKeyEnv`. |
 | `apiKeyEnv` | string | Unset | Environment-variable name matching `[A-Za-z_][A-Za-z_0-9]*`. Without an inline key, its value must be set and nonblank when a review runs. Omit both key options for no Authorization header. |
 | `instructions` | string | Unset (built-ins) | Absolute, NUL-free directory path containing overrides for the [prompt templates](https://github.com/mightykatun/opencode-reviewer/tree/main/prompts), not inline instructions. Missing named files use built-ins; supplied files must be readable, regular, non-symlink, nonempty UTF-8 text up to 64 KiB. Fixed contracts cannot be overridden. |
-| `stream` | boolean | `false` | Request SSE and show provisional rating/text updates. Approval still requires a completed, validated and rendered report. |
+| `stream` | boolean | `false` | Request SSE and show provisional rating/text updates. Normal automatic approval waits for a completed, validated and rendered report; fast mode can approve on an early Safe rating. |
 | `reviewBash` | boolean | `true` | Review native shell-command permissions. |
 | `reviewEdits` | boolean | `true` | Review native `edit`, `write` and `apply_patch` permissions. |
+| `reviewSkills` | boolean | `true` | Review native skill-load permissions for dangerous guidance and relevance to the current task. Supplies the host's skill instructions and bounded, directly referenced supporting files within the skill directory. |
 | `reviewMcp` | boolean | `false` | Review identifiable MCP tool and resource permissions. |
 | `reviewCustomTools` | boolean | `false` | Review permissions requested by registered custom tools. |
 | `reviewExternalDirectories` | boolean | `false` | Review directory access independently of operation-review switches. Directory approval can resume the operation without another prompt. |
-| `autoApprove` | boolean | `false` | Allow completed, validated and rendered Safe reviews once after their countdown, including behind this plugin's report history. |
+| `autoApprove` | boolean | `false` | Allow Safe reviews once automatically. Normally waits for completion, validation, rendering and the countdown, including behind this plugin's report history. |
+| `fastMode` | boolean | `false` | Requires `autoApprove: true`. Approve a visible, front-of-queue request as soon as a Safe rating is parsed, bypassing the countdown. Respects `stream`; with `stream: false`, waits for the complete validated response. Finish the report and save it in the background after approval. |
 | `extraCareful` | boolean | `true` | Include extra-careful guidance when `autoApprove` is enabled. Setting `false` omits that guidance without disabling automatic approval. |
-| `autoApproveDelaySeconds` | integer | `15` | `0`–`3600` seconds. Positive values have an extra one-second initial hold; `0` skips the wait but retains rendering and eligibility checks. |
+| `autoApproveDelaySeconds` | integer | `15` | `0`–`3600` seconds. Positive values have an extra one-second initial hold; `0` skips the wait but retains rendering and eligibility checks. Ignored in fast mode. |
 | `notify` | boolean | `true` | Master switch for desktop banners, sounds and reminders. `false` overrides all per-type controls. |
 | `notifySound` | boolean | `true` | Master switch for notification audio. `false` silences every type and reminder without disabling enabled banners. |
 | `staleReminderSeconds` | integer | `60` | `0` through the maximum safe integer, in seconds. `0` disables reminders; otherwise eligible pending human interactions repeat at this interval, limited to the native front-of-queue blocker per conversation. |
 | `notifications` | object | All types: `banner: true`, `sound: true` | Keys: `attention`, `unsafe`, `question`, `approved`, `error`, `ended`. Each entry is an object with optional `banner` and `sound` booleans. Omitted types/fields remain enabled; unknown types/fields are invalid. Controls also apply to reminders. |
 | `notificationSoundDirectory` | string | Unset (bundled sounds) | Absolute, NUL-free path, at most 4096 string code units. Use the six notification type names as basenames: usable `.wav` first, then `.mp3`, then the corresponding bundled sound. |
 | `formatRetries` | integer | `1` | `0`–`100` additional assessment-format correction attempts. `0` disables format corrections, not independent transport recovery. |
-| `maxOutputTokens` | integer | `2048` | `1` through the maximum safe integer. Sent as `max_tokens` on every reviewer POST, including retries/corrections. Your provider/model enforces its supported output limit. |
+| `maxOutputTokens` | integer | `4096` | `1` through the maximum safe integer. Sent as `max_tokens` on every reviewer POST, including retries/corrections. Your provider/model enforces its supported output limit. |
 | `timeoutMs` | integer | `30000` | `1`–`3600000` milliseconds shared across evidence collection, HTTP requests, retries and corrections; not a fresh budget per POST. |
-| `maxFiles` | integer | `6` | `1`–`1000` distinct file candidates per shell/edit review, including unavailable candidates. |
-| `maxEvidenceBytes` | integer | `131072` | `1`–`16777216` UTF-8 bytes for command/source content, edit diffs or category-specific JSON evidence. Optional items are omitted whole; oversized mandatory evidence fails analysis. This is not a cap on the full prompt or HTTP request. |
+| `maxFiles` | integer | `6` | `1`–`1000` distinct file candidates per shell/edit/skill review, including unavailable candidates. Skill reviews count the main instructions as one file. |
+| `maxEvidenceBytes` | integer | `131072` | `1`–`16777216` bytes for command/source content, edit diffs or category-specific JSON evidence. Skill reviews share this budget between mandatory skill JSON and UTF-8 supporting-file content. Optional items are omitted whole; oversized mandatory evidence fails analysis. This is not a cap on the full prompt or HTTP request. |
 
 Notification channels are independent: `banner: false, sound: true` is sound-only;
 `banner: true, sound: false` is banner-only; both `false` disable that type.
@@ -121,10 +131,41 @@ The sidebar shows Safe, Unsafe, or Analysis unavailable. Explanations support
 Markdown and scrolling. If the sidebar is hidden, use OpenCode's Show sidebar
 command.
 
+Skill-load review is enabled by default; set `skill` permissions to `ask` in
+`opencode.json` to receive reviews. Its prompt requires both bounded risk and clear
+relevance to the current work. A harmless but irrelevant skill is rated Unsafe.
+The reviewer receives the exact main instructions from the host's skill catalog,
+plus bounded snapshots of directly referenced local files within the skill directory.
+It does not execute scripts, follow references in supporting files, expand directory
+listings, fetch external URLs, or read supporting files outside that directory.
+Built-in skills without a local directory receive instruction-only review.
+Customize this guidance with `SKILL-REVIEW-PROMPT.md` in your prompt directory.
+
+For every review category, subagent requests include the latest immediate delegation
+linked to the requesting assistant invocation, alongside the genuine root-user prompt.
+Resumed subagents use the current delegation; nested subagents include only their
+immediate delegation. Missing or over-64-KiB delegation text is noted rather than
+replaced with an older task. Both prompts are context for the reviewer, not instructions
+that can override its review contract.
+
 With streaming enabled, Evaluating and its spinner disappear when a rating arrives.
 The rating remains provisional until the full response is validated. A retry
-clears the preview and restores the loading indicator. Auto-approval
+clears the preview and restores the loading indicator. Normal auto-approval
 starts only after the full response is validated and rendered.
+
+With `autoApprove: true` and `fastMode: true`, a parsed Safe rating approves the
+current visible permission immediately, without a countdown or waiting for the
+rest of a streamed report. Hidden panels and covering dialogs or history prevent
+fast approval. Without streaming, fast mode waits for the full validated response
+and then skips the countdown.
+
+After confirmed fast approval, the live panel shows **Auto-approved; finishing
+report…** and stays ahead of newer requests until its report finishes. Hiding the
+panel, changing conversations or disabling review does not stop that already-approved
+assessment. Normal retries and the original deadline still apply. The panel closes
+when the assessment finishes; history saves continue in the background. Only a
+completed validated report is saved, including a final Unsafe rating after a retry.
+A failed remainder creates no report entry and cannot undo the earlier approval.
 
 Transient connection failures, HTTP 408/429/500/502/503/504 responses, and rejected
 assessment streams share up to two internal retries within `timeoutMs`, honoring
@@ -148,8 +189,8 @@ before counting down. A zero-second setting still approves without that hold.
 
 `/reviewer-disable` and `/reviewer-enable` control the current conversation and its
 descendants. The setting is saved for resume. Both commands are also in the command
-palette. Disabling stops current reviews and countdowns while native permission
-controls remain available.
+palette. Disabling stops unapproved reviews and countdowns while native permission
+controls remain available. Already-approved fast-mode reports finish in the background.
 
 ### Report history
 
@@ -158,7 +199,8 @@ open the newest saved report for the current conversation and its descendants.
 Left/Right or the arrow buttons select older/newer entries; Up/Down and
 PageUp/PageDown scroll. Close or Escape closes history. Repeating the command
 returns to the newest report. History remains available with review disabled or
-invalid reviewer configuration, and does not force a hidden sidebar open.
+invalid reviewer configuration. The history command preserves a hidden sidebar;
+clicking an approval notification reveals it and selects that permission's live or saved report.
 
 Each entry shows the original report, available usage, model, provider and outcome:
 **Auto approved**, **Manually approved**, **Cancelled**, or **Rejected**. Cancelled
@@ -213,8 +255,8 @@ same state directory. Browsing and switching views do not add usage.
 Older retained history can provide a **partial** conversation baseline. Previously
 deleted details and usage predating history tracking cannot be attributed or
 reconstructed from legacy lifetime aggregates. Once recorded in conversation totals,
-deleting report details does not
-reduce those totals or Lifetime. Storage failures show unavailable, not zero.
+deleting report details does not reduce those totals or Lifetime. Storage failures
+show unavailable, not zero.
 
 Tokens describe received provider usage, not just the visible explanation. One
 report may sum several reviewer POSTs, including format corrections and transport
@@ -250,7 +292,8 @@ terminal is focused:
 - **Agent has a question:** a pending agent question at the front of the native
   input queue, with its own sound.
 - **Reviewer approved a permission:** sent with the approval sound after confirmed
-  automatic approval, for both positive and zero delays. The countdown is silent.
+  automatic approval, including fast mode while its report is still streaming.
+  Positive and zero delays also notify on success; the countdown is silent.
   Approval sounds are limited to
   one every two seconds; every eligible banner is retained for delivery.
 - **Session error:** an unrecovered session/provider failure, not a review failure.
@@ -299,6 +342,12 @@ the originating GNOME Terminal tab and root conversation. Native input prompts
 cover root/direct-child requests in the supported host. Open dialogs are
 left intact; other terminals still receive banners and sounds. Desktop policies
 control expiry/history and whether activation actually brings a window forward.
+Clicking **Reviewer approved a permission** opens that permission's unfinished
+fast-mode report, or its matching saved report if it has completed, revealing the
+sidebar if hidden. If a dialog is open, navigation waits until it closes and then
+checks whether the report is still live. A clicked live panel closes on completion
+like any fast-mode report. A pending save gets up to five seconds; if the report is
+unavailable or deleted, the click just opens its conversation rather than a different report.
 GNOME Terminal clicks use the desktop activation token to bring the correct tab
 forward across workspaces. GNOME may attribute the notification source to Terminal;
 the banner heading remains Opencode.

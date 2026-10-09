@@ -5,6 +5,7 @@ import { candidateEnabled, classify, enabledKind, type ReviewOptions } from "./c
 import { loadContext, loadEditContext, loadConversationContext, loadInvocation, permissionContext, type ContextReader } from "./context.js"
 import { collectEvidence, collectEditEvidence } from "./evidence.js"
 import { collectDirectoryEvidence, collectToolEvidence } from "./tool-evidence.js"
+import { collectSkillEvidence } from "./skill-evidence.js"
 import { FileAccess } from "./file-access.js"
 import { remainingTime, reviewStage, withDeadline } from "./deadline.js"
 import type { ReviewEvidence, ToolDefinition } from "./types.js"
@@ -41,12 +42,23 @@ export async function evaluateEvidence(request: PermissionRequest, reader: Conte
     reviewStage(signal, "Evidence collection")
     return collectEditEvidence(context, config, signal, scope)
   }
-  const conversation = await loadConversationContext(request, reader, signal)
+  const conversation = await loadConversationContext(request, reader, signal, invocation)
   if (!invocation.location.instanceDirectory) conversation.limitations.push("Invocation directory unavailable; session origin is not substituted.")
   if (!invocation.location.instanceWorktree) conversation.limitations.push("Invocation worktree unavailable.")
   // New variable payloads are copied only by the bounded collector, not by an
   // earlier unrestricted structuredClone of permission metadata or scope arrays.
   const common = { ...conversation, tool: invocation.tool, input: invocation.input, permission: permissionContext(request, false), location: invocation.location }
+  if (classified.kind === "skill") {
+    const skill = await withDeadline(signal, Math.min(5000, remainingTime(signal) / 3), async s => {
+      const catalog = await reader.skills?.(s)
+      s.throwIfAborted()
+      if (!Array.isArray(catalog) || catalog.length > 16384) throw new Error("Skill catalog unavailable or oversized")
+      const matches = catalog.filter(item => item?.name === invocation.input.name)
+      if (matches.length !== 1) throw new Error("Requested skill is unavailable or ambiguous in the host catalog")
+      return matches[0]!
+    }, "Skill catalog lookup")
+    return collectSkillEvidence({ ...common, kind: "skill", tool: "skill", skill }, config, signal, scope)
+  }
   if (classified.kind === "external-directory") {
     if (!ids) common.limitations.push("Tool registry unavailable; operation origin is not verified as native.")
     return collectDirectoryEvidence({ ...common, kind: "external-directory", native: classified.native }, config, signal)

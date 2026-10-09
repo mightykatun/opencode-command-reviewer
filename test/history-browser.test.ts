@@ -4,6 +4,7 @@ import { setImmediate as settle } from "node:timers/promises"
 import { HistoryController } from "../src/history-controller.js"
 import type { HistorySelection } from "../src/history-schema.js"
 import type { HistoryQuery } from "../src/history-records.js"
+import { opaque } from "../src/history-records.js"
 import { historyLayout, historyMetadata } from "../src/history-layout.js"
 import { uiText } from "../src/ui-text.js"
 import { historyCommands } from "../src/history-commands.js"
@@ -44,8 +45,9 @@ test("history has independent exact copy and extreme footer layouts", () => {
 })
 test("historical metadata order, fallback, usage independence and control sanitization", () => {
   assert.equal(historyMetadata(selection.record!), "model: m\nprovider: https://example.com")
-  assert.equal(historyMetadata({ ...selection.record!, payload: { ...selection.record!.payload, reportedModel: "reported", usage: { input: 12, output: 3, cost: 0.0001 } } }),
-    "token: 12 in 3 out\ncost: $0.0001\nmodel: reported\nprovider: https://example.com")
+  assert.equal(historyMetadata({ ...selection.record!, payload: { ...selection.record!.payload, reportedModel: "reported",
+    usage: { input: 12, output: 3, cost: 0.0001 }, timing: { ratingMs: 1250, fullReportMs: 3500 } } }),
+    "token: 12 in 3 out\ncost: $0.0001\nmodel: reported\nprovider: https://example.com\nTime to first rating: 1.25s\nTime to full report: 3.50s")
   const unsafe = historyMetadata({ ...selection.record!, payload: { ...selection.record!.payload, reportedModel: "x\x1b[31m\u202ey" } })
   assert.ok(!unsafe.includes("\x1b")); assert.ok(!unsafe.includes("\u202e")); assert.ok(!unsafe.includes("lifetime"))
 })
@@ -164,4 +166,76 @@ test("live deletion suppresses precommit snapshots and durable root deletion clo
   assert.equal(c.state.status, "ready"); assert.equal(c.state.selection?.entry, undefined)
   f.commit(); f.pending.shift()!.resolve({ revision: 3, rank: 0, total: 0, deleted: true }); await tick()
   assert.equal(c.state.open, false)
+})
+
+const target = { session: "root", permission: "p" }
+const targeted: HistorySelection = { ...selection, entry: opaque("/project", "p"),
+  order: { ...selection.order!, id: opaque("/project", "p") } }
+
+test("notification selection waits for its exact committed entry, then retains it and permits browsing", async t => {
+  const f = fixture(t), c = f.controller
+  let ready = 0
+  c.openPermission("root", target, () => ready++)
+  await tick()
+  assert.equal(c.state.open, false)
+  assert.deepEqual(f.pending[0]!.query, { type: "history", scope: "/project", root: "root", entry: targeted.entry })
+  f.pending.shift()!.resolve({ revision: 1, total: 2, rank: 0 }); await tick()
+  assert.equal(c.state.open, false)
+  f.commit(); f.pending.shift()!.resolve({ ...targeted, total: 3, rank: 1, newer: "b".repeat(64) }); await tick()
+  assert.equal(c.state.open, true); assert.equal(c.state.selection?.entry, targeted.entry); assert.equal(ready, 1)
+  c.scroll = 10
+  f.commit(); f.pending.shift()!.resolve({ ...targeted, total: 4, rank: 1, newer: "b".repeat(64) }); await tick()
+  assert.equal(c.scroll, 10); assert.equal(ready, 1)
+  c.navigate("newer")
+  assert.equal((f.pending[0]!.query as Extract<HistoryQuery, { type: "history" }>).direction, "newer")
+})
+
+test("missing, unreadable, wrong-scope or wrong-permission targets never show another saved report", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] })
+  for (const value of [{ revision: 1, total: 4, rank: 0 }, { ...targeted, record: undefined, unreadable: true }, selection,
+    ...["scope", "root", "session", "permission"].map(field => ({ ...targeted,
+      record: { ...targeted.record!, context: { ...targeted.record!.context, [field]: "wrong" } } }))]) {
+    const f = fixture(t); let ready = 0
+    f.controller.openPermission("root", target, () => ready++); await tick()
+    f.pending.shift()!.resolve(value); await tick()
+    assert.equal(f.controller.state.open, false)
+    t.mock.timers.tick(5000); await tick()
+    f.commit()
+    for (const read of f.pending) read.resolve(targeted)
+    await tick(); assert.equal(f.controller.state.open, false); assert.equal(ready, 0)
+  }
+})
+
+test("targeted open cancellation defeats late reads and never overrides a newer history command", async t => {
+  for (const action of ["close", "route", "deleted", "dispose", "open", "cancelPendingPermission"] as const) {
+    const f = fixture(t); let ready = 0
+    f.controller.openPermission("root", target, () => ready++); await tick()
+    const read = f.pending.shift()!
+    if (action === "route") f.controller.route("other")
+    else if (action === "deleted") f.controller.deleted("root")
+    else if (action === "open") f.controller.open("root")
+    else f.controller[action]()
+    await tick(); read.resolve(targeted); await tick()
+    assert.equal(ready, 0); assert.equal(f.controller.state.selection, undefined)
+    assert.equal(f.controller.state.open, action === "open")
+  }
+})
+
+test("targeted history waits through maintenance and retains actual read cleanup ownership", async t => {
+  let dirty = true, onMaintenance = () => {}, commit = () => {}, finish!: (value: HistorySelection) => void, settleRead!: () => void
+  let reads = 0, ready = 0
+  const read = Object.assign(new Promise<HistorySelection>(resolve => { finish = resolve }),
+    { settled: new Promise<void>(resolve => { settleRead = resolve }) })
+  const c = new HistoryController("/project", {
+    get maintenanceDirty() { return dirty }, onMaintenance: cb => { onMaintenance = cb; return () => {} },
+    onCommit: cb => { commit = cb; return () => {} }, onWriteFailure: () => () => {},
+    query: () => { reads++; return read },
+  }, async () => "root", () => {})
+  t.after(() => c.dispose())
+  c.openPermission("root", target, () => ready++); await tick()
+  finish(targeted); await tick()
+  assert.equal(c.state.open, false)
+  dirty = false; onMaintenance(); commit(); await tick(); assert.equal(reads, 1)
+  settleRead(); await tick()
+  assert.equal(reads, 2); assert.equal(c.state.open, true); assert.equal(ready, 1)
 })

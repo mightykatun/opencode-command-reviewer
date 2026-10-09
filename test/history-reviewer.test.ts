@@ -36,7 +36,7 @@ test("per execution and POST identity, actual retry kind and exactly-once normal
   assert.equal(bodies[0], JSON.stringify({ model: config.model, messages: [
     { role: "system", content: [BUILTIN_PROMPTS.shell.instructions, (await import("../src/prompts.js")).CONTRACT].join("\n\n") },
     { role: "user", content: JSON.stringify(evidence) },
-  ], max_tokens: 2048, stream: false }))
+  ], max_tokens: 4096, stream: false }))
   assert.ok(!bodies.some(b => b.includes('"review":"execution"')))
   assert.equal(value.metadata?.reportedModel, "successful-model")
   assert.equal(value.metadata?.configuredModel, "configured")

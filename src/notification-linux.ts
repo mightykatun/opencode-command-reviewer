@@ -2,7 +2,7 @@ import type { NotificationConfig } from "./notification-config.js"
 import { NotificationAudio } from "./notification-audio.js"
 import { OwnedNotificationProcesses, type NotificationProcesses } from "./notification-process.js"
 import { activateGnomeTerminal, gnomeTerminalIdentity, type TerminalIdentity } from "./notification-terminal.js"
-import { notificationMarkup, notificationText, type NotificationBackend, type NotificationMessage } from "./notification-types.js"
+import { notificationMarkup, notificationText, type NotificationBackend, type NotificationMessage, type NotificationClick } from "./notification-types.js"
 import type { NotificationProcess } from "./notification-process.js"
 import { NotificationIcon } from "./notification-icon.js"
 import { uiText } from "./ui-text.js"
@@ -18,7 +18,7 @@ export class LinuxNotifications implements NotificationBackend {
   private start(...args: Parameters<NotificationProcesses["start"]>): NotificationProcess | undefined {
     try { return this.processes.start(...args) } catch { return undefined }
   }
-  constructor(config: Pick<NotificationConfig, "notificationSoundDirectory" | "notify" | "notifySound">, private click: (sessionID: string) => void,
+  constructor(config: Pick<NotificationConfig, "notificationSoundDirectory" | "notify" | "notifySound">, private click: NotificationClick,
     private processes: NotificationProcesses = new OwnedNotificationProcesses(),
     private identity: TerminalIdentity | null = gnomeTerminalIdentity() ?? null,
     private platform: string = process.platform) {
@@ -26,6 +26,8 @@ export class LinuxNotifications implements NotificationBackend {
   }
   async show(message: NotificationMessage, parent: AbortSignal) {
     if (this.stopped || parent.aborted || this.platform !== "linux") return
+    const sessionID = message.sessionID
+    const history = message.kind === "approved" && message.history ? { ...message.history } : undefined
     const preparation = AbortSignal.any([parent, this.abort.signal])
     if (!message.banner) {
       if (!message.sound) return
@@ -71,7 +73,7 @@ export class LinuxNotifications implements NotificationBackend {
       "--urgency=normal", "--expire-time=-1", "--transient", "--hint=boolean:suppress-sound:true", "--print-id",
       // GNOME emits an activation token only for a recognized application.
       ...(this.identity ? ["--hint=string:desktop-entry:org.gnome.Terminal"] : []),
-      ...(this.identity ? [`--action=default=${uiText.notifications.openSession}`] : []), "--wait", "--",
+      ...(this.identity ? [`--action=default=${history ? uiText.notifications.openReview : uiText.notifications.openSession}`] : []), "--wait", "--",
       // Summaries are plain text; only the body supports desktop markup.
       uiText.notifications.heading(notificationText(message.body)).replaceAll("\\", "\\\\"),
       uiText.notifications.body(notificationMarkup(message.title)).replaceAll("\\", "\\\\")],
@@ -99,7 +101,7 @@ export class LinuxNotifications implements NotificationBackend {
       // libnotify writes the token after the action name and closes its own
       // notification. Wait for EOF so token parsing is independent of chunking.
       if (clicked && !this.stopped) void activateGnomeTerminal(this.processes, this.identity, this.abort.signal, token).then(ok => {
-        if (ok && !this.stopped) { try { this.click(message.sessionID) } catch {} }
+        if (ok && !this.stopped) { try { this.click(sessionID, history) } catch {} }
       }).catch(() => {})
     })
     return { close, closed: process.result.then(() => {}) }

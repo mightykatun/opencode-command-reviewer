@@ -20,6 +20,7 @@ interface Candidate {
   expires?: number
 }
 interface Dispatch { context: HistoryReview; approval: string; automatic: boolean }
+interface EarlyReview { context: HistoryReview; confirmed?: "auto" | "manual"; reply?: Candidate["reply"] }
 const category = (kind: ReviewKind): HistoryReview["category"] => kind === "shell" ? "bash"
   : kind === "external-directory" ? "external_directory" : kind
 
@@ -30,6 +31,7 @@ const category = (kind: ReviewKind): HistoryReview["category"] => kind === "shel
 export class HistoryCoordinator {
   private candidates = new Map<string, Candidate>()
   private dispatches = new Map<string, Dispatch>()
+  private early = new Map<string, EarlyReview>()
   private resolved = new Map<string, HistoryReview>()
   private stopped = false
   private polling = false
@@ -50,6 +52,9 @@ export class HistoryCoordinator {
     const context: HistoryReview | undefined = execution.root ? { scope: this.scope, root: execution.root,
       session: request.sessionID, permission: request.id, review: execution.review, category: category(kind),
       configuredModel: config.model, provider: config.baseURL } : undefined
+    // Early approval needs identity/accounting before an accepted report exists.
+    // No provisional rating or explanation enters persistent history.
+    if (!this.stopped && context && config.autoApprove && config.fastMode) this.early.set(request.id, { context })
     return { review: execution.review, observe: event => {
       // Real transport finalizers may still enqueue received usage during shutdown.
       if (!context || event.review !== context.review) return
@@ -71,12 +76,18 @@ export class HistoryCoordinator {
         ...(m.reportedModel ? { reportedModel: m.reportedModel } : {}) }
       this.admit({ type: "reviewAccepted", context, at: fact.completedAt, accepted })
       const old = this.candidates.get(id)
-      this.candidates.set(id, { context, payload: { ...accepted, desc: fact.result.desc,
+      const early = this.early.get(id)
+      const confirmed = early?.context.review === fact.review ? early.confirmed : undefined
+      const candidate: Candidate = { context, payload: { ...accepted, desc: fact.result.desc,
         ...(fact.result.usage ? { usage: { ...fact.result.usage } } : {}) }, message: fact.request.tool?.messageID,
-        cancelled: old?.cancelled ?? false, interrupted: old?.interrupted ?? false, removed: false,
-        dispatched: old?.dispatched ?? false, confirmed: old?.confirmed })
+        cancelled: old?.cancelled ?? false, interrupted: old?.interrupted ?? false, removed: !!confirmed,
+        dispatched: old?.dispatched ?? false, confirmed: confirmed ?? old?.confirmed,
+        ...(early?.context.review === fact.review && early.reply ? { reply: early.reply } : {}) }
+      this.candidates.set(id, candidate)
+      if (confirmed) this.finishKnown(candidate)
       return
     }
+    if (fact.type === "removed") this.early.delete(id)
     const c = this.candidates.get(id)
     if (!c || c.context.session !== fact.request.sessionID) return
     if (fact.type === "cancelled") { c.cancelled = true; return }
@@ -94,6 +105,8 @@ export class HistoryCoordinator {
   }
   reply(properties: { requestID: string; sessionID: string; reply: "once" | "always" | "reject" }) {
     if (this.stopped) return
+    const early = this.early.get(properties.requestID)
+    if (early?.context.session === properties.sessionID) early.reply = properties.reply
     const c = this.candidates.get(properties.requestID)
     if (!c) {
       const context = this.resolved.get(properties.requestID)
@@ -116,10 +129,12 @@ export class HistoryCoordinator {
   approval = (fact: ApprovalFact) => {
     if (this.stopped || !fact.approval || !fact.review) return
     const c = this.candidates.get(fact.request.id)
+    const early = this.early.get(fact.request.id)
     if (fact.type === "dispatched") {
-      if (!c || c.context.review !== fact.review || c.context.session !== fact.request.sessionID) return
-      c.dispatched = true
-      const d = { context: c.context, approval: fact.approval, automatic: fact.automatic }
+      const context = early?.context.review === fact.review ? early.context : c?.context
+      if (!context || context.review !== fact.review || context.session !== fact.request.sessionID) return
+      if (c) c.dispatched = true
+      const d = { context, approval: fact.approval, automatic: fact.automatic }
       this.dispatches.set(fact.approval, d)
       this.admit({ type: "approvalDispatched", ...d, at: this.now() })
       return
@@ -128,6 +143,7 @@ export class HistoryCoordinator {
     if (!d || d.context.review !== fact.review || d.context.permission !== fact.request.id || d.context.session !== fact.request.sessionID) return
     if (fact.type === "confirmed") {
       this.admit({ type: "approvalConfirmed", ...d, at: this.now() })
+      if (early?.context.review === fact.review) early.confirmed = d.automatic ? "auto" : "manual"
       if (c) {
         c.confirmed = d.automatic ? "auto" : "manual"
         // Confirmation itself proves resolution, even before the native event.
@@ -188,6 +204,7 @@ export class HistoryCoordinator {
     finally { this.polling = false }
   }
   invalidateSession(session: string) {
+    for (const [id, e] of this.early) if (e.context.session === session || e.context.root === session) this.early.delete(id)
     for (const [id, c] of this.candidates) if (c.context.session === session || c.context.root === session) this.candidates.delete(id)
     for (const [id, d] of this.dispatches) if (d.context.session === session || d.context.root === session) this.dispatches.delete(id)
     for (const [id, c] of this.resolved) if (c.session === session || c.root === session) this.resolved.delete(id)
@@ -203,6 +220,7 @@ export class HistoryCoordinator {
     this.store.markMaintenanceDirty?.()
     const known = [...this.candidates.values()].find(c => c.context.session === info.id)?.context
       ?? [...this.resolved.values()].find(c => c.session === info.id)
+      ?? [...this.early.values()].find(e => e.context.session === info.id)?.context
     this.invalidateSession(info.id)
     if (!info.parentID || known) {
       this.deleted({ scope: this.scope, root: known?.root ?? info.id, session: info.id }); return
@@ -221,6 +239,7 @@ export class HistoryCoordinator {
   deleted(context: HistoryScope) {
     if (this.stopped || context.scope !== this.scope) return
     const matches = (c: HistoryScope) => c.session === context.session || (context.session === context.root && c.root === context.root)
+    for (const [id, e] of this.early) if (matches(e.context)) this.early.delete(id)
     for (const [id, c] of this.candidates) if (matches(c.context)) this.candidates.delete(id)
     for (const [id, d] of this.dispatches) if (matches(d.context)) this.dispatches.delete(id)
     for (const [id, c] of this.resolved) if (matches(c)) this.resolved.delete(id)
@@ -229,7 +248,7 @@ export class HistoryCoordinator {
   dispose() {
     if (this.stopped) return
     this.stopped = true; this.unsubscribe(); clearTimeout(this.timer); this.abort.abort()
-    this.candidates.clear(); this.dispatches.clear(); this.resolved.clear()
+    this.candidates.clear(); this.dispatches.clear(); this.resolved.clear(); this.early.clear()
   }
 }
 

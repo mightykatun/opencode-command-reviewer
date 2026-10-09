@@ -90,13 +90,12 @@ export function lifetimeCost(totals: LifetimeTotals): string {
 export function lifetimeReport(totals: LifetimeTotals): string {
   const reviews = totals.safe + totals.unsafe, activity = totals.activity
   const percentage = (count: number) => reviews ? (count / reviews * 100).toFixed(1) : undefined
-  const partial = activity.reviews < reviews || activity.usageRequests < totals.requests
-  return [uiText.lifetime.dialogReviews(reviews), uiText.lifetime.dialogRetries(activity.retries, partial),
+  return [uiText.lifetime.dialogReviews(reviews), uiText.lifetime.dialogRetries(activity.retries),
     totals.tokenRequests ? uiText.lifetime.dialogTokens(totals.input, totals.output, totals.tokenRequests < totals.requests) : uiText.lifetime.dialogTokensUnavailable,
     uiText.lifetime.dialogCost(totals.priced ? totals.cost.toFixed(4) : undefined, totals.priced < totals.requests),
     "", uiText.lifetime.dialogSafe(totals.safe, percentage(totals.safe)),
     uiText.lifetime.dialogUnsafe(totals.unsafe, percentage(totals.unsafe)),
-    uiText.lifetime.dialogAutoApproved(activity.autoApproved, percentage(activity.autoApproved), partial),
+    uiText.lifetime.dialogAutoApproved(activity.autoApproved, percentage(activity.autoApproved)),
     "", uiText.lifetime.averageFullReport(activity.timedReviews ? (activity.meanFullReportMs / 1000).toFixed(2) : undefined),
     uiText.lifetime.averageRating(activity.timedReviews ? (activity.meanRatingMs / 1000).toFixed(2) : undefined),
   ].join("\n")

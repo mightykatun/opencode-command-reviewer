@@ -81,6 +81,7 @@ const seed = (n, options = {}) => {
     review: options.review ?? "r" + n, category: "bash", configuredModel: "historical-model", provider: "https://history.invalid/v1" }
   apply({ type: "permissionResolved", context, at: 1000 + n, outcome: options.outcome ?? ["manual", "auto", "cancelled", "rejected"][(n - 1) % 4],
     payload: { completedAt: options.completed ?? n, safe: n % 2 === 1, desc: options.desc ?? "Historical report " + n,
+      ...(options.timing ? { timing: options.timing } : {}),
       ...(n === 1 ? { usage: { input: 12, output: 3, cost: 0.0001 } } : {}) } })
 }
 try {
@@ -113,15 +114,19 @@ try {
     sql.db.exec("UPDATE history SET completed=1")
     await until(s => s.includes("Historical report 1")); await save("recovered")
   } else {
-    for (let n = 1; n <= (scenario === "delete" ? 5 : 4); n++) seed(n, scenario === "delete" ? { child: "child-" + n } : {})
+    for (let n = 1; n <= (scenario === "delete" ? 5 : 4); n++) seed(n, scenario === "delete" ? { child: "child-" + n }
+      : scenario === "browse" && (n === 1 || n === 4) ? { timing: { ratingMs: 1250, fullReportMs: 3500 } } : {})
     if (scenario === "scroll") seed(4, { review: "long", completed: 5, desc: Array.from({ length: 100 }, (_, i) => `History line ${i + 1}\n`).join("\n") })
     if (scenario === "disabled-invalid") { await palette("Reviewer: Disable for conversation"); await until(s => s.includes("Reviewer disabled for this conversation.")) }
     await open(); await until(s => s.includes(scenario === "delete" ? "5/5" : "4/4")); await save("newest")
     if (scenario === "browse") {
+      assert.match(capture(), /Time to first rating: 1\.25s/); assert.match(capture(), /Time to full report: 3\.50s/)
       send("Left"); await until(s => s.includes("3/4") && s.includes("Cancelled"));
+      assert.doesNotMatch(capture(), /Time to first rating:|Time to full report:/)
       send("Left"); await until(s => s.includes("2/4") && s.includes("Auto approved"));
       send("Left"); await until(s => s.includes("1/4") && s.includes("Manually approved"));
       assert.match(capture(), /model: historical-model/); assert.match(capture(), /provider: https:\/\/history.invalid\/v1/)
+      assert.match(capture(), /Time to first rating: 1\.25s/); assert.match(capture(), /Time to full report: 3\.50s/)
       assert.ok(!capture().includes("lifetime:")); await save("oldest")
       send("-l", "ABC"); send("Left", "Left"); send("-l", "Z")
       await until(s => s.includes("ABCZ") && s.includes("1/4")); send("C-u")

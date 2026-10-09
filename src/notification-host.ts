@@ -6,6 +6,7 @@ import type { NotificationPolicy } from "./notification-policy.js"
 import { notificationClock, type NotificationClock } from "./notification-types.js"
 import { notificationBlockers, type PendingInteraction } from "./notification-order.js"
 import { withDeadline } from "./deadline.js"
+import type { HistoryTarget } from "./history-records.js"
 
 type Target = { root: string; sessionID: string; title: string }
 interface Request {
@@ -49,10 +50,13 @@ export class NotificationHost {
   private questionRead = false
   private questionPoll?: () => void
   private abort = new AbortController()
+  private pendingClick?: { sessionID: string; history: HistoryTarget; route: string }
+  private clickWait?: () => void
   constructor(private api: HostApi, private policy: NotificationPolicy,
     private resolveRoot: (id: string, signal: AbortSignal) => Promise<string>,
     private readQuestions: (signal: AbortSignal) => Promise<readonly QuestionRequest[]>,
-    private clock: NotificationClock = notificationClock) {
+    private clock: NotificationClock = notificationClock,
+    private openHistory?: (sessionID: string, target: HistoryTarget) => void) {
     const on = api.event.on
     this.subscriptions.push(
       on("permission.asked", e => this.asked("permission", e.properties)),
@@ -308,11 +312,42 @@ export class NotificationHost {
       }
     })
   }
-  click(sessionID: string) {
+  click(sessionID: string, history?: HistoryTarget) {
+    this.clearClick()
+    if (history && this.openHistory) {
+      this.pendingClick = { sessionID, history: { ...history }, route: this.clickRoute() }
+      this.activateClick()
+      return
+    }
     if (this.stopped || this.deletedSessions.has(sessionID) || this.api.ui.dialog.open || !this.api.state.session.get(sessionID)) return
     this.api.route.navigate("session", { sessionID })
   }
+  private clearClick() { this.clickWait?.(); this.clickWait = undefined; this.pendingClick = undefined }
+  private clickRoute() {
+    const route = this.api.route.current
+    return JSON.stringify([route?.name, route?.name === "session" ? route.params?.sessionID : undefined])
+  }
+  private activateClick() {
+    const target = this.pendingClick
+    if (!target) return
+    if (this.stopped || this.api.lifecycle.signal.aborted || this.clickRoute() !== target.route || this.deletedSessions.has(target.sessionID)
+      || this.deletedSessions.has(target.history.session) || !this.api.state.session.get(target.sessionID)) { this.clearClick(); return }
+    if (this.api.ui.dialog.open) {
+      // Only the latest click waits; keep the user's dialog intact.
+      this.clickWait = this.clock.after(100, () => {
+        if (this.pendingClick !== target) return
+        this.clickWait = undefined; this.activateClick()
+      })
+      return
+    }
+    this.clearClick()
+    try {
+      this.api.route.navigate("session", { sessionID: target.sessionID })
+      this.openHistory?.(target.sessionID, target.history)
+    } catch { /* Navigation cannot affect review/approval. */ }
+  }
   private deleted(id: string) {
+    if (this.pendingClick?.sessionID === id || this.pendingClick?.history.session === id) this.clearClick()
     this.questionRevision++
     if (this.deletedSessions.size >= 4096) this.deletedSessions.delete(this.deletedSessions.values().next().value!)
     this.deletedSessions.add(id)
@@ -326,6 +361,7 @@ export class NotificationHost {
   }
   dispose() {
     this.stopped = true
+    this.clearClick()
     this.abort.abort(); this.questionPoll?.()
     for (const stop of this.subscriptions) stop()
     for (const root of this.roots.values()) root.idle?.()
