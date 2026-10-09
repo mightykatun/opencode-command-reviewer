@@ -30,6 +30,7 @@ import { HistoryStore } from "./history-store.js"
 import { HistoryCoordinator, drainHistory } from "./history-coordinator.js"
 import { HistoryController, type HistoryViewState } from "./history-controller.js"
 import { HistoryView, type HistoryInput } from "./history-view.js"
+import { HistoryCover } from "./history-cover.js"
 import { historyCommands } from "./history-commands.js"
 import { ReviewDescription } from "./review-description.js"
 export type { DiagnosticEvent, DiagnosticObserver } from "./diagnostics.js"
@@ -156,7 +157,7 @@ function contextReader(api: TuiPluginApi, trace?: DiagnosticTrace): ContextReade
 
 export type NotificationBackendFactory = (click: (sessionID: string) => void, config: NotificationConfig) => NotificationBackend
 
-/** Opt-in Phase 0 observations of real renderables, never a readiness override. */
+/** Opt-in observations of real renderables, never a readiness override. */
 export interface HistoryRenderProbeEvent {
   stage: "render-after" | "frame"
   at: number
@@ -174,9 +175,10 @@ export interface HistoryRenderProbeEvent {
   eligible: boolean
   auto?: string
   seconds?: number
+  history?: "loading" | "ready" | "error"
 }
 export interface HistoryRenderProbe {
-  cover: () => Renderable | undefined
+  cover?: () => Renderable | undefined
   observe: (event: Readonly<HistoryRenderProbeEvent>) => void | Promise<void>
 }
 
@@ -211,6 +213,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const [historyState, setHistoryState] = createSignal<HistoryViewState>({ open: false, status: "loading", reset: 0 })
   const browser = new HistoryController(api.state.path.directory, historyStore, (id, signal) => history.root(id, signal), setHistoryState)
   const historyInput: HistoryInput = { interactive: () => false, scroll: () => {} }
+  const historyCover = new HistoryCover()
   const unregisterHistory = historyCommands(api, browser, () => historyInput.interactive(), (amount, page) => historyInput.scroll(amount, page))
   let notifications: NotificationHost | undefined
   if (notificationConfig?.notify) {
@@ -343,7 +346,11 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
           return visibleReview(controller.views, mounted.sessionID, (id) => api.state.session.get(id))
         }
         const current = createMemo(() => { views(); return select() })
-        return (<>
+        // A stable slot root keeps the host's array normalization from replacing
+        // the live sibling when the optional history sibling appears/disappears.
+        return (<box position="absolute" top={0} right={0} bottom={0} width={42} zIndex={1}
+          visible={!!sidebar() && !api.ui.dialog.open && api.route.current.name === "session"
+            && api.route.current.params?.sessionID === sidebar()?.sessionID && (!!current() || historyState().open)}>
           <Show when={current()?.request.id} keyed>
             {(id) => {
               // Countdown publications must not remount Markdown/reset its scroll.
@@ -368,7 +375,11 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                 && ownsHit(owner, api.renderer.hitTest(panel.x + 2, panel.y + 1))
                 && ownsHit(owner, api.renderer.hitTest(panel.x + 2, panel.y + panel.height - 3))
               const coveredByProbe = () => {
-                try { return !!historyProbe && ownsPanelProbes(historyProbe.cover()) } catch { return false }
+                if (!panel) return false
+                const session = sidebar()?.sessionID
+                if (session && historyCover.covers(session, [api.renderer.hitTest(panel.x + 2, panel.y + 1),
+                  api.renderer.hitTest(panel.x + 2, panel.y + panel.height - 3)])) return true
+                try { return !!historyProbe?.cover && ownsPanelProbes(historyProbe.cover()) } catch { return false }
               }
               const observeRender = (stage: HistoryRenderProbeEvent["stage"], eligible: boolean) => {
                 if (!historyProbe || !panel) return
@@ -384,7 +395,8 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                     highlighting: !!description && !highlightingComplete(description),
                     painted: !!assessment && paintedAssessment === assessment, covered: coveredByProbe(),
                     physical: ownsPanelProbes(panel), eligible, auto: auto?.status,
-                    seconds: auto?.status === "countdown" ? auto.seconds : undefined }))
+                    seconds: auto?.status === "countdown" ? auto.seconds : undefined,
+                    history: historyState().open ? historyState().status : undefined }))
                   if (pending) void Promise.resolve(pending).catch(() => {})
                 } catch { /* Fixture observations cannot change approval behavior. */ }
               }
@@ -410,6 +422,9 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
               if (config?.autoApprove) visibleApproval = visible
               if (config?.autoApprove || traces) {
                 const frame = () => {
+                  // Expire the previous hit-grid handoff before proving this
+                  // frame. Keep the new proof for transitions before next paint.
+                  historyCover.frame()
                   const presented = visible()
                   const trace = traces?.get(view().request)
                   if (trace) {
@@ -421,7 +436,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                       && (rating() !== undefined || (report() && description && !description.isDestroyed
                         && description.getChildrenCount() && highlightingComplete(description)))) trace.once("first-display")
                     // Keep this physical-display diagnostic truthful under the
-                    // opt-in cover exception; its readiness observations are separate.
+                    // history-only cover exception; readiness observations are separate.
                     if (presented && ownsPanelProbes(panel)) trace.once("final-render")
                   }
                   if (config?.autoApprove) {
@@ -492,9 +507,9 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
           </Show>
           <Show when={historyState().open && sidebar() && !api.ui.dialog.open && api.route.current.name === "session"
             && api.route.current.params?.sessionID === sidebar()?.sessionID}>
-            <HistoryView api={api} controller={browser} state={historyState()} input={historyInput} />
+            <HistoryView api={api} controller={browser} state={historyState()} input={historyInput} cover={historyCover} session={sidebar()!.sessionID} />
           </Show>
-        </>)
+        </box>)
       },
     },
   })
@@ -510,9 +525,15 @@ export function withDiagnostics(observer: DiagnosticObserver): TuiPlugin {
   return (api, options) => reviewTui(api, options, undefined, observer)
 }
 
-/** Phase 0 fixture only. Default plugin has no cover exception or render observer. */
+/** Phase 0 fixture only. Explicit synthetic cover, never used by the normal plugin. */
 export function withHistoryRenderProbe(probe: HistoryRenderProbe, observer?: DiagnosticObserver): TuiPlugin {
   return (api, options) => reviewTui(api, options, undefined, observer, undefined, probe)
+}
+
+/** Production history observations and notification I/O, without a cover override. */
+export function withHistoryObservations(observe: HistoryRenderProbe["observe"], observer?: DiagnosticObserver,
+  notifications?: NotificationBackendFactory): TuiPlugin {
+  return (api, options) => reviewTui(api, options, undefined, observer, notifications, { observe })
 }
 
 /** Isolated notification backend for embedding and real-host fixtures. */

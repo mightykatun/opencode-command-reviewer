@@ -1,7 +1,7 @@
 # Reviewer history: implementation handoff
 
-Status: implementation in progress; Phases 0 and 1 passed, Phases 2 through 4 implemented.
-The history-only approval exception (Phase 5) and maintenance (Phase 6) remain open.
+Status: implementation in progress; Phases 0 and 1 passed, Phases 2 through 5 implemented.
+Maintenance and final user documentation (Phase 6) remain open.
 
 Prepared on 2026-10-09 against repository commit
 `983e888d0bb7f31e4169b30ceb436046c1003a52`, package version `0.7.0`,
@@ -875,8 +875,8 @@ deadline, or cause a permission write.
   base-mode keys at priority 100. Actual heading/footer ownership and native dialogs
   gate input. Normal typing and native autocomplete continue to work.
 - [x] Public app-slot wiring keeps the live report as a separate mounted sibling.
-  Existing live approval gates are retained. No Phase 5 exception or Phase 6
-  maintenance is included in this implementation.
+  Phase 5 below adds its narrowly scoped cover exception. Phase 6 maintenance
+  remains separate.
 
 Implemented additions:
 
@@ -893,13 +893,34 @@ block. Add all approved fixed copy to `src/ui-text.ts`.
 
 ### Phase 5: history-only approval cover exception
 
-Refactor live presentation gating using section 7. The history UI is not a
-replacement for the live controller and must not unmount/remount a live request
-on every history navigation. Test open/close/navigation/refresh transitions within
-the same renderer frame for spurious `presented(undefined)` cancellation.
-
-Retain all existing non-history coverage cancellation tests. Add notification and
-diagnostic assertions so the exception cannot become general background approval.
+- [x] Production `HistoryView` registers actual mounted ownership with the narrow
+  `history-cover.ts` helper. Current browser/route/sidebar session and both stable
+  heading/lower-interior hit probes are required. Footerless empty/loading/error
+  states include the public ScrollBox viewport hierarchy. No normal-plugin caller
+  can nominate another cover.
+- [x] A stable app-slot box contains the separate keyed live and history siblings.
+  The host replaces a changing fragment's live child; using a stable root prevents
+  that replacement and its spurious cancellation. Proven hit identities bridge only
+  the current paint during close/child replacement and clear on the next live frame.
+- [x] Live assessment identity, exact sanitized Markdown, completed non-streaming
+  highlighting and its painted frame still precede approval eligibility. Physical
+  first-display/final-render diagnostics remain separate and truthful. History
+  ratings never participate in the live decision.
+- [x] Existing deadlines survive history open/close/navigation. Native dialog,
+  fullscreen, hidden/narrow sidebar, session/order/mode and durable cancellation/
+  uncertain-write gates remain. History controls never submit an approval.
+- [x] Actual-host fixtures use public direct dispatch of the registered history
+  command while a countdown runs, plus the literal slash command after resolution.
+  Native palette opening itself cancels an ongoing countdown, as required by the
+  native-dialog gate. Selecting Report history from that palette does not revive it.
+  This is distinct from non-modal dispatch, not a product mismatch.
+- [x] Committed background reports update counts without changing the current
+  selection and are navigable afterward. Notifications retain the existing final
+  render grace, countdown suppression and confirmed-success sound. Replaying history
+  adds no notification birth, sound, model request or permission reply.
+- [x] Focused tests and actual production-history fixtures include loading/error,
+  retained render identity, native negative gates and manual/mode tombstones.
+  Exact executed checks and artifact locations are recorded below.
 
 ### Phase 6: cleanup, packaging, and documentation
 
@@ -1014,17 +1035,17 @@ model tests. No implementation test above was run merely to create this plan.
 - [ ] Every approved string, interaction and visibility rule is implemented.
 - [ ] History contains only committed, resolved, eligible reports with stable scope.
 - [ ] Latest completed report and permission outcome are correctly independent.
-- [ ] Live display and notification semantics pass regression checks.
-- [ ] Only the history layer receives the new approval-occlusion exception.
+- [x] Live display and notification semantics pass regression checks.
+- [x] Only the history layer receives the new approval-occlusion exception.
 - [ ] No pending body persistence or inferred/retried approval occurs.
 - [ ] Transactional event replay cannot duplicate aggregate contributions.
 - [x] Analytics opens from precomputed totals, starts fresh, and preserves current metric meaning.
 - [ ] Retention, root/child deletion, offline cleanup and anti-resurrection work.
 - [ ] Worker/queue/read work is bounded and does not stall the TUI/approval path.
 - [ ] Disposal finishes within the real host cleanup budget under storage failure.
-- [ ] Package remains reproducible with exactly five files.
+- [x] Package remains reproducible with exactly five files.
 - [ ] README and maintainer rules match implemented behavior.
-- [ ] Exact checks/captures are reported; no inferred full-matrix claims.
+- [x] Exact checks/captures are reported; no inferred full-matrix claims.
 
 ## 15. References and verified implementation facts
 
@@ -1191,7 +1212,100 @@ Phase 4 verification (2026-10-09, uncommitted working tree after `44583b0`):
   hit-test/visibility gates are unchanged; the Phase 5 history-only approval-cover
   exception and Phase 6 offline maintenance remain unimplemented.
 
-Local references below reflect the current implementation, including Phase 4:
+Phase 5 verification (2026-10-09, uncommitted working tree after `384e6e6`):
+
+- Started from a clean Phase 4 checkout. Implemented only Phase 5; no commits or
+  Phase 6 maintenance changes were made.
+- Final `npm run check` passed: typecheck, 733 TypeScript tests, 74 pure helper
+  tests, and build. Final focused invocation passed all 221 tests:
+
+  ```sh
+  npx tsx --test test/history-cover.test.ts test/history-browser.test.ts test/approval.test.ts test/controller.test.ts test/streaming-controller.test.ts test/notification-policy.test.ts test/diagnostics.test.ts
+  ```
+
+  New controller/clock tests exercise navigation and close between painted frames,
+  retaining the original countdown deadline, and reject a foreign hit pair without
+  reviving a cancelled countdown. Existing uncertain-write/mode tests remain intact.
+- Final `npm run check:package` passed: reproducible bundle SHA-256
+  `4779dec755fc4a4ed56862b2e9fa8c6e6c40b41f1f5c5a54d655491634451cda`,
+  exactly five archive files, 678,316 bytes unpacked. The complete final check and
+  package stdout was captured by the harness at
+  `/home/user/.local/share/opencode/tool-output/tool_1217a068d001IjiZ4XjIP2pBXC`.
+  `npm run test:runtime-cleanup` passed all six checks; `git diff --check` passed.
+- These exact production-history commands passed on the final bundle, with at most
+  two real hosts running concurrently:
+
+  ```sh
+  node scripts/smoke-history-auto.mjs covered
+  node scripts/smoke-history-auto.mjs countdown
+  node scripts/smoke-history-auto.mjs navigation
+  node scripts/smoke-history-auto.mjs error
+  node scripts/smoke-history-auto.mjs zero
+  node scripts/smoke-history-auto.mjs dialog
+  node scripts/smoke-history-auto.mjs fullscreen
+  node scripts/smoke-history-auto.mjs hide
+  node scripts/smoke-history-auto.mjs narrow
+  node scripts/smoke-history-auto.mjs manual
+  node scripts/smoke-history-auto.mjs mode
+  ```
+
+  The fixture shares Phase 0 transport/render assertions but mounts only production
+  HistoryView. `covered` starts from empty history; `countdown` observes an actual
+  footerless loading frame and navigation while preserving panel/Markdown identity
+  and nonincreasing seconds through open/close. `error` uses a corrupted isolated
+  SQL index, then repairs it. `navigation` retains `Saved history 1` as its index
+  changes from `1/2` to `1/3` after background commit, then navigates to the new report.
+  `zero` retains final-only approval without the positive-delay hold. Negative runs
+  exercise actual native UI and wait beyond the original deadline with zero replies
+  and executions. `mode` re-enables, receives a second final Safe review, and retains
+  the manual tombstone. Positive runs each assert exactly one native `once` reply
+  and harmless execution, final validation/highlighting/paint before readiness,
+  truthful physical diagnostics, approval audio and root-completion notification.
+  Literal `/reviewer-history`, arrow and Close/Escape replay creates no new model
+  request, reply, notification birth or sound.
+- Exact artifacts: `.runtime/history-auto-<scenario>/results.json` contains render
+  identities/readiness, diagnostics, native replies and notification observations;
+  `metrics.json` records `passed` and HTTP counts; named `.txt`/`.ansi` captures
+  include `complete-json-held-terminal`, `countdown-started`, `ongoing-navigation`,
+  `committed-no-jump`, `cancelled-after-native-gate`, `manual-tombstone`, and `resolved`
+  where applicable. Earlier development failure captures can coexist; final
+  `results.json` and `metrics.json` record the successful run.
+- All section 13.3 real-host regressions were also executed and passed during this
+  phase, plus the two existing history regressions below:
+
+  ```sh
+  node scripts/smoke.mjs auto-shell --notifications
+  node scripts/smoke.mjs auto-cancel
+  node scripts/smoke.mjs auto-hide
+  node scripts/smoke.mjs auto-dialog
+  node scripts/smoke.mjs auto-fullscreen
+  node scripts/smoke.mjs auto-narrow
+  node scripts/smoke.mjs auto-scroll
+  node scripts/smoke.mjs auto-zero
+  node scripts/smoke.mjs auto-immediate
+  node scripts/smoke-session-mode.mjs
+  node scripts/smoke-streaming.mjs complete
+  node scripts/smoke-streaming.mjs truncated --static
+  node scripts/smoke-permissions.mjs mcp --auto --correction --stream --stats
+  node scripts/smoke-permissions.mjs external-edit --auto --stream --stats
+  node scripts/smoke-history.mjs browse
+  node scripts/smoke-history.mjs visibility
+  ```
+
+  Their usual `.runtime/auto-*-metrics.json`, `permission-*-metrics.json`, streaming,
+  session-mode and history capture files retain evidence. These are isolated local
+  fixture checks, not live-provider judgment, desktop-focus proof or a full matrix.
+- Verification found and fixed the changing-fragment remount and missing ScrollBox
+  viewport ownership. Review also moved hit-proof expiry to the start of the next
+  live frame, retaining the newly proven pair for between-frame timer checks.
+  Fixture refinements await root-completion notification before replay comparisons,
+  avoid a redundant async history reset racing navigation after SQL repair, and
+  assert the actual existing notification grace policy: slow highlighting may
+  generate attention after one second before countdown, never during countdown.
+  Cancellation can then create its normal renewed manual-wait episode. No product
+  policy change or unresolved verification failure remains.
+
+Local references below reflect the current implementation, including Phase 5:
 
 - [Controller lifecycle and visibility](src/controller.ts): `presented`, `eligible`,
   accepted-review observer, `replied`, `reconcile`, `dispose`, `visibleReview`.

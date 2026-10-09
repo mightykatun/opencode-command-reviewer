@@ -22,6 +22,7 @@ export class HistoryController {
   constructor(private scope: string, private store: Pick<HistoryStore, "query" | "onCommit" | "onWriteFailure">,
     private ancestry: (session: string, signal: AbortSignal) => Promise<string>, private publish: (state: HistoryViewState) => void) {}
   private update(value: Partial<HistoryViewState>) { this.state = { ...this.state, ...value }; this.publish(this.state) }
+  isCurrent(session: string) { return !this.stopped && this.state.open && this.session === session }
   open(session: string) {
     if (this.stopped) return
     this.close()

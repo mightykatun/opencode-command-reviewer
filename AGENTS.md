@@ -18,7 +18,8 @@
 - Target OpenCode **1.18.35**, local Linux terminal TUI. Other clients, remote
   workspaces and OpenCode 2 are unverified.
 - The plugin is advisory by default. Explicit `autoApprove: true` may reply
-  `once` to an enabled, visible, completed, validated and rendered Safe review
+  `once` to an enabled, visible (or covered only by production history), completed,
+  validated and rendered Safe review
   after its countdown or a footer click. Never send `always`/`reject`, change permission rules, directly
   execute commands or directly apply edits. Use public `@opencode-ai/plugin/tui`
   APIs and public TUI slots; do not patch the native approval dialog.
@@ -312,6 +313,16 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   button hit targets during submission. Do not inspect private host UI.
   Native Always/rejection internal forms are not public dialogs: document explicit
   Cancel before deliberating there. Once dispatched, approval cannot be unsent.
+  Production history is the sole normal-plugin physical-cover exception. Keep one
+  stable app-slot root containing keyed live/history siblings: returning a changing
+  fragment makes the host replace the live render tree. History must be mounted in
+  the current browser/route/sidebar session and own both stable hit probes, including
+  the public ScrollBox viewport in footerless states. `history-cover.ts` retains only
+  the exact proven hit pair through a same-frame child replacement/close; the next
+  live frame clears that handoff. No logical-open or caller-provided cover can grant
+  this exception in the normal plugin. Final live Markdown must still match the
+  validated result, finish highlighting, and paint before eligibility. Diagnostic
+  first-display/final-render remain physical claims, separate from readiness.
 - Invalid configuration or review failure shows `Analysis unavailable`, never a
   fabricated rating or permission decision.
 
@@ -692,8 +703,24 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   checks, and actual heading/stable-footer hit probes. Autocomplete/dialogs retain
   their keys; end navigation is consumed. Restore stored scroll only after Markdown
   readiness and a stable measured scroll extent, including remounts after hiding.
-- The Phase 5 history-only auto-approval cover exception is not implemented.
-  Existing live eligibility/hit gates still apply and can cancel on history cover.
+- Phase 5 keeps live readiness and an existing countdown behind production history,
+  including empty/loading/error states. History opening/closing/navigation does not
+  reset the keyed live request or its deadline. All native visibility, ordering,
+  mode and manual/uncertain tombstone gates remain. A native palette dialog cancels
+  an active countdown; choosing history afterward cannot revive it. Public direct
+  dispatch of the registered history command has no dialog and preserves countdowns.
+  History controls never approve; committed background reports update counts without
+  jumping a current selection. History never creates notification births or sounds.
+- `node scripts/smoke-history-auto.mjs covered` uses the actual production HistoryView,
+  public command dispatch and `/reviewer-history`, the packed bundle, and real host
+  permission/SQLite operations. Other scenarios are `countdown`, `navigation`,
+  `error`, `zero`, `dialog`, `fullscreen`, `hide`, `narrow`, `manual`, and `mode`.
+  It shares Phase 0 transport/render assertions, but supplies no synthetic cover.
+  `withHistoryObservations` supplies read-only render/diagnostic observations plus
+  notification backend I/O, not configuration or readiness overrides. Assertions
+  retain the existing one-second render grace, silent countdown, confirmed approval
+  audio, and root completion notification. Captures/results/metrics are under
+  `.runtime/history-auto-<scenario>/`. Offline maintenance remains Phase 6.
 - Focused tests: `npx tsx --test test/history-browser.test.ts test/history-storage.test.ts`.
   After building, run `node scripts/smoke-history.mjs browse`; other implemented
   scenarios are `scroll`, `empty-error`, `resume`, `shared`, `delete`, `visibility`,

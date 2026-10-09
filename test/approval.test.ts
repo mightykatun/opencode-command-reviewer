@@ -8,6 +8,7 @@ import { approvalTransport, type ApprovalTransport } from "../src/approval.js"
 import { parseConfig } from "../src/config.js"
 import { Controller, visibleReview, type ApprovalClock, type View } from "../src/controller.js"
 import type { Assessment } from "../src/types.js"
+import { HistoryCover } from "../src/history-cover.js"
 
 const safe: Assessment = { safe: true, desc: "Reads the requested temporary fixture." }
 const request = (id = "b-review", permission = "bash", sessionID = "root"): PermissionRequest => ({
@@ -54,6 +55,7 @@ function fixture(t: TestContext, settings: {
   writer?: boolean
   transport?: ApprovalTransport
   changed?: (views: View[], controller: Controller) => void
+  presentation?: () => boolean
 } = {}) {
   const clock = new FakeClock()
   const reads: AbortSignal[] = []
@@ -62,7 +64,7 @@ function fixture(t: TestContext, settings: {
   const publications: View[][] = []
   const host = { pending: [] as PermissionRequest[], shown: true, extra: [] as View[] }
   const getSession = (id: string) => ({ id, ...(id === "child" ? { parentID: "root" } : {}) })
-  const visible = (): string | undefined => host.shown
+  const visible = (): string | undefined => host.shown && (settings.presentation?.() ?? true)
     ? visibleReview([...controller.views, ...host.extra], "root", getSession)?.request.id : undefined
   const transport: ApprovalTransport = settings.transport ?? {
     list: async () => structuredClone(host.pending),
@@ -91,6 +93,35 @@ function fixture(t: TestContext, settings: {
   const present = () => controller.presented(visible())
   return { controller, clock, reads, writes, evaluated, publications, host, visible, view, add, present }
 }
+
+test("production history hit-grid handoff preserves the original countdown through same-frame navigation and close", async t => {
+  const cover = new HistoryCover()
+  let physical = true, children = [1, 2]
+  const hits: [number, number] = [1, 2]
+  const f = fixture(t, { options: { autoApproveDelaySeconds: 2 }, presentation: () => physical || cover.covers("root", hits) })
+  await f.add(); f.present(); f.clock.jump(1000)
+  const close = cover.mount("root", hit => children.includes(hit))
+  physical = false; cover.frame(); f.present()
+  children = [3, 4] // navigation replaces children before the next hit-grid paint
+  f.clock.jump(500); f.present()
+  close(); f.clock.jump(500); f.present()
+  assert.equal(f.view()?.autoApproval?.status, "countdown")
+  physical = true; cover.frame(); f.present(); f.clock.jump(1000); await settle()
+  assert.equal(f.writes.length, 1, "original three-second deadline includes the initial hold, without a restart")
+})
+
+test("a native cover cannot inherit history hits or revive its cancelled countdown after close", async t => {
+  const cover = new HistoryCover()
+  let physical = false, hits: [number, number] = [1, 2]
+  const close = cover.mount("root", hit => hit === 1 || hit === 2)
+  const f = fixture(t, { options: { autoApproveDelaySeconds: 2 }, presentation: () => physical || cover.covers("root", hits) })
+  await f.add(); cover.frame(); f.present()
+  hits = [1, 9]; f.present()
+  assert.equal(f.view()?.autoApproval?.status, "cancelled")
+  close(); physical = true; cover.frame(); f.present(); f.clock.jump(10000); await settle()
+  assert.equal(f.writes.length, 0)
+  assert.equal(f.view()?.autoApproval?.status, "cancelled")
+})
 
 test("approval configuration defaults to disabled and a 15-second bounded integer delay", () => {
   const config = { baseURL: "http://fixture.invalid/v1", model: "fixture" }

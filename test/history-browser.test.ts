@@ -109,11 +109,12 @@ test("open, insertion refresh, replacement and repeat preserve identity but rese
 test("close, route change, deletion and disposal invalidate pending snapshots", async t => {
   for (const action of ["close", "route", "deleted", "dispose"] as const) {
     const f = fixture(t), c = f.controller
-    c.open("root"); await tick()
+    c.open("root"); assert.equal(c.isCurrent("root"), true); assert.equal(c.isCurrent("child"), false); await tick()
     if (action === "route") c.route("child")
     else if (action === "deleted") c.deleted("root")
     else c[action]()
     f.pending[0]!.resolve(selection); await tick(); assert.equal(c.state.open, false)
+    assert.equal(c.isCurrent("root"), false)
   }
 })
 test("late ancestry cannot reopen, invalid roots show error and never query a guessed scope", async t => {

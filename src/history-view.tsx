@@ -1,12 +1,18 @@
 import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js"
-import { CliRenderEvents, CodeRenderable, RGBA, type MarkdownRenderable, type BoxRenderable, type Renderable, type ScrollBoxRenderable } from "@opentui/core"
+import { CliRenderEvents, CodeRenderable, RGBA, ScrollBoxRenderable, type MarkdownRenderable, type BoxRenderable, type Renderable } from "@opentui/core"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { HistoryController, HistoryViewState } from "./history-controller.js"
 import { uiText } from "./ui-text.js"
 import { historyLayout, historyMetadata } from "./history-layout.js"
 import { ReviewDescription } from "./review-description.js"
+import type { HistoryCover } from "./history-cover.js"
 
-function owns(node: Renderable, hit: number): boolean { return node.num === hit || node.getChildren().some(child => owns(child, hit)) }
+function owns(node: Renderable, hit: number): boolean {
+  // ScrollBox.getChildren exposes content children, not its public viewport.
+  // Empty/loading/error views still paint that viewport at the lower probe.
+  return node.num === hit || (node instanceof ScrollBoxRenderable && owns(node.wrapper, hit))
+    || node.getChildren().some(child => owns(child, hit))
+}
 function ready(node: Renderable): boolean { return !(node instanceof CodeRenderable && node.isHighlighting) && node.getChildren().every(ready) }
 
 function Button(props: { api: TuiPluginApi; label: string; disabled?: boolean; run: () => void }) {
@@ -28,13 +34,18 @@ function Button(props: { api: TuiPluginApi; label: string; disabled?: boolean; r
 }
 
 export interface HistoryInput { interactive: () => boolean; scroll: (amount: number, page: boolean) => void }
-export function HistoryView(props: { api: TuiPluginApi; controller: HistoryController; state: HistoryViewState; input: HistoryInput }) {
+export function HistoryView(props: { api: TuiPluginApi; controller: HistoryController; state: HistoryViewState; input: HistoryInput; cover: HistoryCover; session: string }) {
   let panel: BoxRenderable | undefined
   let scroll: ScrollBoxRenderable | undefined
   let description: MarkdownRenderable | undefined
   let restored = false
   let measured = ""
   let reset = props.state.reset
+  const unmountCover = props.cover.mount(props.session, hit => !!panel && !panel.isDestroyed && panel.visible
+    && props.controller.isCurrent(props.session) && props.api.route.current.name === "session"
+    && props.api.route.current.params?.sessionID === props.session
+    && panel.width >= 4 && panel.height >= 4 && owns(panel, hit))
+  onCleanup(unmountCover)
   const record = () => props.state.status === "ready" ? props.state.selection?.record : undefined
   const selection = () => props.state.status === "ready" ? props.state.selection : undefined
   const index = () => uiText.history.index(selection()?.rank ?? 0, selection()?.total ?? 0)
