@@ -15,7 +15,12 @@ const sounds = Object.fromEntries(await Promise.all(
 ))
 
 await build({
-  entryPoints: ["src/tui.tsx"],
+  stdin: {
+    contents: 'export { default } from "./src/tui.tsx"; export * from "./src/tui.tsx"; export { historyWorkerProbeSource } from "./src/history-worker-probe.ts"',
+    resolveDir: process.cwd(),
+    sourcefile: "reviewer-entry.ts",
+    loader: "ts",
+  },
   outfile: "dist/tui.js",
   bundle: true,
   platform: "node",

@@ -159,8 +159,32 @@ function contextReader(api: TuiPluginApi, trace?: DiagnosticTrace): ContextReade
 
 export type NotificationBackendFactory = (click: (sessionID: string) => void, config: NotificationConfig) => NotificationBackend
 
+/** Opt-in Phase 0 observations of real renderables, never a readiness override. */
+export interface HistoryRenderProbeEvent {
+  stage: "render-after" | "frame"
+  at: number
+  panel: number
+  markdown?: number
+  final: boolean
+  streaming: boolean
+  contentMatches: boolean
+  children: number
+  codeBlocks: number
+  highlighting: boolean
+  painted: boolean
+  covered: boolean
+  physical: boolean
+  eligible: boolean
+  auto?: string
+  seconds?: number
+}
+export interface HistoryRenderProbe {
+  cover: () => Renderable | undefined
+  observe: (event: Readonly<HistoryRenderProbeEvent>) => void | Promise<void>
+}
+
 async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], fileIO?: FileIO, observer?: DiagnosticObserver,
-  notificationBackend?: NotificationBackendFactory) {
+  notificationBackend?: NotificationBackendFactory, historyProbe?: HistoryRenderProbe) {
   let config: Config | undefined
   let reviewOptions: Config | undefined
   let prompts = BUILTIN_PROMPTS
@@ -307,6 +331,30 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
               const report = () => view().assessment?.desc ?? (view().status === "analyzing" ? view().progress?.preview?.desc : undefined) ?? ""
               let paintedAssessment: View["assessment"]
               let readyAssessment: View["assessment"]
+              const ownsPanelProbes = (owner: Renderable | undefined) => !!panel && !!owner && !owner.isDestroyed && owner.visible
+                && ownsHit(owner, api.renderer.hitTest(panel.x + 2, panel.y + 1))
+                && ownsHit(owner, api.renderer.hitTest(panel.x + 2, panel.y + panel.height - 3))
+              const coveredByProbe = () => {
+                try { return !!historyProbe && ownsPanelProbes(historyProbe.cover()) } catch { return false }
+              }
+              const observeRender = (stage: HistoryRenderProbeEvent["stage"], eligible: boolean) => {
+                if (!historyProbe || !panel) return
+                const countCode = (node: Renderable): number => Number(node instanceof CodeRenderable)
+                  + node.getChildren().reduce((total, child) => total + countCode(child), 0)
+                const assessment = view().assessment
+                const auto = view().autoApproval
+                try {
+                  const pending = historyProbe.observe(Object.freeze({ stage, at: performance.now(), panel: panel.num,
+                    markdown: description?.num, final: !!assessment, streaming: description?.streaming ?? true,
+                    contentMatches: !!assessment && description?.content === displayText(assessment.desc),
+                    children: description?.getChildrenCount() ?? 0, codeBlocks: description ? countCode(description) : 0,
+                    highlighting: !!description && !highlightingComplete(description),
+                    painted: !!assessment && paintedAssessment === assessment, covered: coveredByProbe(),
+                    physical: ownsPanelProbes(panel), eligible, auto: auto?.status,
+                    seconds: auto?.status === "countdown" ? auto.seconds : undefined }))
+                  if (pending) void Promise.resolve(pending).catch(() => {})
+                } catch { /* Fixture observations cannot change approval behavior. */ }
+              }
               const visible = () => {
                 if (!panel || panel.isDestroyed || !panel.visible || panel.width < 4 || panel.height < 4
                   || select()?.request.id !== id || !paintedAssessment || paintedAssessment !== view().assessment) return
@@ -323,9 +371,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                 // outermost rows left uncovered by native fullscreen. The footer
                 // padding also retains its hit target when buttons are replaced
                 // by Allowing… before the next frame updates the hit grid.
-                const x = panel.x + 2
-                if (!ownsHit(panel, api.renderer.hitTest(x, panel.y + 1))
-                  || !ownsHit(panel, api.renderer.hitTest(x, panel.y + panel.height - 3))) return
+                if (!ownsPanelProbes(panel) && !coveredByProbe()) return
                 return id
               }
               if (config?.autoApprove) visibleApproval = visible
@@ -341,13 +387,15 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                       && ownsHit(panel, api.renderer.hitTest(panel.x + 2, panel.y + 3))
                       && (rating() !== undefined || (report() && description && !description.isDestroyed
                         && description.getChildrenCount() && highlightingComplete(description)))) trace.once("first-display")
-                    // The same completed frame/visibility gate used by approval.
-                    if (presented) trace.once("final-render")
+                    // Keep this physical-display diagnostic truthful under the
+                    // opt-in cover exception; its readiness observations are separate.
+                    if (presented && ownsPanelProbes(panel)) trace.once("final-render")
                   }
                   if (config?.autoApprove) {
                     controller.presented(presented)
                     if (presented && view().autoApproval?.status === "countdown") trace?.once("approval-countdown")
                   }
+                  observeRender("frame", !!presented)
                 }
                 api.renderer.on(CliRenderEvents.FRAME, frame)
                 onCleanup(() => {
@@ -367,6 +415,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
                   if (assessment && paintedAssessment !== assessment && description && !description.isDestroyed
                     && !description.streaming && description.content === displayText(assessment.desc)
                     && description.getChildrenCount() && highlightingComplete(description)) paintedAssessment = assessment
+                  observeRender("render-after", false)
                 }}
                   position="absolute" top={0} right={0} bottom={0} width={42} zIndex={1}
                   paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2}
@@ -422,6 +471,11 @@ export function withFileAccess(io: FileIO): TuiPlugin {
 /** Opt-in embedding/fixture observations only; no configuration, storage or logging. */
 export function withDiagnostics(observer: DiagnosticObserver): TuiPlugin {
   return (api, options) => reviewTui(api, options, undefined, observer)
+}
+
+/** Phase 0 fixture only. Default plugin has no cover exception or render observer. */
+export function withHistoryRenderProbe(probe: HistoryRenderProbe, observer?: DiagnosticObserver): TuiPlugin {
+  return (api, options) => reviewTui(api, options, undefined, observer, undefined, probe)
 }
 
 /** Isolated notification backend for embedding and real-host fixtures. */
