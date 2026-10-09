@@ -27,9 +27,10 @@ export type HistoryEvent =
   | { type: "permissionOutcome"; context: HistoryReview; at: number; outcome: "manual" | "rejected" }
   | { type: "sessionDeleted"; context: HistoryScope; at: number }
 export interface HistoryOperation { writer: string; sequence: number; event: HistoryEvent }
+export interface HistoryOrder { completed: number; tie: string; id: string }
 export type HistoryQuery =
   | { type: "totals" }
-  | { type: "history"; scope: string; root: string; entry?: string; direction?: "older" | "newer" }
+  | { type: "history"; scope: string; root: string; entry?: string; direction?: "older" | "newer"; order?: HistoryOrder }
   | { type: "sessions"; scope: string; after?: string; limit?: number }
   | { type: "resolution"; scope: string; root: string; session: string; permission: string }
   | { type: "session"; scope: string; session: string }
@@ -136,7 +137,11 @@ export function validateQuery(q: HistoryQuery): void {
     if (q.after !== undefined) text(q.after)
     requireValue(q.limit === undefined || (count(q.limit) && q.limit > 0 && q.limit <= 100))
   } else {
-    object(q, ["type", "scope", "root", "entry", "direction"]); text(q.root)
+    object(q, ["type", "scope", "root", "entry", "direction", "order"]); text(q.root)
+    if (q.order !== undefined) {
+      object(q.order, ["completed", "tie", "id"]); timestamp(q.order.completed); text(q.order.tie)
+      requireValue(q.entry && q.order.id === q.entry && /^[a-f0-9]{64}$/.test(q.order.id))
+    }
     if (q.entry !== undefined) requireValue(/^[a-f0-9]{64}$/.test(q.entry))
     requireValue(q.direction === undefined || (q.entry && ["older", "newer"].includes(q.direction)))
   }

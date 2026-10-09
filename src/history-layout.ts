@@ -1,0 +1,25 @@
+import { displayText } from "./controller.js"
+import type { HistorySelection } from "./history-schema.js"
+import { usageText } from "./usage.js"
+import { uiText } from "./ui-text.js"
+
+export function historyMetadata(record: NonNullable<HistorySelection["record"]>): string {
+  return displayText([
+    ...(record.payload.usage ? [usageText(record.payload.usage)] : []),
+    uiText.history.model(record.payload.reportedModel ?? record.context.configuredModel),
+    uiText.history.provider(record.context.provider),
+  ].join("\n"))
+}
+
+/** Button padding is two cells. The exact index never shortens. */
+export function historyLayout(label: string | undefined, index: string, width = 38) {
+  const navigation = index.length + 8
+  if (!label) return { label, rows: navigation <= width ? 1 : 3 }
+  const available = width - navigation - 3
+  if (label.length <= available) return { label, rows: 1 }
+  if (available >= 8) {
+    const retained = available - 2
+    return { label: label.slice(0, Math.ceil(retained / 2)) + ".." + label.slice(-Math.floor(retained / 2)), rows: 1 }
+  }
+  return { label, rows: navigation <= width ? 2 : 3 }
+}

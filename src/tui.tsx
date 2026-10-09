@@ -1,5 +1,5 @@
 import { createEffect, createMemo, createSignal, Index, Match, onCleanup, Show, Switch } from "solid-js"
-import { CliRenderEvents, CodeRenderable, RGBA, SyntaxStyle, type BoxRenderable, type MarkdownRenderable, type Renderable, type ScrollBoxRenderable } from "@opentui/core"
+import { CliRenderEvents, CodeRenderable, RGBA, type BoxRenderable, type MarkdownRenderable, type Renderable, type ScrollBoxRenderable } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { parseConfig, type Config } from "./config.js"
 import { loadRootMessages, type ContextReader } from "./context.js"
@@ -10,7 +10,7 @@ import { review, withDeadline } from "./reviewer.js"
 import { BUILTIN_PROMPTS, loadPrompts } from "./prompts.js"
 import { approvalTransport } from "./approval.js"
 import { PendingRefresh } from "./pending-refresh.js"
-import { reviewSyntaxStyles, scannerFrame, SCANNER_FRAME_COUNT, SCANNER_INTERVAL_MS } from "./appearance.js"
+import { scannerFrame, SCANNER_FRAME_COUNT, SCANNER_INTERVAL_MS } from "./appearance.js"
 import { modelPricing, usageText } from "./usage.js"
 import { lifetimeTracker } from "./lifetime-view.js"
 import path from "node:path"
@@ -28,6 +28,10 @@ import type { NotificationProcesses } from "./notification-process.js"
 import { uiText } from "./ui-text.js"
 import { HistoryStore } from "./history-store.js"
 import { HistoryCoordinator, drainHistory } from "./history-coordinator.js"
+import { HistoryController, type HistoryViewState } from "./history-controller.js"
+import { HistoryView, type HistoryInput } from "./history-view.js"
+import { historyCommands } from "./history-commands.js"
+import { ReviewDescription } from "./review-description.js"
 export type { DiagnosticEvent, DiagnosticObserver } from "./diagnostics.js"
 
 function ReviewLoading(props: { api: TuiPluginApi; retrying: boolean }) {
@@ -54,16 +58,6 @@ function ReviewLoading(props: { api: TuiPluginApi; retrying: boolean }) {
       {" "}{props.retrying ? uiText.review.retrying : uiText.review.evaluating}
     </text>
   )
-}
-
-function ReviewDescription(props: { api: TuiPluginApi; text: string; streaming: boolean; ref?: (value: MarkdownRenderable) => void }) {
-  const style = createMemo(() => {
-    const syntax = SyntaxStyle.fromStyles(reviewSyntaxStyles(props.api.theme.current))
-    // Let existing renderables finish using the native style before releasing it.
-    onCleanup(() => { void props.api.renderer.idle().catch(() => {}).finally(() => syntax.destroy()) })
-    return syntax
-  })
-  return <markdown ref={props.ref} content={displayText(props.text)} syntaxStyle={style()} fg={props.api.theme.current.markdownText} conceal={true} streaming={props.streaming} tableOptions={{ style: "grid" }} width="100%" flexShrink={0} />
 }
 
 function highlightingComplete(node: Renderable): boolean {
@@ -214,6 +208,10 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const modes = new SessionModes(new SessionModeStore(path.join(api.state.path.state, "opencode-reviewer", "session-mode-v1"),
     api.state.path.directory), async (id, signal) => api.state.session.get(id) ?? reader.session(id, signal))
   const history = new HistoryCoordinator(api.state.path.directory, historyStore, (id, signal) => modes.root(id, signal))
+  const [historyState, setHistoryState] = createSignal<HistoryViewState>({ open: false, status: "loading", reset: 0 })
+  const browser = new HistoryController(api.state.path.directory, historyStore, (id, signal) => history.root(id, signal), setHistoryState)
+  const historyInput: HistoryInput = { interactive: () => false, scroll: () => {} }
+  const unregisterHistory = historyCommands(api, browser, () => historyInput.interactive(), (amount, page) => historyInput.scroll(amount, page))
   let notifications: NotificationHost | undefined
   if (notificationConfig?.notify) {
     try {
@@ -276,6 +274,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   api.event.on("message.updated", (event) => history.message(event.properties.info))
   api.event.on("session.deleted", (event) => {
     const info = event.properties.info
+    browser.deleted(info.id)
     // Start ancestry before invalidating its cache. The public deletion event
     // identifies roots directly; known child ancestry retains the normal bound.
     const deletion = history.sessionDeleted(info)
@@ -297,6 +296,8 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const stop = () => cleanup ??= (async () => {
     const abortAt = lifecycleAbortAt ?? performance.now()
     history.dispose()
+    browser.dispose()
+    unregisterHistory()
     const notificationCleanup = notifications?.dispose()
     pendingRefresh.dispose()
     clearInterval(interval)
@@ -327,6 +328,10 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
         return null
       },
       app: () => {
+        createEffect(() => {
+          const route = api.route.current
+          browser.route(route.name === "session" ? route.params?.sessionID as string | undefined : undefined)
+        })
         if (notifications) createEffect(() => {
           const route = api.route.current
           notifications?.visit(route.name === "session" ? route.params?.sessionID as string | undefined : undefined)
@@ -338,7 +343,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
           return visibleReview(controller.views, mounted.sessionID, (id) => api.state.session.get(id))
         }
         const current = createMemo(() => { views(); return select() })
-        return (
+        return (<>
           <Show when={current()?.request.id} keyed>
             {(id) => {
               // Countdown publications must not remount Markdown/reset its scroll.
@@ -485,7 +490,11 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
               )
             }}
           </Show>
-        )
+          <Show when={historyState().open && sidebar() && !api.ui.dialog.open && api.route.current.name === "session"
+            && api.route.current.params?.sessionID === sidebar()?.sessionID}>
+            <HistoryView api={api} controller={browser} state={historyState()} input={historyInput} />
+          </Show>
+        </>)
       },
     },
   })

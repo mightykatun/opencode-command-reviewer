@@ -18,6 +18,20 @@ const payload: HistoryPayload = { safe: true, completedAt: 100, desc: "Resolved 
 const resolve = (c = context, p = payload, outcome: "auto" | "manual" | "cancelled" | "rejected" = "manual"): HistoryEvent =>
   ({ type: "permissionResolved", context: c, at: 200, outcome, payload: p })
 
+test("saved indexed order selects next newer after deletion, then nearest older, without jumping newest", t => {
+  const f = fixture(t)
+  for (let n = 1; n <= 5; n++) f.apply(resolve({ ...context, session: `child-${n}`, permission: `p-${n}`, review: `r-${n}` }, { ...payload, completedAt: n }))
+  const query = { type: "history" as const, scope: context.scope, root: context.root }
+  const middle = f.sql.query({ ...query, entry: entryID({ ...context, permission: "p-3" }) }) as HistorySelection
+  f.apply({ type: "sessionDeleted", context: { scope: context.scope, root: context.root, session: "child-3" }, at: 300 })
+  const newer = f.sql.query({ ...query, entry: middle.entry, order: middle.order }) as HistorySelection
+  assert.equal(newer.record?.context.permission, "p-4"); assert.equal(newer.rank, 3); assert.equal(newer.total, 4)
+  for (const n of [4, 5]) f.apply({ type: "sessionDeleted", context: { scope: context.scope, root: context.root, session: `child-${n}` }, at: 301 })
+  const older = f.sql.query({ ...query, entry: middle.entry, order: middle.order }) as HistorySelection
+  assert.equal(older.record?.context.permission, "p-2")
+  assert.throws(() => f.sql.query({ ...query, entry: middle.entry, order: { ...middle.order!, id: "b".repeat(64) } }))
+})
+
 test("data-only resolution queries observe independent clients without reading or admitting report bodies", t => {
   const f = fixture(t), second = f.second()
   const query = { type: "resolution" as const, scope: context.scope, root: context.root, session: context.session, permission: context.permission }

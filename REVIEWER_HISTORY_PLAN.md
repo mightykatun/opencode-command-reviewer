@@ -1,7 +1,7 @@
 # Reviewer history: implementation handoff
 
-Status: implementation in progress; Phases 0 and 1 passed, Phases 2 and 3 implemented.
-History UI remains Phase 4; later history interaction and maintenance phases remain open.
+Status: implementation in progress; Phases 0 and 1 passed, Phases 2 through 4 implemented.
+The history-only approval exception (Phase 5) and maintenance (Phase 6) remain open.
 
 Prepared on 2026-10-09 against repository commit
 `983e888d0bb7f31e4169b30ceb436046c1003a52`, package version `0.7.0`,
@@ -860,9 +860,27 @@ deadline, or cause a permission write.
 
 ### Phase 4: history UI and command state
 
-Proposed additions:
+- [x] `history-controller.ts` implements logically open/root/selection state through
+  `history.root`, independently of mode loading and configuration validity. Indexed
+  selection snapshots and `HistoryRefresh` preserve identity on insertions and reset
+  on replacement/repeat/navigation. Reads and ancestry are generation guarded.
+- [x] The query includes a validated saved order cursor for bounded deletion fallback
+  to next newer, then nearest older. Root tombstones close the view. Selected-session
+  identity remains available with invalid payloads for local deletion invalidation.
+- [x] `history-view.tsx`, `history-layout.ts` and shared `review-description.tsx`
+  implement the approved copy, 42-column layout, disabled outcomes, navigation,
+  overflow and sanitized metadata, without historical lifetime lines. Scroll offset
+  is controller-owned and restored after Markdown and measured layout readiness.
+- [x] `history-commands.ts` registers both local command surfaces and unmodified
+  base-mode keys at priority 100. Actual heading/footer ownership and native dialogs
+  gate input. Normal typing and native autocomplete continue to work.
+- [x] Public app-slot wiring keeps the live report as a separate mounted sibling.
+  Existing live approval gates are retained. No Phase 5 exception or Phase 6
+  maintenance is included in this implementation.
 
-- `src/history-controller.ts`: open/root/selection state, paged ordering, refreshing,
+Implemented additions:
+
+- `src/history-controller.ts`: open/root/selection state, indexed ordering, refreshing,
   scroll reset signals, keyboard eligibility and deletion fallback.
 - `src/history-view.tsx`: header, shared report rendering, metadata, placeholders,
   fixed outcome/navigation footer and exact status shortening.
@@ -1105,7 +1123,75 @@ Phase 3 verification (2026-10-09, uncommitted working tree after `bfdf74f`):
   No unresolved verification failure remains from the Phase 3 runs above.
 - Phase 4 UI/commands and later history-only approval-cover behavior are not implemented.
 
-Local references below reflect the current implementation, including Phase 3:
+Phase 4 verification (2026-10-09, uncommitted working tree after `44583b0`):
+
+- Confirmed the clean starting HEAD was Phase 3 commit
+  `44583b05b0e62e9cc1784c25480e60a8b57790a0`. No commit was created for Phase 4.
+- `npm run check` passed: typecheck, 729 TypeScript tests, 74 pure helper tests,
+  and build. The existing Phase 2 controller lifecycle tests are retained; new
+  browser tests live separately in `test/history-browser.test.ts`.
+- After the final selected-session/deletion invalidation refinement, typecheck and
+  `npx tsx --test test/history-browser.test.ts test/history-storage.test.ts` passed
+  all 37 tests. This includes actual missing/cyclic/over-depth ancestry, no mode
+  load, two-second ancestry recovery, late-root/read races, local precommit deletion
+  suppression, metadata sanitization, exact strings and footer overflow boundaries.
+- Final `npm run check:package` passed: reproducible bundle SHA-256
+  `db57bfc1f07f8a02277bf9f2e4354034eff947ae771d6a502b1c3cc5a26c0d75`,
+  exactly five files, 675,148 bytes unpacked. `npm run test:runtime-cleanup` passed
+  all six isolated supervisor checks.
+- All implemented new real-host scenarios passed. Final verification uses at most
+  two hosts concurrently; the final two-host `shared` run was performed alone:
+
+  ```sh
+  node scripts/smoke-history.mjs browse
+  node scripts/smoke-history.mjs scroll
+  node scripts/smoke-history.mjs empty-error
+  node scripts/smoke-history.mjs resume
+  node scripts/smoke-history.mjs shared
+  node scripts/smoke-history.mjs delete
+  node scripts/smoke-history.mjs visibility
+  node scripts/smoke-history.mjs disabled-invalid
+  ```
+
+  `browse` verifies all four outcomes, both command surfaces, mouse arrows/Close,
+  end-key consumption while normal typing works, Escape and native autocomplete/
+  dialog priority. `scroll` verifies paging/wheel, insertion identity, repeat and
+  selection resets, payload replacement, and exact saved offset after dialog,
+  narrow and hidden-sidebar remounts. `empty-error` verifies rendered empty-to-first,
+  corrupt individual payload versus index failure, and repairs without changing the
+  revision. `resume` restarts the actual host. `shared` uses two host instances and
+  checks a newly created independent root is empty. `delete` proves next-newer
+  rather than newest, nearest-older fallback, real public root deletion/closure and
+  unchanged totals. `disabled-invalid` combines disabled mode and invalid reviewer
+  config; a native child route silently arms history without forcing a sidebar,
+  and returning to the parent closes it before reopening committed root history.
+  Every scenario checks rendered results and unchanged model-request counts (two
+  host startup/title calls), with zero observed permission requests/replies.
+  `empty-error` and `delete` were rerun after the final deletion refinement.
+- These focused existing real-host regression runs passed:
+
+  ```sh
+  node scripts/smoke.mjs auto-shell --notifications
+  node scripts/smoke.mjs auto-hide
+  node scripts/smoke.mjs auto-scroll
+  node scripts/smoke.mjs auto-fullscreen
+  node scripts/smoke.mjs auto-dialog
+  node scripts/smoke-streaming.mjs complete
+  ```
+
+- Captures and results are under `.runtime/history-{browse,scroll,empty-error,
+  resume,shared,delete,visibility,disabled-invalid}/`; existing regression captures
+  retain their usual `.runtime/` names. These are local deterministic integration
+  checks, not live-model judgment or a full runtime matrix.
+- Verification caught and fixed premature scroll restoration between Markdown
+  readiness and scrollbar measurement. Fixture checks now wait for the rendered
+  saved viewport. Fixture-only corrections included exact native sidebar controls,
+  legal public command IDs and the host's sidebar-free child route behavior.
+- The live component remains a separate mounted sibling below history. Its current
+  hit-test/visibility gates are unchanged; the Phase 5 history-only approval-cover
+  exception and Phase 6 offline maintenance remain unimplemented.
+
+Local references below reflect the current implementation, including Phase 4:
 
 - [Controller lifecycle and visibility](src/controller.ts): `presented`, `eligible`,
   accepted-review observer, `replied`, `reconcile`, `dispose`, `visibleReview`.

@@ -569,7 +569,7 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   the existing real-host approval fixture and verifies its production database.
   Other scenarios are `auto-immediate` (manual footer), `auto-manual` (unattributed
   native once) and `auto-cancel` (cancellation followed by explicit rejection).
-  History UI remains Phase 4. The existing lifetime presentation now uses this store.
+  Phase 4 history UI uses this store. The existing lifetime presentation also uses it.
   `scripts/smoke-lifetime.mjs` seeds isolated fixtures through production SQL events
   using the Node adapter, with consistent review/POST identity. It also places
   large legacy seeds in all four old directories and verifies they remain untouched
@@ -664,6 +664,43 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   abort; async results never replace or resurrect a dismissed dialog. Inline lifetime
   still requires the existing completed, valid report-usage block. Preserve exact
   labels, formatting, received-only coverage and mixed reported/estimated costs.
+
+## Report history UI (Phase 4)
+
+- `history-controller.ts` owns logical open state, the selected indexed snapshot,
+  generation guards and the actual scroll offset. Resolve ancestry through
+  `HistoryCoordinator.root`, never the review-mode load gate. Disabled conversations
+  and invalid reviewer configuration can still browse committed history.
+- `/reviewer-history` and `Reviewer: Report history` open the newest entry; repeat
+  refreshes newest and resets scroll. Close/Escape close; route changes close even
+  within one root. Hidden/narrow sidebars and dialogs retain logical state without
+  forcing layout. Native child routes have no sidebar and can arm history invisibly.
+- Use `HistoryRefresh` and one indexed selection, not an in-memory history list.
+  Retain entry identity and scroll on insertions/count/outcome refreshes. A new report
+  payload resets scroll. Save the bounded `(completed,tie,id)` order cursor so deletion
+  falls forward to the nearest newer survivor, then backward, rather than to newest.
+  Durable root tombstones close the panel. Locally deleted selections suppress stale
+  precommit snapshots, including unreadable payloads. Offline maintenance is Phase 6.
+- `history-view.tsx` uses the public app slot above the still-mounted live view.
+  The 42-column panel has fixed heading/Close and outcome/navigation footer. Reuse
+  `review-description.tsx` for sanitized Markdown and theme syntax. History metadata
+  is original report usage, model, then provider, always muted and without lifetime.
+  Exact strings live in `ui-text.ts`; `history-layout.ts` owns balanced `..` shortening
+  and exact-count one/two/three-row overflow. Invalid payloads have a warning/bold
+  placeholder and navigation, without a rating or outcome badge.
+- Unmodified history keys use a public base-mode layer at priority 100, native dialog
+  checks, and actual heading/stable-footer hit probes. Autocomplete/dialogs retain
+  their keys; end navigation is consumed. Restore stored scroll only after Markdown
+  readiness and a stable measured scroll extent, including remounts after hiding.
+- The Phase 5 history-only auto-approval cover exception is not implemented.
+  Existing live eligibility/hit gates still apply and can cancel on history cover.
+- Focused tests: `npx tsx --test test/history-browser.test.ts test/history-storage.test.ts`.
+  After building, run `node scripts/smoke-history.mjs browse`; other implemented
+  scenarios are `scroll`, `empty-error`, `resume`, `shared`, `delete`, `visibility`,
+  and `disabled-invalid`. These use `smokeRuntime`, the actual bundle, production SQL
+  event seeds and public host session operations. They assert rendered results,
+  unchanged model requests and no permission replies. Limit hosts to two concurrently.
+  Exact Phase 4 runs and captures are recorded in `REVIEWER_HISTORY_PLAN.md`.
 
 ## Diagnostics and measurements
 

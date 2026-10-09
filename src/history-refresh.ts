@@ -30,6 +30,8 @@ export class HistoryRefresh {
     this.refresh()
   }
   select(query: HistoryQuery) { this.query = snapshotQuery(query); this.refresh() }
+  /** Update the next polling cursor after a successful snapshot, without another read. */
+  retain(query: HistoryQuery) { this.query = snapshotQuery(query) }
   refresh() {
     if (this.stopped) return
     this.revision++

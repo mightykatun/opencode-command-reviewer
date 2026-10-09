@@ -28,6 +28,7 @@ export const uiText = {
     unavailable: "! Auto-approval unavailable. Use native controls.",
   },
   commands: {
+    history: "Reviewer: Report history",
     category: "Reviewer",
     enable: "Reviewer: Enable for conversation",
     disable: "Reviewer: Disable for conversation",
@@ -41,6 +42,14 @@ export const uiText = {
       ? "Reviewer enabled locally, but saving failed. Resume may use the previous setting."
       : "Reviewer disabled locally, but saving failed. Resume may use the previous setting.",
     unavailable: "Reviewer setting unavailable. Session ancestry or saved mode could not be read.",
+  },
+  history: {
+    heading: "Analysis history", close: "Close",
+    outcomes: { auto: "Auto approved", manual: "Manually approved", cancelled: "Cancelled", rejected: "Rejected" },
+    older: "<", newer: ">", index: (x: number, y: number) => `${x}/${y}`,
+    empty: "No history entries", loading: "Loading history", unavailable: "History could not be read",
+    unreadable: "! Unreadable entry", model: (model: string) => `model: ${model}`,
+    provider: (providerBaseURL: string) => `provider: ${providerBaseURL}`,
   },
   usage: {
     tokens: (input: number, output: number) => `token: ${input} in ${output} out`,

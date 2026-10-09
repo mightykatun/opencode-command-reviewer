@@ -1,7 +1,7 @@
 import { add, empty, validate } from "./lifetime.js"
 import type { LifetimeTotals } from "./lifetime.js"
 import { count, decodeEvent, entryID, HistoryInvalid, opaque, reviewID, rootID, sessionID, validatePayload, validateQuery, validateReview, validateScope } from "./history-records.js"
-import type { HistoryEvent, HistoryOutcome, HistoryPayload, HistoryQuery, HistoryReview, HistoryScope } from "./history-records.js"
+import type { HistoryEvent, HistoryOutcome, HistoryPayload, HistoryQuery, HistoryReview, HistoryScope, HistoryOrder } from "./history-records.js"
 
 type Row = Record<string, any>
 export interface HistoryDatabase {
@@ -13,6 +13,9 @@ export interface HistorySelection {
   revision: number; total: number; rank: number; entry?: string; older?: string; newer?: string
   record?: { context: HistoryReview; payload: HistoryPayload; outcome: HistoryOutcome; approvingReview?: string }
   unreadable?: boolean
+  order?: HistoryOrder
+  deleted?: boolean
+  session?: string
 }
 export interface HistoryTotals { revision: number; totals: LifetimeTotals }
 export interface HistorySessions { sessions: { scope: string; root: string; session: string }[]; after?: string }
@@ -254,6 +257,7 @@ export class HistorySQL {
         return { outcome, uncertain, conflict, deleted }
       }
       const root = rootID(q), revision = this.get("SELECT revision FROM roots WHERE id=?", root)?.revision ?? 0
+      if (this.get("SELECT id FROM tombstones WHERE id=?", root)) return { revision, total: 0, rank: 0, deleted: true }
       const base = "scope=? AND root=? AND outcome IS NOT NULL"
       // Validate indexed scalar types without loading report bodies or all index rows into JS.
       const invalid = this.get(`SELECT id FROM history WHERE scope=? AND root=? AND
@@ -273,16 +277,18 @@ export class HistorySQL {
       const adjacent = (row: Row, newer: boolean) => this.get(`SELECT * FROM history WHERE ${base} AND (completed,tie,id) ${newer ? ">" : "<"} (?,?,?)
         ORDER BY completed ${newer ? "ASC" : "DESC"},tie ${newer ? "ASC" : "DESC"},id ${newer ? "ASC" : "DESC"} LIMIT 1`, q.scope, root, row.completed, row.tie, row.id)
       if (selected && q.direction) selected = adjacent(selected, q.direction === "newer") ?? selected
+      if (!selected && q.order) selected = adjacent(q.order, true) ?? adjacent(q.order, false)
       if (!selected) return { revision, total, rank: 0 }
       const s = selected
       if (s.id !== opaque(q.scope, s.permission) || s.review !== opaque(q.scope, s.tie)) throw new HistoryInvalid("Invalid history ownership")
       const rank = this.get(`SELECT count(*) AS n FROM history WHERE ${base} AND (completed,tie,id)<=(?,?,?)`, q.scope, root, s.completed, s.tie, s.id)!.n
       if (!count(rank) || rank < 1 || rank > total) throw new HistoryInvalid("Invalid history rank")
-      const result: HistorySelection = { revision, total, rank, entry: s.id, older: adjacent(s, false)?.id, newer: adjacent(s, true)?.id }
+      const result: HistorySelection = { revision, total, rank, entry: s.id, order: { completed: s.completed, tie: s.tie, id: s.id }, older: adjacent(s, false)?.id, newer: adjacent(s, true)?.id }
       const contextRow = this.get("SELECT CASE WHEN length(CAST(context AS BLOB))<=262144 THEN context END AS context FROM reviews WHERE id=? AND root=? AND session=?", s.review, root, s.session)
       if (typeof contextRow?.context !== "string") throw new HistoryInvalid("Invalid history ownership")
       const context: HistoryReview = JSON.parse(contextRow.context); validateReview(context)
       if (rootID(context) !== root || sessionID(context) !== s.session || entryID(context) !== s.id || reviewID(context) !== s.review) throw new HistoryInvalid("Invalid history ownership")
+      result.session = context.session
       try {
         const body = this.get("SELECT CASE WHEN length(CAST(body AS BLOB))<=524288 THEN body END AS body FROM payloads WHERE id=?", s.id)?.body
         if (typeof body !== "string" || Buffer.byteLength(body) > 512 * 1024) throw new Error()
