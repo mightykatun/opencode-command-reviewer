@@ -83,7 +83,7 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 My LLMs insist on writing a bunch of useless text to my README, so I collapsed them here in case anyone wants to inflict themselves (or more likely their agent) the pain of reading it.
 
 <details>
-<summary>Usage</summary>
+<summary>## Usage</summary>
 The sidebar shows Safe, Unsafe, or Analysis unavailable. Explanations support
 Markdown and scrolling. If the sidebar is hidden, use OpenCode's Show sidebar
 command.
@@ -138,7 +138,7 @@ in the report; ratings are advice based on the supplied evidence.
 </details>
 
 <details>
-<summary>Desktop notifications</summary>
+<summary>## Desktop notifications</summary>
 Transient banners have an **Opencode (Session name)** heading and a small status icon: green
 checkmark for approvals, orange exclamation mark for attention, red X
 for errors, and a neutral code mark for completed responses. GNOME controls the
