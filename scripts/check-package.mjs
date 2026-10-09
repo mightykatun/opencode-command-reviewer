@@ -19,6 +19,7 @@ for (const kind of ["attention", "approved", "error", "ended"]) {
 }
 assert.ok(bundle.includes("mpeg_frame_decoder_create"), "MP3 decoding must be bundled")
 assert.ok(!bundle.includes('"worker_threads"'), "unused MP3 worker adapters must not enter the package")
+assert.ok(bundle.includes("historyWorkerSource") && bundle.includes("bun:sqlite") && bundle.includes("BEGIN IMMEDIATE"), "production history worker must be embedded")
 const manifest = JSON.parse(await readFile("package.json", "utf8"))
 const lock = JSON.parse(await readFile("package-lock.json", "utf8"))
 assert.equal(lock.name, manifest.name, "lockfile name must match package.json")

@@ -1,6 +1,6 @@
 # Reviewer history: implementation handoff
 
-Status: implementation in progress; Phase 0 compatibility proofs passed.
+Status: implementation in progress; Phases 0 and 1 passed, lifecycle integration next.
 
 Prepared on 2026-10-09 against repository commit
 `983e888d0bb7f31e4169b30ceb436046c1003a52`, package version `0.7.0`,
@@ -780,6 +780,9 @@ explicitly scoped replacements for this feature.
 
 ### Phase 1: typed events and storage core
 
+- [x] Typed events, transactional storage, bounded worker/queue, refresh and
+  production-adapter verification complete. Integration remains in later phases.
+
 Proposed additions:
 
 | File | Responsibility |
@@ -1003,6 +1006,15 @@ Phase 0 (2026-10-09):
   synchronous abort listeners return; four seconds from abort remains conservative.
 
 ### Source references
+
+Phase 1 verification (2026-10-09): 31 storage/queue/refresh tests passed after
+independent audit fixes for watchdog ownership, immutable query snapshots,
+polling starvation, symlink ancestors, deletion/approval identity and plain-data
+validation. The earlier combined storage/lifetime/usage run passed 52 tests.
+Typecheck, build and packed production adapter smoke passed; the package check
+proved reproducibility and exactly five files. Runtime artifacts are under
+`.runtime/history-storage/`. No controller or legacy-accounting integration is
+claimed by this storage-only phase.
 
 Local references are relative to this repository and were reviewed at the baseline
 commit identified at the top of this document:

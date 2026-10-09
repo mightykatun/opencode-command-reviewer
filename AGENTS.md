@@ -546,6 +546,22 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
 
 ## Usage and lifetime accounting
 
+- Phase 1 history storage is a standalone, exported API, not yet wired into the
+  controller or legacy tracker. `HistoryStore.admit` accepts the strict events in
+  `history-records.ts`; only `permissionResolved` carries report text. The worker
+  embeds in the five-file bundle and uses public `node:worker_threads` eval CJS
+  with `env: {}` and Bun SQLite; tests use the Node SQLite adapter. Its private
+  `history-v1.sqlite` has transactional checkpoints, opaque contribution/tombstone
+  keys and precomputed totals. It does not import legacy usage snapshots.
+- `HistoryStore.query` returns snapshot history navigation, totals or bounded
+  session maintenance pages. Its optional `settled` promise retains actual worker
+  ownership after a bounded caller timeout. Commit/failure subscriptions and
+  `HistoryRefresh` support future integration. Disposal drains against a supplied
+  monotonic lifecycle-abort timestamp with a 3.5-second deadline. Run
+  `npx tsx --test test/history*.test.ts` and, after building,
+  `node scripts/smoke-history-storage.mjs` for the packed production adapter in
+  OpenCode 1.18.35. These verify storage, not later history UI/lifecycle phases.
+
 - Usage stays outside assessment JSON and model evidence. Tokens are a valid
   input/output pair; cost is independently available. For the normalized exact
   endpoint `https://openrouter.ai/api/v1`, use finite nonnegative `usage.cost`,

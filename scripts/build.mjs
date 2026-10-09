@@ -14,9 +14,14 @@ const sounds = Object.fromEntries(await Promise.all(
   }]),
 ))
 
+const historyWorker = await build({
+  entryPoints: ["src/history-storage-worker.ts"], bundle: true, write: false,
+  platform: "node", format: "cjs", target: "es2023", external: ["bun:sqlite", "node:sqlite"],
+})
+
 await build({
   stdin: {
-    contents: 'export { default } from "./src/tui.tsx"; export * from "./src/tui.tsx"; export { historyWorkerProbeSource } from "./src/history-worker-probe.ts"',
+    contents: 'export { default } from "./src/tui.tsx"; export * from "./src/tui.tsx"; export { historyWorkerProbeSource } from "./src/history-worker-probe.ts"; export { HistoryStore, historyWorkerSource } from "./src/history-store.ts"; export { HistoryRefresh } from "./src/history-refresh.ts"',
     resolveDir: process.cwd(),
     sourcefile: "reviewer-entry.ts",
     loader: "ts",
@@ -26,7 +31,7 @@ await build({
   platform: "node",
   format: "esm",
   target: "es2023",
-  define: { __REVIEW_PROMPTS__: JSON.stringify(prompts), __REVIEW_SOUNDS__: JSON.stringify(sounds) },
+  define: { __REVIEW_PROMPTS__: JSON.stringify(prompts), __REVIEW_SOUNDS__: JSON.stringify(sounds), __HISTORY_WORKER__: JSON.stringify(historyWorker.outputFiles[0].text) },
   external: ["solid-js", "solid-js/*", "@opentui/*", "@opencode-ai/*"],
   plugins: [{
     name: "notification-decoder-only",

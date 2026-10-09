@@ -38,7 +38,7 @@ const count = (value: unknown): value is number => typeof value === "number" && 
 const amount = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0
 const snapshotName = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.json$/
 
-function validate(value: LifetimeTotals): LifetimeTotals {
+export function validate(value: LifetimeTotals): LifetimeTotals {
   if (!value || ![value.requests, value.tokenRequests, value.input, value.output, value.priced, value.safe, value.unsafe, value.safe + value.unsafe].every(count)
     || !amount(value.cost) || value.priced > value.requests || value.tokenRequests > value.requests
     || value.requests > value.tokenRequests + value.priced
@@ -65,7 +65,7 @@ function mean(left: number, leftCount: number, right: number, rightCount: number
   return left + (right - left) * (rightCount / (leftCount + rightCount))
 }
 
-function add(left: LifetimeTotals, right: LifetimeTotals): LifetimeTotals {
+export function add(left: LifetimeTotals, right: LifetimeTotals): LifetimeTotals {
   return validate({
     requests: left.requests + right.requests, input: left.input + right.input, output: left.output + right.output,
     tokenRequests: left.tokenRequests + right.tokenRequests,
@@ -85,6 +85,8 @@ function add(left: LifetimeTotals, right: LifetimeTotals): LifetimeTotals {
     },
   })
 }
+
+export { empty }
 
 /** One compact atomic snapshot per plugin instance: no shared read/modify/write race. */
 export class LifetimeUsage {
