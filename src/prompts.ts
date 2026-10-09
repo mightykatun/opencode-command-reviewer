@@ -67,7 +67,7 @@ async function override(directory: string, name: string, signal: AbortSignal): P
   }
   signal.throwIfAborted()
   try {
-    const handle = await open(filename, constants.O_RDONLY | constants.O_NONBLOCK)
+    const handle = await open(filename, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW)
     try {
       signal.throwIfAborted()
       const before = await handle.stat()

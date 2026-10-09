@@ -1,4 +1,6 @@
 import { open, realpath } from "node:fs/promises"
+import { constants } from "node:fs"
+import path from "node:path"
 import { DeadlineError, remainingTime, withDeadline } from "./deadline.js"
 
 export interface FileIO { open: typeof open; realpath: (filename: string) => Promise<string> }
@@ -39,6 +41,30 @@ export class FileAccess {
 
 export interface CanonicalPath { path: string | null; reason?: string }
 
+/** The pinned Bun host normalizes `..` before realpath, unlike Node. Resolve each
+ * preceding directory physically before taking its parent, within one owned
+ * probe. Directory descriptors also reject file/.. instead of selecting a decoy.
+ * This inspects paths only, never directory entries or file contents. */
+async function physicalPath(filename: string, io: FileIO, signal: AbortSignal): Promise<string> {
+  let pending = filename
+  for (let parents = 0;; parents++) {
+    signal.throwIfAborted()
+    const parent = /(^|\/)\.\.(?=\/|$)/.exec(pending)
+    if (!parent) return io.realpath(pending)
+    if (parents >= 256) throw new FileAccessError("File path parent traversal exceeds the 256-component limit")
+    const prefix = pending.slice(0, parent.index) || (pending.startsWith("/") ? "/" : ".")
+    const resolved = await io.realpath(prefix)
+    signal.throwIfAborted()
+    const handle = await io.open(resolved, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW | constants.O_DIRECTORY)
+    try {
+      signal.throwIfAborted()
+      const opened = await io.realpath(`/proc/self/fd/${handle.fd}`)
+      signal.throwIfAborted()
+      pending = `${path.dirname(opened)}/${pending.slice(parent.index + parent[0].length).replace(/^\//, "")}`
+    } finally { await handle.close() }
+  }
+}
+
 /** One shared optional-filesystem budget and path snapshot per permission. */
 export class FileScope {
   private end: number | undefined
@@ -64,7 +90,7 @@ export class FileScope {
     let value = this.paths.get(filename)
     if (!value) {
       value = this.probe(this.access.timing.pathMs, "File path lookup", async (signal) => {
-        const resolved = await this.access.io.realpath(filename)
+        const resolved = await physicalPath(filename, this.access.io, signal)
         signal.throwIfAborted()
         return { path: resolved }
       }).catch((error): CanonicalPath => {

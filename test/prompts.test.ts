@@ -7,6 +7,36 @@ import { execFileSync } from "node:child_process"
 import { BUILTIN_PROMPTS, CONTRACT, CORRECTION, correctionPrompt, loadPrompts } from "../src/prompts.js"
 import inventory from "../src/prompt-files.json" with { type: "json" }
 import { parseConfig } from "../src/config.js"
+import fs from "node:fs/promises"
+import { syncBuiltinESMExports } from "node:module"
+
+test("prompt overrides reject valid final-component symlinks including a swap after lstat", async t => {
+  for (const scenario of ["inside", "outside", "swap"]) await t.test(scenario, async t => {
+    const dir = await mkdtemp(path.join(tmpdir(), "review-prompt-link-"))
+    t.after(() => rm(dir, { recursive: true, force: true }))
+    await mkdir(`${dir}/prompts`)
+    const target = scenario === "inside" ? `${dir}/prompts/target.md` : `${dir}/target.md`
+    const file = `${dir}/prompts/EDIT-REVIEW-PROMPT.md`
+    await writeFile(target, "PRIVATE LINK TARGET INSTRUCTIONS")
+    if (scenario === "swap") {
+      await writeFile(file, "original regular instructions")
+      const inspect = fs.lstat
+      t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+        const result = await inspect(...args)
+        if (args[0] === file) { await rm(file); await symlink(target, file) }
+        return result
+      })
+      syncBuiltinESMExports()
+      t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports() })
+    } else await symlink(target, file)
+    await assert.rejects(loadPrompts(`${dir}/prompts`, new AbortController().signal), error => {
+      assert.ok(error instanceof Error)
+      assert.match(error.message, /Invalid prompt file/)
+      assert.doesNotMatch(error.message, /PRIVATE LINK TARGET/)
+      return true
+    })
+  })
+})
 
 test("all review kinds use named assessment files and one fixed correction contract", async () => {
   for (const kind of ["shell", "edit", "mcp", "custom", "external-directory", "skill"] as const) {

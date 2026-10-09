@@ -41,10 +41,131 @@ test("skill evidence uses the exact host text and direct supporting files, never
   assert.equal(result.partial, false)
 })
 
+test("quoted skill filenames preserve punctuation rather than capturing prose-cleaned decoys", async t => {
+  const f = await fixture(t)
+  await writeFile(`${f.base}/notes.md!`, "ACTUAL PUNCTUATED SUPPORT")
+  await writeFile(`${f.base}/notes.md`, "UNREFERENCED DECOY")
+  for (const text of ['Read `notes.md!`.', 'Read "notes.md!".', "Read 'notes.md!'.", 'Run `cat "notes.md!"`.', 'Run `cat notes.md!`.']) {
+    f.context.skill.content = text
+    const result = await collectSkillEvidence(f.context, limits, signal())
+    assert.deepEqual(result.files.map(file => file.filename), ["notes.md!"], text)
+    assert.equal(result.files[0]?.contents, "ACTUAL PUNCTUATED SUPPORT", text)
+    assert.equal(result.partial, false)
+  }
+  assert.deepEqual(skillReferences("Read notes.md!", signal()).references, ["notes.md"])
+})
+
+test("unsupported nested Markdown destinations are omitted whole with a limitation and no fragment decoys", async t => {
+  const f = await fixture(t)
+  for (const name of [".md", "foo", "bar.md", "foo(bar).md"]) await writeFile(`${f.base}/${name}`, "UNREFERENCED LINK DECOY")
+  for (const text of ["[reference](foo(bar).md)", "[bar.md](foo(bar).md)", "[reference](foo(bar(baz)).md)", "[reference](foo(bar).md \"title\")"]) {
+    f.context.skill.content = `${text} Read \`docs/context.md\`.`
+    const result = await collectSkillEvidence(f.context, limits, signal())
+    assert.deepEqual(result.files.map(file => file.filename), ["docs/context.md"], text)
+    assert.equal(result.partial, true)
+    assert.match(result.limitations.join(" "), /[Uu]nsupported.*[Mm]arkdown|[Mm]arkdown.*not resolved/)
+    assert.doesNotMatch(JSON.stringify(result.files), /LINK DECOY/)
+  }
+})
+
+test("main skill exclusion uses canonical identity rather than lexical symlink-parent equality", async t => {
+  const f = await fixture(t, "Read `link/../SKILL.md`, `main-alias.md` and `docs/context.md`.")
+  await mkdir(`${f.base}/nested/deep`, { recursive: true })
+  await symlink(`${f.base}/nested/deep`, `${f.base}/link`)
+  await symlink(`${f.base}/SKILL.md`, `${f.base}/main-alias.md`)
+  await writeFile(`${f.base}/nested/SKILL.md`, "ACTUAL REFERENCED SUPPORT")
+  const opened: string[] = []
+  const files = new FileAccess({ realpath, open: (async (...args: Parameters<typeof open>) => { opened.push(String(args[0])); return open(...args) }) as typeof open })
+  const s = signal(), result = await collectSkillEvidence(f.context, { ...limits, maxFiles: 3 }, s, files.scope(s))
+  assert.deepEqual(result.files.map(file => file.filename), ["link/../SKILL.md", "docs/context.md"])
+  assert.equal(result.files[0]?.contents, "ACTUAL REFERENCED SUPPORT")
+  assert.equal(result.files[1]?.status, "captured")
+  assert.equal(result.partial, false)
+  assert.ok(!opened.includes(`${f.base}/SKILL.md`))
+  assert.doesNotMatch(JSON.stringify(result.files), /DISK CONTENT CHANGED/)
+})
+
+test("unavailable main skill identity omits supporting files without rereading catalog instructions", async t => {
+  const f = await fixture(t)
+  let opened = 0
+  const files = new FileAccess({ realpath: async name => {
+    if (name === f.context.skill.location) throw Object.assign(Error("private"), { code: "EACCES" })
+    return realpath(name)
+  }, open: (async (...args: Parameters<typeof open>) => { opened++; return open(...args) }) as typeof open })
+  const s = signal(), result = await collectSkillEvidence(f.context, limits, s, files.scope(s))
+  assert.equal(opened, 0)
+  assert.equal(result.partial, true)
+  assert.equal(result.skill.content, f.context.skill.content)
+  assert.match(result.limitations.join(" "), /[Mm]ain skill.*identity/)
+  assert.ok(result.files.every(file => file.contents === undefined))
+})
+
 test("literal discovery handles links, quoted command operands and paths with spaces without expanding URLs or shell expressions", () => {
   const result = skillReferences('Run `python "scripts/check tool.py"`. Then `./scripts/next.py --check`. Read "my notes.md" and `other notes.md` and [notes](<docs/my notes.md>#section). https://example.com/remote.py `$HOME/secret.txt` `scripts/*.py`', signal())
   assert.deepEqual(result.references, ["scripts/check tool.py", "./scripts/next.py", "my notes.md", "other notes.md", "docs/my notes.md"])
   assert.ok(result.limitations.some(line => line.includes("Dynamic")))
+})
+
+test("skill discovery preserves prose after apostrophes and omits entire URLs and incomplete links", () => {
+  const result = skillReferences("The user's task needs `docs/context.md`. https://example.com/foo(bar).md mailto:foo(bar).md [bad](foo(bar).md) Then [good](scripts/check.py).", signal())
+  assert.deepEqual(result.references, ["docs/context.md", "scripts/check.py"])
+  assert.equal(result.limitations.length, 1)
+  for (const text of ["[bad](foo(bar).md", "[bad](foo[bar].md)", '[bad](foo\\(bar\\).md)']) {
+    const invalid = skillReferences(text, signal())
+    assert.deepEqual(invalid.references, [])
+    assert.match(invalid.limitations.join(" "), /whole link was omitted/)
+  }
+})
+
+test("skill scanner bounds whole-construct work and propagates parent cancellation", t => {
+  const reason = Error("skill resolved")
+  assert.throws(() => skillReferences("[bad](foo(bar).md)", AbortSignal.abort(reason)), error => error === reason)
+  let clock = 0
+  t.mock.method(performance, "now", () => { clock += 100; return clock })
+  const result = skillReferences("[reference](" + "(".repeat(10000) + ".md)", signal())
+  assert.deepEqual(result.references, [])
+  assert.match(result.limitations.join(" "), /bounded work limit/)
+})
+
+test("an ancestor swap onto the main skill never rereads main instructions through a supporting alias", async t => {
+  const f = await fixture(t, "Read `scripts/SKILL.md`.")
+  await writeFile(`${f.base}/scripts/SKILL.md`, "supporting source before swap")
+  let reads = 0, closes = 0
+  const files = new FileAccess({ realpath, open: (async (filename, flags) => {
+    await rename(`${f.base}/scripts`, `${f.base}/original`)
+    await symlink(f.base, `${f.base}/scripts`)
+    const handle = await open(filename, flags)
+    return new Proxy(handle, { get(target, key) {
+      if (key === "read") return (...args: any[]) => { reads++; return (target.read as any)(...args) }
+      if (key === "close") return () => { closes++; return target.close() }
+      const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value
+    } })
+  }) as typeof open })
+  const s = signal(), result = await collectSkillEvidence(f.context, limits, s, files.scope(s))
+  assert.equal(reads, 0); assert.equal(closes, 1)
+  assert.equal(result.partial, true)
+  assert.match(result.files[0]!.status, /opened file is the main skill/)
+  assert.doesNotMatch(JSON.stringify(result), /DISK CONTENT CHANGED/)
+})
+
+test("timed-out main identity probes retain physical ownership and ignore late results", async t => {
+  const f = await fixture(t)
+  let release!: (value: string) => void
+  const held = new Promise<string>(resolve => { release = resolve })
+  const files = new FileAccess({ realpath: name => name === f.context.skill.location ? held : realpath(name),
+    open: async () => { throw Error("must not open") } }, { totalMs: 1000, pathMs: 15, captureMs: 50, concurrency: 2 })
+  const s = signal()
+  try {
+    const result = await collectSkillEvidence(f.context, limits, s, files.scope(s))
+    assert.equal(result.partial, true)
+    assert.equal(files.outstanding, 1)
+    assert.match(result.limitations.join(" "), /Main skill file identity unavailable.*timed out/)
+    const published = JSON.stringify(result)
+    release(f.context.skill.location)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(files.outstanding, 0)
+    assert.equal(JSON.stringify(result), published)
+  } finally { release(f.context.skill.location) }
 })
 
 test("supporting files cannot escape by traversal, encoded links, absolute paths or symlinks", async t => {

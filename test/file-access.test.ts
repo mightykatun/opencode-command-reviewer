@@ -1,7 +1,7 @@
 import { test, type TestContext } from "node:test"
 import assert from "node:assert/strict"
 import { setImmediate as nextTurn, setTimeout as sleep } from "node:timers/promises"
-import { mkdtemp, symlink, rm } from "node:fs/promises"
+import { mkdtemp, symlink, rm, mkdir, writeFile, realpath, open } from "node:fs/promises"
 import { execFileSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -19,6 +19,25 @@ const timing = { totalMs: 80, pathMs: 15, captureMs: 25, concurrency: 2 }
 const limits = { maxFiles: 6, maxEvidenceBytes: 131072 }
 const input = { command: "cat source", cwd: "/virtual", userPrompt: "Inspect source" }
 const signal = () => new AbortController().signal
+
+test("source parent traversal stays physical even with a lexically normalizing host realpath", async t => {
+  const dir = await mkdtemp(path.join(tmpdir(), "review-physical-path-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  await mkdir(`${dir}/project`); await mkdir(`${dir}/outside/deep`, { recursive: true })
+  await symlink(`${dir}/outside/deep`, `${dir}/project/link`)
+  await writeFile(`${dir}/outside/job.py`, "# physical target\n")
+  await writeFile(`${dir}/project/job.py`, "# lexical path decoy\n")
+  await writeFile(`${dir}/project/not-directory`, "# regular file\n")
+  const files = new FileAccess({ open, realpath: name => realpath(path.resolve(name)) })
+  for (const operand of ["link/../job.py", "not-directory/../job.py"]) {
+    const s = signal()
+    const result = await collectEvidence({ command: `python ${operand}`, cwd: `${dir}/project`, userPrompt: null }, limits, s, files.scope(s))
+    if (operand.startsWith("link")) assert.equal(result.files[0]?.contents, "# physical target\n")
+    else { assert.equal(result.files[0]?.contents, undefined); assert.match(result.files[0]!.status, /ENOTDIR/) }
+    assert.doesNotMatch(JSON.stringify(result.files), /lexical path decoy/)
+  }
+  assert.equal(files.outstanding, 0)
+})
 const stat = { isFile: () => true, size: 8, mtimeMs: 1, ctimeMs: 1 }
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -60,6 +79,60 @@ function controlledTime(t: TestContext) {
   t.mock.timers.enable({ apis: ["setTimeout"] })
   return { advance(ms: number) { now += ms; t.mock.timers.tick(ms) } }
 }
+
+test("physical parent probes own late directory descriptors and cleanup after timeout or cancellation", async t => {
+  for (const stage of ["open", "descriptor", "close"]) for (const cancel of [false, true]) await t.test(`${stage} ${cancel ? "cancel" : "timeout"}`, async t => {
+    const clock = controlledTime(t), entered = deferred<void>(), held = deferred<any>()
+    let closes = 0, opens = 0
+    const handle = { fd: 42, close: async () => {
+      closes++
+      if (stage === "close") { entered.resolve(); await held.promise }
+    } } as unknown as FileHandle
+    const files = new FileAccess({ open: (async () => {
+      opens++
+      if (stage === "open") { entered.resolve(); return held.promise }
+      return handle
+    }) as typeof open, realpath: async name => {
+      if (name === "/proc/self/fd/42" && stage === "descriptor") { entered.resolve(); return held.promise }
+      return "/outside/deep"
+    } }, { ...timing, concurrency: 1 })
+    const abort = new AbortController(), scope = files.scope(abort.signal)
+    const pending = scope.canonical("/virtual/link/../target")
+    try {
+      await entered.promise
+      if (cancel) abort.abort(Error("stop parent traversal"))
+      else clock.advance(timing.pathMs)
+      if (cancel) await assert.rejects(pending, /stop parent traversal/)
+      else {
+        const result = await pending
+        assert.equal(result.path, null)
+        assert.match(result.reason!, /timed out/)
+        assert.match((await scope.canonical("/other")).reason!, /probes busy/)
+      }
+      assert.equal(files.outstanding, 1)
+      assert.equal(opens, 1)
+    } finally {
+      held.resolve(stage === "open" ? handle : "/outside/deep")
+      await pending.catch(() => {})
+      await nextTurn()
+      assert.equal(files.outstanding, 0)
+      assert.equal(closes, 1)
+    }
+  })
+})
+
+test("physical parent traversal has a fixed probe-work bound", async t => {
+  controlledTime(t)
+  let opens = 0, closes = 0
+  const files = new FileAccess({ realpath: async () => "/",
+    open: (async () => { opens++; return { fd: 42, close: async () => { closes++ } } as FileHandle }) as typeof open })
+  const result = await files.scope(signal()).canonical("/" + "../".repeat(300) + "target")
+  assert.equal(result.path, null)
+  assert.match(result.reason!, /256-component limit/)
+  assert.ok(opens <= 256)
+  assert.equal(closes, opens)
+  assert.equal(files.outstanding, 0)
+})
 
 for (const stage of ["realpath", "open", "stat", "read", "close"]) {
   test(`stalled ${stage} becomes an omission before the overall deadline; late completion is owned`, async () => {

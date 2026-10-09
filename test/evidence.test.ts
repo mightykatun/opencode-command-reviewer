@@ -9,6 +9,47 @@ import { withDeadline } from "../src/deadline.js"
 const limits = { maxFiles: 4, maxEvidenceBytes: 65536 }
 const signal = () => new AbortController().signal
 
+test("physical shell modes, traps and timed builtins never capture known-cwd decoys", async t => {
+  const dir = await mkdtemp(path.join(tmpdir(), "review-shell-state-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const project = `${dir}/project`, outside = `${dir}/outside`
+  await mkdir(project); await mkdir(`${outside}/deep`, { recursive: true })
+  await symlink(`${outside}/deep`, `${project}/link`)
+  await writeFile(`${project}/job.py`, "# stale cwd decoy\n")
+  await writeFile(`${dir}/job.py`, "# timed cd decoy\n")
+  await writeFile(`${outside}/job.py`, "# physical target\n")
+  for (const command of [
+    "bash -P -c 'cd link/.. && python3 job.py'",
+    "bash -o physical -c 'cd link/.. && python3 job.py'",
+    "bash -ePc 'cd link/.. && python3 job.py'",
+    "bash +P -P -c 'cd link/.. && python3 job.py'",
+    "bash +o physical -o physical -c 'cd link/.. && python3 job.py'",
+    `trap 'cd ${outside}' DEBUG; python3 job.py`,
+    `builtin trap 'cd ${outside}' DEBUG; python3 job.py`,
+    "time cd link && python3 ../job.py",
+    "time -p cd link && python3 ../job.py",
+  ]) await t.test(command, async () => {
+    const result = await collectEvidence({ command, cwd: project, userPrompt: "Inspect job" }, limits, signal())
+    assert.ok(result.files.length, command)
+    assert.ok(result.files.every(file => file.contents === undefined), command)
+    assert.match(result.limitations.join(" "), /physical|trap|timed|time.*unresolved/, command)
+    assert.ok(result.files.every(file => /working directory unresolved/.test(file.status)), command)
+  })
+  for (const command of [
+    "bash -P +P -c 'cd link/.. && python3 job.py'",
+    "bash -o physical +o physical -c 'cd link/.. && python3 job.py'",
+    "bash -P +eP -c 'cd link/.. && python3 job.py'",
+    "bash -P job.py",
+  ]) {
+    const result = await collectEvidence({ command, cwd: project, userPrompt: null }, limits, signal())
+    assert.equal(result.files[0]?.contents, "# stale cwd decoy\n", command)
+  }
+  const nested = discover("bash -Pc 'cd link/.. && python job.py'; python job.py", project)
+  assert.deepEqual(nested.references.map(ref => ref.cwd), [null, project])
+  assert.equal(discover(`/usr/bin/time cd link; python job.py`, project).references.at(-1)?.cwd, project)
+  assert.equal(discover(`command time cd link; python job.py`, project).references.at(-1)?.cwd, project)
+})
+
 test("literal discovery: quoted paths, flags, wrappers, compounds and nested shell strings", () => {
   for (const command of [
     'python3 "fruit script.py"',

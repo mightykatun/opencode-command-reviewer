@@ -13,7 +13,7 @@ export function withinDirectory(directory: string, filename: string): boolean {
   return relative !== ".." && !relative.startsWith("../") && !path.isAbsolute(relative)
 }
 
-export async function captureFile(reference: Reference, budget: number, signal: AbortSignal, scope: FileScope, directory?: string): Promise<FileEvidence> {
+export async function captureFile(reference: Reference, budget: number, signal: AbortSignal, scope: FileScope, directory?: string, excludedPath?: string): Promise<FileEvidence> {
   const result: FileEvidence = { filename: reference.filename, status: "unavailable" }
   if (!reference.cwd && !path.isAbsolute(reference.filename)) return { ...result, status: "working directory unresolved; contents not provided" }
   // Do not normalize `..` before the filesystem traverses preceding symlinks.
@@ -25,6 +25,7 @@ export async function captureFile(reference: Reference, budget: number, signal: 
     signal.throwIfAborted()
     if (!canonical.path) return { ...result, status: `cannot read file (${canonical.reason}); contents not provided` }
     if (directory && !withinDirectory(directory, canonical.path)) return { ...result, status: "outside the skill directory; contents not provided" }
+    if (canonical.path === excludedPath) return { ...result, status: "main skill instructions already supplied by host; contents not provided" }
     return await scope.capture(async (signal, io) => {
       const handle = await io.open(canonical.path!, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW)
       try {
@@ -35,6 +36,7 @@ export async function captureFile(reference: Reference, budget: number, signal: 
           const opened = await io.realpath(`/proc/self/fd/${handle.fd}`)
           signal.throwIfAborted()
           if (!withinDirectory(directory, opened)) return { ...result, status: "opened file is outside the skill directory; contents not provided" }
+          if (opened === excludedPath) return { ...result, status: "opened file is the main skill; host instructions retained without rereading contents" }
         }
         const before = await handle.stat()
         signal.throwIfAborted()

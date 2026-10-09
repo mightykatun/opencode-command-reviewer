@@ -11,21 +11,26 @@ import { reviewStage } from "./deadline.js"
 export function skillReferences(text: string, signal: AbortSignal) {
   const references = new Set<string>(), limitations = new Set<string>()
   const end = performance.now() + 250
-  let tokens = 0
-  const add = (raw: string, link = false) => {
-    if (++tokens > 16384 || references.size >= 256 || performance.now() >= end) return false
+  let tokens = 0, steps = 0
+  const check = () => {
     reviewStage(signal, "Skill reference discovery")
-    let value = raw.trim()
-    if (link) {
+    return ++steps <= 16 * 1024 * 1024 && performance.now() < end
+  }
+  const add = (raw: string, origin: "prose" | "literal" | "link") => {
+    if (++tokens > 16384 || references.size >= 256 || !check()) return false
+    // Quoting is part of the reference syntax, not permission to rewrite the
+    // filename. In particular `notes.md!` must not select notes.md.
+    let value = origin === "literal" ? raw : raw.trim()
+    if (origin === "link") {
       if (value.startsWith("<") && !value.includes(">")) { limitations.add("An invalid skill file link was not resolved."); return true }
       value = value.startsWith("<") ? value.slice(1, value.indexOf(">")) : value.split(/\s+["']/)[0]!
       if (/^[a-z][a-z\d+.-]*:/i.test(value) || value.startsWith("//") || value.startsWith("#")) return true
       value = value.split("#", 1)[0]!
       try { value = decodeURIComponent(value) } catch { limitations.add("An invalid encoded skill file reference was not resolved."); return true }
-    } else value = value.replace(/[,;:.!]$/, "")
+    } else if (origin === "prose") value = value.replace(/[,;:.!]$/, "")
     if (!value || value.endsWith("/")) return true
-    const literalPath = value.includes("/") || /\.(?:mdx?|txt|rst|py|sh|bash|zsh|js|mjs|cjs|ts|tsx|json|ya?ml|toml|ini|cfg|conf|sql|xml|html|css|csv|ipynb|go|rs|rb|ps1|bat|wasm|so|exe)$/i.test(value)
-    if (!link && !literalPath) return true
+    const literalPath = value.includes("/") || /\.(?:mdx?|txt|rst|py|sh|bash|zsh|js|mjs|cjs|ts|tsx|json|ya?ml|toml|ini|cfg|conf|sql|xml|html|css|csv|ipynb|go|rs|rb|ps1|bat|wasm|so|exe)[,;:.!]*$/i.test(value)
+    if (origin !== "link" && !literalPath) return true
     if (/^[a-z][a-z\d+.-]*:/i.test(value) || value.startsWith("//")) return true
     if (value.length > 4096 || /[\u0000-\u001f\u007f$*?{}\\]/.test(value) || value.startsWith("~")) {
       limitations.add("Dynamic, globbed or invalid skill file references were not resolved."); return true
@@ -33,21 +38,64 @@ export function skillReferences(text: string, signal: AbortSignal) {
     references.add(value)
     return true
   }
-  for (const match of text.matchAll(/`([^`\r\n]+)`|\]\(([^()[\]\r\n]+)\)|"([^"\r\n]+)"|'([^'\r\n]+)'|[^\s`"'<>()[\]{}]+/g)) {
-    reviewStage(signal, "Skill reference discovery")
-    const quoted = match[1] ?? match[3] ?? match[4]
-    // Only recognizable inline commands split into operands. Quoted filenames
-    // such as "my notes.md" stay whole; guessing their suffix would read a
-    // different, unreferenced file.
-    let complete = true
-    const command = match[1] !== undefined && /^(?:(?:python(?:\d+(?:\.\d+)*)?|node|bun|deno|bash|sh|zsh|cat|head|source|uv|npx|git)\s|[^\s]+\.(?:py|sh|bash|js|mjs|ts)\s|\.{1,2}\/[^\s]+\s+--)/.test(quoted!)
-    if (quoted && command) {
-      for (const part of quoted.matchAll(/"([^"]+)"|'([^']+)'|[^\s]+/g)) {
-        if (!add(part[1] ?? part[2] ?? part[0])) { complete = false; break }
-      }
-    } else complete = add(quoted ?? match[2] ?? match[0], match[2] !== undefined)
-    if (!complete) { limitations.add("Skill reference discovery reached its bounded work limit; additional references were not inspected."); break }
+  let exhausted = false
+  // Consume balanced constructs before looking for bare words. Unsupported link
+  // syntax is one omitted construct, never a source of plausible suffix paths.
+  const balanced = (start: number, open: string, close: string) => {
+    let depth = 1, unsupported = false, cursor = start + 1
+    for (; cursor < text.length; cursor++) {
+      if (!check()) { exhausted = true; break }
+      const char = text[cursor]
+      if (char === "\\") { unsupported = true; cursor++; continue }
+      if (char === open) { depth++; unsupported = true }
+      else if (char === close && --depth === 0) return { end: cursor + 1, unsupported }
+      if (char === "\r" || char === "\n" || (open === "(" && (char === "[" || char === "]"))) unsupported = true
+    }
+    return { end: text.length, unsupported: true }
   }
+  for (let cursor = 0; cursor < text.length && !exhausted;) {
+    if (!check()) { exhausted = true; break }
+    const char = text[cursor]!
+    if (char === "[") {
+      const label = balanced(cursor, "[", "]")
+      if (exhausted) break
+      if (text[label.end] !== "(") { cursor = label.end; continue }
+      const destination = balanced(label.end, "(", ")")
+      if (exhausted) break
+      if (label.unsupported || destination.unsupported) limitations.add("Unsupported Markdown skill link was not resolved; the whole link was omitted.")
+      else exhausted = !add(text.slice(label.end + 1, destination.end - 1), "link")
+      cursor = destination.end
+    } else if (char === "`" || char === '"' || char === "'") {
+      // Apostrophes inside prose words do not begin quoted filenames.
+      if (char === "'" && /[\p{L}\p{N}]/u.test(text[cursor - 1] ?? "")) { cursor++; continue }
+      const start = ++cursor
+      while (cursor < text.length && text[cursor] !== char) {
+        if (!check()) { exhausted = true; break }
+        cursor++
+      }
+      if (exhausted) break
+      if (cursor === text.length) { limitations.add("Unclosed quoted skill reference was not resolved."); break }
+      const quoted = text.slice(start, cursor++)
+      // Split only recognizable inline commands. All their operands are literal
+      // tokens, including trailing punctuation, rather than surrounding prose.
+      const command = char === "`" && /^(?:(?:python(?:\d+(?:\.\d+)*)?|node|bun|deno|bash|sh|zsh|cat|head|source|uv|npx|git)\s|[^\s]+\.(?:py|sh|bash|js|mjs|ts)\s|\.{1,2}\/[^\s]+\s+--)/.test(quoted)
+      if (command) {
+        for (const part of quoted.matchAll(/"([^"]+)"|'([^']+)'|[^\s]+/g)) {
+          if (!add(part[1] ?? part[2] ?? part[0], "literal")) { exhausted = true; break }
+        }
+      } else exhausted = !add(quoted, "literal")
+    } else if (/[\s<>()[\]{}]/.test(char)) cursor++
+    else {
+      const start = cursor++
+      const url = /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(text.slice(start, start + 128))
+      while (cursor < text.length && !(url ? /[\s`"'<>]/ : /[\s`"'<>()[\]{}]/).test(text[cursor]!)) {
+        if (!check()) { exhausted = true; break }
+        cursor++
+      }
+      if (!exhausted) exhausted = !add(text.slice(start, cursor), "prose")
+    }
+  }
+  if (exhausted) limitations.add("Skill reference discovery reached its bounded work limit; additional references were not inspected.")
   return { references: [...references], limitations: [...limitations] }
 }
 
@@ -73,19 +121,25 @@ export async function collectSkillEvidence(context: SkillContext, limits: Limits
   const files: FileEvidence[] = [], seen = new Set<string | symbol>()
   const base = path.isAbsolute(skill.location) && !skill.location.includes("\0") ? path.dirname(skill.location) : undefined
   const canonical = base && discovery.references.length ? await scope.canonical(base) : undefined
+  // Compare verified filesystem paths without loading the main instructions
+  // again. Lexical equality can hide a different file behind link/../SKILL.md.
+  const main = canonical?.path ? await scope.canonical(skill.location) : undefined
   if (discovery.references.length && !canonical?.path) limitations.push("Local skill directory unavailable; supporting files were not read.")
+  if (canonical?.path && !main?.path) limitations.push(`Main skill file identity unavailable (${main?.reason}); supporting files were not read.`)
   for (const filename of discovery.references) {
     reviewStage(signal, "Skill supporting files")
     const declared = base ? path.isAbsolute(filename) ? filename : `${base}/${filename}` : undefined
     let file: FileEvidence = { filename, ...(declared ? { path: declared } : {}), status: "local skill directory unavailable" }
     if (base && declared && canonical?.path) {
       if (!withinDirectory(base, declared)) file.status = "outside the skill directory; contents not provided"
-      else if (path.resolve(declared) === path.resolve(skill.location)) continue
+      else if (!main?.path) file.status = "main skill file identity unavailable; contents not provided"
       else {
+        const target = await scope.canonical(declared)
+        if (target.path === main.path) continue
         const { key, withinLimit } = await limit.consider(declared, signal)
         if (seen.has(key)) continue
         seen.add(key)
-        file = withinLimit ? await captureFile({ filename, cwd: base, executable: false }, remaining, signal, scope, canonical.path)
+        file = withinLimit ? await captureFile({ filename, cwd: base, executable: false }, remaining, signal, scope, canonical.path, main.path)
           : { ...file, status: "file-count limit reached" }
       }
     }

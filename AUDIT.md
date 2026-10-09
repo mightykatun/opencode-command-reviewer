@@ -14,13 +14,14 @@ Implementation starts from `0aaf9d6`. Checkboxes require passing evidence, not a
   - [x] Prove actual heading/footer/report geometry; add short-height cancellation and restoration regressions.
   - [x] Pass focused approval/controller/fast/history-cover checks, typecheck, and build.
   - [x] Pass real short-height, normal approval, fast retained report, mode, and history-cover fixtures; record outputs.
-  - [ ] Commit the verified W1 checkpoint.
-- [ ] W2: evidence identity (A03, A05, A06, A24)
-  - [ ] Match absolute launch workdir normalization to the pinned host and verify actual/decoy capture.
-  - [ ] Invalidate unsupported physical shell/trap/time cwd inference with explicit evidence limitations.
-  - [ ] Preserve quoted skill paths, consume link destinations whole, and compare main-file identity canonically.
-  - [ ] Enforce atomic no-follow prompt overrides with valid-link and swap regressions.
-  - [ ] Pass focused evidence tests and required real shell/skill fixtures after build; record outputs and commit.
+  - [x] Commit the verified W1 checkpoint: `e1ab1f1`.
+- [x] W2: evidence identity (A03, A05, A06, A24)
+  - [x] Match absolute launch workdir normalization to the pinned host and verify actual/decoy capture.
+  - [x] Invalidate unsupported physical shell/trap/time cwd inference with explicit evidence limitations.
+  - [x] Preserve quoted skill paths, consume link destinations whole, and compare main-file identity canonically.
+  - [x] Enforce atomic no-follow prompt overrides with valid-link and swap regressions.
+  - [x] Pass focused evidence tests and required real shell/skill fixtures after build; record outputs.
+  - [ ] Commit the verified W2 checkpoint.
 - [ ] W3: persistence and actual operation ownership (A07, A08, A09)
   - [ ] Derive compatible serialized metadata bounds; prove legacy baseline and unrelated-root FIFO recovery.
   - [ ] Separate local maintenance progress from external invalidation; prove linear cleanup and healthy reconciliation.
@@ -55,6 +56,7 @@ Implementation starts from `0aaf9d6`. Checkboxes require passing evidence, not a
 - `test/history-controller.test.ts` covers controller/history lifecycle facts; actual browser ancestry composition also requires `test/history-browser.test.ts`.
 - The available editing tool is `apply_patch`; it is used for plan checkbox updates as well as source changes.
 - A28 is compatibility evaluation, not an instruction to force incompatible major upgrades. OpenTUI 0.4.5 declares exact Solid 1.9.12 peers; any update must respect that verified host boundary.
+- W2 native verification exposed Bun 1.3.14 (inside OpenCode 1.18.35) lexically collapsing `link/..` in `realpath`, unlike Node. Bounded physical-parent traversal now resolves preceding directories through owned descriptors, with regression coverage for `file/..`, limits, cancellation, and cleanup.
 
 ### Phase verification ledger
 
@@ -71,6 +73,17 @@ node scripts/smoke-history-auto.mjs covered             PASS actual Markdown rea
 ```
 
 W1 implementation details: at most three sequential verification reads share the original five-second reservation budget. Exhausted stale-read churn stays silent until an accepted fresh reconciliation releases it; it does not create a cancellation/uncertain-write tombstone. Actual list ownership survives caller timeout. Actual dispatch markers precede transport invocation without intervening observer callbacks; dispatch facts follow invocation. Geometry requires a painted proof of heading/rating/report/footer bounds and actual footer descendants. Same-frame child replacement can reuse that proof only with identical viewport/container identities and dimensions; the next frame revalidates descendants. The initially-short host regression exposed and verified the fix for the Checking-to-Allowing branch-replacement transition.
+
+**W2:** fail-before regressions exposed 10 failing results across workdir/shell/skill/prompt boundaries. Final focused evidence/context/filesystem/skill/tools/prompts/delegation suite passed **179/179**. `npm run check` passed typecheck, **936 source tests**, **77 helper tests**, and build; fixture syntax and diff checks passed. Native OpenCode 1.18.35 verification passed:
+
+```text
+node scripts/smoke-evidence.mjs                      PASS seven adversarial operations; .runtime/evidence-identity/results.json
+node scripts/smoke-evidence.mjs prompt-symlink       PASS manual permission, zero reviewer POSTs; .runtime/evidence-prompt-symlink/results.json
+node scripts/smoke.mjs external                     PASS separate directory/shell stages and exact evidence
+node scripts/smoke-skills.mjs root                  PASS host skill catalog/supporting files
+node scripts/smoke-skills.mjs subagent              PASS resumed delegation/skill evidence
+node scripts/smoke.mjs stalled-file                 PASS bounded omission and responsive TUI
+```
 
 ## 1. Scope, provenance, and status
 

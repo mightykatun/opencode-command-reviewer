@@ -4,6 +4,9 @@ import type { AssistantMessage, Message, Part, PermissionRequest, Session } from
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { latestUserPrompt, loadContext, loadEditContext, loadInvocation, loadRootMessages, type ContextReader } from "../src/context.js"
 import { collectEvidence } from "../src/evidence.js"
+import { mkdtemp, mkdir, writeFile, symlink, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 
 function user(id: string, text: string, created: number, flags = {}): { info: Message; parts: Part[] } {
   return {
@@ -25,6 +28,32 @@ const reader = (overrides: Partial<ContextReader> = {}): ContextReader => ({
   message: async () => ({ info: assistant, parts: [tool] }),
   projects: async () => [{ id: "project", worktree: "/project", name: "Initial repository", vcs: "git", sandboxes: [], time: { created: 1, updated: 1 } }],
   ...overrides,
+})
+
+test("absolute symlink-parent workdir matches the host launch path through source collection", async t => {
+  const dir = await mkdtemp(path.join(tmpdir(), "review-launch-"))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const project = `${dir}/project`, outside = `${dir}/outside`
+  await mkdir(project); await mkdir(`${outside}/deep`, { recursive: true })
+  await symlink(`${outside}/deep`, `${project}/link`)
+  await writeFile(`${project}/job.py`, "# actual host launch source\n")
+  await writeFile(`${outside}/job.py`, "# wrong physical-workdir decoy\n")
+  const requested = `${project}/link/..`
+  for (const cwd of [project, undefined]) {
+    const s = new AbortController().signal
+    const context = await loadContext(request, reader({ message: async () => ({
+      info: { ...assistant, path: { cwd, root: project } } as AssistantMessage,
+      parts: [{ ...tool, state: { status: "running", input: { command: "python job.py", workdir: requested }, time: { start: 1 } } }],
+    }) }), s)
+    assert.ok(context)
+    assert.equal(context.cwd, project)
+    assert.equal(context.execution?.requestedWorkdir, requested)
+    assert.equal(context.execution?.canonicalCwd, project)
+    const evidence = await collectEvidence(context, { maxFiles: 4, maxEvidenceBytes: 65536 }, s)
+    assert.equal(evidence.files[0]?.contents, "# actual host launch source\n")
+    assert.equal(evidence.files[0]?.path, `${project}/job.py`)
+    assert.doesNotMatch(JSON.stringify(evidence), /wrong physical-workdir decoy/)
+  }
 })
 
 test("SDK history adapter forwards opaque response cursors and preserves prompt barriers", async () => {

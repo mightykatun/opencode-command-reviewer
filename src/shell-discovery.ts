@@ -148,8 +148,9 @@ class DiscoveryState {
     this.qualifySnapshot()
     this.references.push({ filename, cwd: this.cwd, executable })
   }
-  nested(command: string) {
-    const nested = scan(command, this.explicitCdpath ? null : this.cwd, this.depth + 1, this.budget)
+  nested(command: string, physical: boolean) {
+    if (physical) this.note("Physical shell directory mode is outside literal cwd inference; nested relative script targets are unresolved.")
+    const nested = scan(command, this.explicitCdpath || physical ? null : this.cwd, this.depth + 1, this.budget)
     if (nested.references.length) this.qualifySnapshot()
     this.references.push(...nested.references)
     nested.limitations.forEach((text) => this.note(text))
@@ -275,7 +276,7 @@ function builtin(executable: string, args: Words, state: DiscoveryState, next?: 
     state.invalidateCwd("Sourced code may change the shell environment or working directory.")
     return true
   }
-  if (["eval", "read", "readarray", "mapfile", "getopts", "let", "set", "shopt", "alias", "unalias", "enable", "unset"].includes(executable)) {
+  if (["eval", "trap", "read", "readarray", "mapfile", "getopts", "let", "set", "shopt", "alias", "unalias", "enable", "unset"].includes(executable)) {
     state.invalidateCwd(`In-process shell state change through ${executable} is outside literal discovery; the working directory is unresolved.`)
     return true
   }
@@ -309,6 +310,7 @@ function reader(program: "cat" | "head", args: Words, state: DiscoveryState) {
 }
 
 function interpreter(isPython: boolean, args: Words, state: DiscoveryState) {
+  let physical = false
   while (args.length) {
     const arg = args.take()!
     if (arg === "--") {
@@ -326,7 +328,7 @@ function interpreter(isPython: boolean, args: Words, state: DiscoveryState) {
     if ((isPython && arg === "-c") || (!isPython && /^-[abefhiklmnptuvxBCEHPT]*c$/.test(arg))) {
       const code = args.peek()
       if (!code || !literal(code) || state.uncertainWord) state.note("Inline interpreter code contains unresolved expansion or is missing; its runtime contents are unavailable.")
-      if (!isPython && code && literal(code) && !state.uncertainWord) state.nested(code)
+      if (!isPython && code && literal(code) && !state.uncertainWord) state.nested(code, physical || arg.includes("P"))
       return
     }
     if (isPython && (arg === "-m" || arg.startsWith("-m") || arg.startsWith("-c"))) {
@@ -338,13 +340,17 @@ function interpreter(isPython: boolean, args: Words, state: DiscoveryState) {
         state.note(`Interpreter option ${arg} has a missing or unresolved argument; script source was not resolved.`)
         return
       }
-      args.take()
+      const option = args.take()
+      if (!isPython && option === "physical") physical = arg === "-o"
       continue
     }
     if (arg.startsWith("-") || (!isPython && arg.startsWith("+"))) {
       const known = isPython ? /^-[bBdEIOPqRsSuv]+$/.test(arg) || /^-(W|X).+/.test(arg)
         : /^[-+][abefhiklmnptuvxBCEHPT]+$/.test(arg) || ["--noprofile", "--norc"].includes(arg)
-      if (known) continue
+      if (known) {
+        if (!isPython && /^[-+][abefhiklmnptuvxBCEHPT]+$/.test(arg) && arg.includes("P")) physical = arg.startsWith("-")
+        continue
+      }
       state.note(`Interpreter option ${arg} is outside supported script discovery.`)
       return
     }
@@ -354,6 +360,13 @@ function interpreter(isPython: boolean, args: Words, state: DiscoveryState) {
 }
 
 function visit(args: string[], state: DiscoveryState, next?: string) {
+  // `time` is shell syntax and can run builtins in this process. Do not unwrap
+  // it as an external launcher or guess the effects of the timed pipeline.
+  // Explicit paths and `command time` retain their external-command semantics.
+  if (args[0] === "time") {
+    state.invalidateCwd("Shell timed commands are outside literal discovery; the working directory is unresolved.")
+    return
+  }
   const words = new Words(args, state.budget)
   const invocation = unwrap(words, state)
   if (!invocation) return

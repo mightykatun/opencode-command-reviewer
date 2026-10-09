@@ -111,9 +111,10 @@ export async function loadContext(request: PermissionRequest, reader: ContextRea
   const { instanceDirectory, instanceWorktree } = invocation.location
   const invalidWorkdir = workdir !== undefined && typeof workdir !== "string"
   const requestedWorkdir = typeof workdir === "string" && workdir ? workdir : null
-  // ShellTool resolves relative workdir against its execution instance, not the
-  // stored session directory (which can differ when continuing a session).
-  const cwd = invalidWorkdir ? null : requestedWorkdir && path.isAbsolute(requestedWorkdir) ? requestedWorkdir
+  // ShellTool lexically resolves supplied workdirs, including absolute ones.
+  // Only relative workdirs need the invocation base, never the session origin.
+  // Source operands retain filesystem traversal semantics in captureFile.
+  const cwd = invalidWorkdir ? null : requestedWorkdir && path.isAbsolute(requestedWorkdir) ? path.resolve(requestedWorkdir)
     : instanceDirectory ? path.resolve(instanceDirectory, requestedWorkdir ?? ".") : null
   if (!instanceDirectory) limitations.push("Execution instance directory unavailable; the session's starting directory is not substituted for it.")
   if (!instanceWorktree) limitations.push("Execution instance worktree unavailable.")
