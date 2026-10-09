@@ -60,6 +60,13 @@ export class HistorySQL {
       const meta = db.prepare("SELECT version,revision,CASE WHEN length(CAST(totals AS BLOB))<=4096 THEN totals END AS totals FROM meta WHERE id=1").get()
       if (meta?.version !== 1 || !count(meta.revision)) throw new HistoryInvalid("Unsupported history schema")
       this.parseTotals(meta.totals)
+      // Additive v1 indexes, serialized with initialization on both adapters.
+      // Cascading maintenance must not scan all unrelated sessions/attempts.
+      db.exec(`CREATE INDEX IF NOT EXISTS sessions_root ON sessions(scope,root);
+        CREATE INDEX IF NOT EXISTS attempts_review ON attempts(review);
+        CREATE INDEX IF NOT EXISTS approvals_root ON approvals(root);
+        CREATE INDEX IF NOT EXISTS approvals_session ON approvals(session);
+        CREATE INDEX IF NOT EXISTS history_root ON history(root);`)
     })
   }
   private statement(sql: string) {

@@ -198,6 +198,9 @@ export class HistoryCoordinator {
    */
   async sessionDeleted(info: { id: string; parentID?: string }) {
     if (this.stopped) return
+    // Invalidate before any bounded ownership lookup. A scope-wide bit also
+    // covers unknown child ownership and saturated admissions without an ID queue.
+    this.store.markMaintenanceDirty?.()
     const known = [...this.candidates.values()].find(c => c.context.session === info.id)?.context
       ?? [...this.resolved.values()].find(c => c.session === info.id)
     this.invalidateSession(info.id)
@@ -207,11 +210,6 @@ export class HistoryCoordinator {
     if (this.deletionReads >= 2) { this.store.markMaintenanceDirty?.(); return }
     this.deletionReads++
     try {
-      try {
-        const root = await this.root(info.id, this.abort.signal)
-        if (!this.stopped) this.deleted({ scope: this.scope, root, session: info.id })
-        return
-      } catch { if (this.stopped) return }
       const read = this.store.query({ type: "session", scope: this.scope, session: info.id }, this.abort.signal)
       try {
         const result = await read as HistorySession

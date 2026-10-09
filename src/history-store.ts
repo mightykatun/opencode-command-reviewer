@@ -73,6 +73,8 @@ export class HistoryStore {
   private commits = new Set<() => unknown>()
   private disposal?: Promise<void>
   private dirty = false
+  private dirtyRevision = 0
+  private maintenanceListeners = new Set<() => unknown>()
   private readonly now: () => number
   private readonly schedule: NonNullable<HistoryStoreOptions["schedule"]>
   private readonly cancel: NonNullable<HistoryStoreOptions["cancel"]>
@@ -84,8 +86,17 @@ export class HistoryStore {
   get pendingOperations() { return this.queue.length }
   /** Saturated deletion admission leaves one bounded reconciliation signal, never an ID side queue. */
   get maintenanceDirty() { return this.dirty }
-  markMaintenanceDirty() { if (!this.stopped) this.dirty = true }
-  maintenanceReconciled() { if (!this.queue.length && !this.blocked) this.dirty = false }
+  get maintenanceRevision() { return this.dirtyRevision }
+  markMaintenanceDirty() {
+    if (this.stopped) return
+    this.dirty = true; this.dirtyRevision++; this.notify(this.maintenanceListeners)
+  }
+  maintenanceReconciled(revision = this.dirtyRevision) {
+    if (revision !== this.dirtyRevision || this.queue.length || this.blocked) return false
+    if (!this.dirty) return true
+    this.dirty = false; this.notify(this.maintenanceListeners); return true
+  }
+  onMaintenance(listener: () => unknown) { this.maintenanceListeners.add(listener); return () => { this.maintenanceListeners.delete(listener) } }
   onCommit(listener: () => unknown) { this.commits.add(listener); return () => { this.commits.delete(listener) } }
   onWriteFailure(listener: () => unknown) { this.failures.add(listener); return () => { this.failures.delete(listener) } }
   private notify(listeners: Set<() => unknown>) {
@@ -94,12 +105,12 @@ export class HistoryStore {
   }
   admit(event: HistoryEvent): boolean {
     if (this.closing || this.stopped || this.blocked) {
-      if (event.type === "sessionDeleted" && !this.stopped) this.dirty = true
+      if (event.type === "sessionDeleted" && !this.stopped) this.markMaintenanceDirty()
       return false
     }
     const serialized = encodeEvent(event), bytes = Buffer.byteLength(serialized) + HISTORY_OPERATION_OVERHEAD
     if (this.bytes + bytes > HISTORY_QUEUE_BYTES || !Number.isSafeInteger(this.sequence + 1)) {
-      if (event.type === "sessionDeleted") this.dirty = true
+      if (event.type === "sessionDeleted") this.markMaintenanceDirty()
       return false
     }
     this.queue.push({ sequence: ++this.sequence, event: serialized, bytes }); this.bytes += bytes
@@ -157,7 +168,11 @@ export class HistoryStore {
       if (this.stopped) return
       if (read) {
         if (read.query.type === "totals" && this.writeFailed) throw new Error("History accounting unavailable")
-        read.resolve(await worker.call({ type: "query", query: read.query })); this.preferRead = false
+        const revision = this.dirtyRevision
+        if (read.query.type === "history" && this.dirty) throw new Error("History reconciliation pending")
+        const result = await worker.call({ type: "query", query: read.query })
+        if (read.query.type === "history" && (this.dirty || revision !== this.dirtyRevision)) throw new Error("History reconciliation pending")
+        read.resolve(result); this.preferRead = false
       }
       else {
         const item = this.queue[0]!
@@ -192,7 +207,7 @@ export class HistoryStore {
     return this.disposal ??= this.drain(abortAt)
   }
   private async drain(abortAt: number) {
-    this.closing = true; this.commits.clear(); this.failures.clear()
+    this.closing = true; this.commits.clear(); this.failures.clear(); this.maintenanceListeners.clear()
     for (const read of this.reads.splice(0)) read.reject(new Error("History disposed"))
     const end = abortAt + 3500
     while ((this.queue.length || this.active) && performance.now() < end - 300 && !this.blocked) {

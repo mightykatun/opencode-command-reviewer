@@ -11,12 +11,26 @@ import { encodeEvent, entryID, reviewID } from "../src/history-records.js"
 import type { HistoryEvent, HistoryPayload, HistoryReview } from "../src/history-records.js"
 import { privateDatabase } from "../src/history-storage-worker.js"
 import { HistoryWorker } from "../src/history-store.js"
+import { StreamingAssessment } from "../src/streaming-assessment.js"
+import { displayText } from "../src/controller.js"
 
 const context: HistoryReview = { scope: "/project", root: "root", session: "child", permission: "permission", review: "review",
   category: "bash", configuredModel: "configured", provider: "https://openrouter.ai/api/v1" }
 const payload: HistoryPayload = { safe: true, completedAt: 100, desc: "Resolved private report", reportedModel: "reported", usage: { cost: 0 } }
 const resolve = (c = context, p = payload, outcome: "auto" | "manual" | "cancelled" | "rejected" = "manual"): HistoryEvent =>
   ({ type: "permissionResolved", context: c, at: 200, outcome, payload: p })
+
+test("validated report controls survive resolved storage and remain escaped for display", t => {
+  const f = fixture(t), parser = new StreamingAssessment()
+  const desc = "Report\u0000with\u001bcontrols\u202e"
+  parser.push(JSON.stringify({ safe: true, desc }))
+  const assessment = parser.finish()
+  f.apply({ type: "reviewAccepted", context, at: 100, accepted: { safe: assessment.safe, completedAt: 100 } })
+  assert.equal(f.db.prepare("SELECT count(*) n FROM payloads").get()!.n, 0)
+  f.apply(resolve(context, { ...payload, ...assessment }))
+  assert.equal(f.history().record?.payload.desc, desc)
+  assert.equal(displayText(f.history().record!.payload.desc), "Report\\u0000with\\u001bcontrols\\u202e")
+})
 
 test("saved indexed order selects next newer after deletion, then nearest older, without jumping newest", t => {
   const f = fixture(t)

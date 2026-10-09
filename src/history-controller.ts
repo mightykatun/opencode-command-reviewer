@@ -19,9 +19,17 @@ export class HistoryController {
   private retry?: ReturnType<typeof setTimeout>
   private stopped = false
   private deletedEntries = new Set<string>()
-  constructor(private scope: string, private store: Pick<HistoryStore, "query" | "onCommit" | "onWriteFailure">,
-    private ancestry: (session: string, signal: AbortSignal) => Promise<string>, private publish: (state: HistoryViewState) => void) {}
+  private unsubscribeMaintenance?: () => void
+  constructor(private scope: string, private store: Pick<HistoryStore, "query" | "onCommit" | "onWriteFailure"> & Partial<Pick<HistoryStore, "onMaintenance" | "maintenanceDirty">>,
+    private ancestry: (session: string, signal: AbortSignal) => Promise<string>, private publish: (state: HistoryViewState) => void) {
+    this.unsubscribeMaintenance = store.onMaintenance?.(() => {
+      if (!this.state.open || this.stopped) return
+      if (store.maintenanceDirty) this.update({ status: "loading" })
+      this.refresh?.refresh()
+    })
+  }
   private update(value: Partial<HistoryViewState>) { this.state = { ...this.state, ...value }; this.publish(this.state) }
+  recordScroll(offset: number) { if (this.state.status === "ready") this.scroll = offset }
   isCurrent(session: string) { return !this.stopped && this.state.open && this.session === session }
   open(session: string) {
     if (this.stopped) return
@@ -39,6 +47,7 @@ export class HistoryController {
       this.root = root
       this.refresh = new HistoryRefresh(this.store, this.query(), result => {
         if (generation !== this.generation || !this.state.open) return
+        if (this.store.maintenanceDirty) { this.update({ status: "loading" }); return }
         if (!result || !("rank" in result)) { this.update({ status: "error" }); return }
         if (result.deleted) { this.close(); return }
         if (result.entry && this.deletedEntries.has(result.entry)) return
@@ -47,7 +56,10 @@ export class HistoryController {
         const replaced = previous?.entry !== result.entry || previous?.order?.tie !== result.order?.tie
           || JSON.stringify(previous?.record?.payload) !== JSON.stringify(result.record?.payload)
         if (replaced) this.scroll = 0
-        this.update({ status: "ready", selection: result, reset: this.state.reset + Number(replaced) })
+        // Loading/error messages replace Markdown and collapse its scroll extent.
+        // Recovery of the same payload must restore layout without losing its offset.
+        const restore = replaced || this.state.status !== "ready"
+        this.update({ status: "ready", selection: result, reset: this.state.reset + Number(restore) })
         // Poll by stable identity, never repeat a direction or jump to a new arrival.
         this.refresh?.retain(this.query())
       })
@@ -81,5 +93,5 @@ export class HistoryController {
     this.deletedEntries.clear()
     this.update({ open: false })
   }
-  dispose() { this.stopped = true; this.close() }
+  dispose() { this.stopped = true; this.unsubscribeMaintenance?.(); this.close() }
 }

@@ -1,6 +1,6 @@
 # Reviewer history: implementation handoff
 
-Status: implementation in progress; Phases 0 and 1 passed, Phases 2 through 5 implemented.
+Status: Phases 0 through 6 implemented and verified. Exact checks are recorded below.
 Maintenance and final user documentation (Phase 6) remain open.
 
 Prepared on 2026-10-09 against repository commit
@@ -10,7 +10,8 @@ OpenCode `1.18.35`, and OpenTUI `0.4.5`.
 This document consolidates the recursive requirements interview, the proposed
 implementation, and the subsequent accuracy audit. Later audit decisions recorded
 here supersede conflicting statements in the earlier conversational plan. It is
-the implementation handoff, not a claim that the feature or verification exists.
+the product specification and implementation record. Phase-specific evidence below
+distinguishes completed checks from the original proposed verification matrix.
 
 ### Navigation
 
@@ -924,20 +925,64 @@ block. Add all approved fixed copy to `src/ui-text.ts`.
 
 ### Phase 6: cleanup, packaging, and documentation
 
-- Implement bounded public-API deletion maintenance and late-write protection.
-- Update `scripts/build.mjs` to embed deterministic worker source.
-- Review `scripts/check-package.mjs`'s existing literal `"worker_threads"` exclusion:
-  it is intended to exclude unused MP3 decoder worker adapters. If the new storage
-  worker affects it, replace that broad assertion with a targeted decoder-specific
-  check plus positive storage-worker checks. Do not simply remove decoder coverage.
-- Preserve third-party notices and unchanged host/SDK/OpenTUI pins.
-- Keep README focused on installation and essential behavior. Explain history
-  scope, report retention/deletion, status meaning, and the history-only background
-  approval exception without duplicating the entire engineering design.
-- Update `AGENTS.md` for new persistence, fresh analytics, approved per-review timing
-  fields, history interactions, actual cleanup bound and new verification commands.
-- Add pure `.mjs` tests to `scripts/helper-tests.json` if any are introduced; keep
-  real-host fixtures separate from pure helpers and package publication policy.
+- [x] Maintenance component implemented after `c8cb4b3`: bounded public-API
+  deletion scanning, dirty-deletion recovery, publication gating and existing
+  transactional late-write protection.
+- [x] Final integration audit, README/metadata/maintainer updates, package checks,
+  supported Node-floor checks and targeted final-host regressions completed.
+- `src/history-maintenance.ts` retains at most one indexed ownership page (100 rows),
+  checks one row per two-second turn in the invocation scope, and checks root before
+  child. Turns have a five-second budget and host probes a 1.5-second abort bound.
+  Aborted/timed-out host and database work retains its single-flight slot through
+  actual settlement. No other host scope is initialized or scanned.
+- Definitive absence requires the pinned public `session.get` HTTP 404 and exact
+  `NotFoundError` envelope with `Session not found: <requested ID>`. The packed real
+  host fixture verified this shape, including native root deletion cascading.
+  Partial listings, missing data, other 404 shapes, 403 and transient/aborted reads
+  do not delete. Unknown root results prevent child deletion checks.
+- Live deletion marks a revisioned scope-wide dirty signal before asynchronous
+  ownership lookup. Unknown/saturated lookups retain no missed-ID queue. The local
+  browser and store suppress stale/reopened history while dirty; a complete healthy
+  same-revision pass and drained admitted writes release the gate. Lifetime metrics
+  remain independent. New dirty revisions restart scanning; failed rows retry on
+  subsequent passes. Other clients observe committed tombstones via normal refresh.
+- Additive v1 indexes support scoped root and cascading detail deletion. Existing
+  tombstones/contribution replay keys retain anti-resurrection/exactly-once behavior;
+  deletion does not subtract or reconstruct precomputed lifetime totals.
+- Maintenance verification on Node 24.21.0 and OpenCode 1.18.35:
+  - `npx tsx --test test/history*.test.ts`: 108 passed.
+  - Final focused rerun after the last code adjustment:
+    `npx tsx --test test/history-maintenance.test.ts test/history-store.test.ts test/history-browser.test.ts test/history-coordinator.test.ts test/history-storage.test.ts`:
+    82 passed, including 11 new maintenance tests.
+  - `npm run typecheck` and `npm run build`: passed.
+  - `node scripts/smoke-history-maintenance.mjs`: passed against the actual npm
+    archive's bundle after rebuild. Plugin TUI stopped during public root/child
+    deletion; API host then stopped before TUI resume. An injected 403 preserved
+    details for two failed probes; recovery removed deleted details, retained the
+    other scope, rendered `2/2` survivors, and preserved all aggregate values.
+    Zero model calls and zero permission replies. Artifacts:
+    `.runtime/history-maintenance/{before,transient,after}.txt` and `results.json`.
+  - `node scripts/smoke-history.mjs browse`: passed, two unchanged model calls.
+  - Earlier fixture development runs exposed npm 12's object-shaped pack JSON and
+    the empty resumed session ignoring an initial prompt; the fixture was corrected.
+    One development run timed out before bounded fixture fetches were added.
+- Limits: dirty recovery conservatively gates the entire local invocation scope,
+  not only the selected root. An unavailable/never-settling host can defer cleanup
+  indefinitely without spawning replacement work. Maintenance is logical deletion,
+  not forensic erasure. This subtask does not claim the full runtime matrix,
+  package reproducibility review, or Node-floor matrix. Older fixtures with synthetic
+  nonexistent sessions may now trigger legitimate cleanup and need real host seeds.
+- [x] Deterministic worker source is embedded by `scripts/build.mjs`.
+- [x] The existing decoder-specific literal exclusion still passes alongside a
+  positive embedded-storage-worker assertion in `scripts/check-package.mjs`.
+- [x] Third-party notices and host/SDK/OpenTUI pins are preserved.
+- [x] README documents history scope, retention/deletion, outcome attribution and
+  background approval, with one installation configuration example. Package
+  description includes report history.
+- [x] `AGENTS.md` documents persistence, fresh analytics, timing, history interactions,
+  cleanup bounds, maintenance and exact fixture commands.
+- [x] New pure tests use the existing TypeScript test inventory; real-host `.mjs`
+  fixtures remain separate from helpers and publication policy.
 
 ## 13. Verification plan
 
@@ -1026,25 +1071,25 @@ node scripts/smoke-permissions.mjs external-edit --auto --stream --stats
 pass alone does not verify worker bundling or host module resolution. Maintain
 read-only CI coverage of the supported Node development floors.
 
-This planning-only change needs document/reference review, not a runtime build or
-model tests. No implementation test above was run merely to create this plan.
+The initial planning-only change received document/reference review. Implementation
+verification and final audit results are recorded in section 15.
 
 ## 14. Completion checklist
 
 - [x] Phase 0 proofs pass inside OpenCode 1.18.35 and the packaged artifact.
-- [ ] Every approved string, interaction and visibility rule is implemented.
-- [ ] History contains only committed, resolved, eligible reports with stable scope.
-- [ ] Latest completed report and permission outcome are correctly independent.
+- [x] Every approved string, interaction and visibility rule is implemented.
+- [x] History contains only committed, resolved, eligible reports with stable scope.
+- [x] Latest completed report and permission outcome are correctly independent.
 - [x] Live display and notification semantics pass regression checks.
 - [x] Only the history layer receives the new approval-occlusion exception.
-- [ ] No pending body persistence or inferred/retried approval occurs.
-- [ ] Transactional event replay cannot duplicate aggregate contributions.
+- [x] No pending body persistence or inferred/retried approval occurs.
+- [x] Transactional event replay cannot duplicate aggregate contributions.
 - [x] Analytics opens from precomputed totals, starts fresh, and preserves current metric meaning.
-- [ ] Retention, root/child deletion, offline cleanup and anti-resurrection work.
-- [ ] Worker/queue/read work is bounded and does not stall the TUI/approval path.
-- [ ] Disposal finishes within the real host cleanup budget under storage failure.
+- [x] Retention, root/child deletion, offline cleanup and anti-resurrection work.
+- [x] Worker/queue/read work is bounded and does not stall the TUI/approval path.
+- [x] Disposal finishes within the real host cleanup budget under storage failure.
 - [x] Package remains reproducible with exactly five files.
-- [ ] README and maintainer rules match implemented behavior.
+- [x] README and maintainer rules match implemented behavior.
 - [x] Exact checks/captures are reported; no inferred full-matrix claims.
 
 ## 15. References and verified implementation facts
@@ -1305,7 +1350,39 @@ Phase 5 verification (2026-10-09, uncommitted working tree after `384e6e6`):
   Cancellation can then create its normal renewed manual-wait episode. No product
   policy change or unresolved verification failure remains.
 
-Local references below reflect the current implementation, including Phase 5:
+Phase 6 final audit and verification (2026-10-09):
+
+- Fixed two integration defects with regressions: temporary loading/error/dirty
+  states could overwrite saved scroll, and valid assessment text containing decoded
+  NUL was incorrectly rejected by history's identifier validator. Stored report text
+  now preserves the valid bounded assessment verbatim and display still escapes it.
+- `npm run check` passed on Node 24.21.0: 746 TypeScript tests, 74 helpers,
+  typecheck and build. `npm run test:runtime-cleanup`: six passed.
+- Actual Node 22.22.2 ran `node --import tsx --test test/*.test.ts`: 746 passed.
+  Actual Node 24.15.0 ran
+  `node --import tsx --test test/history*.test.ts test/lifetime*.test.ts`: 119 passed.
+  Binaries were installed as `node-linux-x64` under `/tmp/opencode/node22-floor`
+  and `/tmp/opencode/node24-floor` and invoked by absolute path. Initial `npx`
+  attempts unexpectedly used Node 24.21.0 and are not counted as floor checks.
+- `npm run check:package` passed: SHA-256
+  `22cac6204191a6dac6bcff8cab183517dac69ad0f04f1aebf12bb8eab668dd6d`,
+  exactly five files, 687,079 bytes unpacked.
+- Final audit reran history `scroll` and `empty-error` successfully. After the final
+  build/package check, these exact real-host commands also passed:
+
+  ```sh
+  node scripts/smoke-history-auto.mjs covered
+  node scripts/smoke-history-auto.mjs countdown
+  node scripts/smoke-history-auto.mjs dialog
+  node scripts/smoke-history-maintenance.mjs
+  node scripts/smoke-history-storage.mjs
+  ```
+
+  At most two hosts ran concurrently. These reruns cover the final integration
+  changes; earlier full scenario runs remain recorded under their respective phases.
+- No live provider was contacted by the runtime fixtures. No publication is claimed.
+
+Local references below reflect the current implementation, including Phase 6:
 
 - [Controller lifecycle and visibility](src/controller.ts): `presented`, `eligible`,
   accepted-review observer, `replied`, `reconcile`, `dispose`, `visibleReview`.
@@ -1339,5 +1416,5 @@ Pinned upstream source at OpenCode commit
   removal can also occur without a reply through deferred cleanup.
 
 Upstream source inspection establishes host behavior; it is not permission to
-import private host modules or patch host controls. Runtime compatibility of the
-proposed worker remains a Phase 0 proof, not a verified fact of this document.
+import private host modules or patch host controls. Worker compatibility is backed
+by the packed Phase 0 and production-storage runtime evidence recorded above.

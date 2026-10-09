@@ -82,7 +82,10 @@ function accepted(v: HistoryAccepted, payload = false): void {
   }
 }
 export function validatePayload(v: HistoryPayload): HistoryPayload {
-  accepted(v, true); text(v.desc, 65536)
+  accepted(v, true)
+  // Accepted assessment text may contain decoded controls. Preserve it verbatim;
+  // displayText escapes those controls when either live or stored reports render.
+  requireValue(typeof v.desc === "string" && v.desc.trim().length > 0 && Buffer.byteLength(v.desc) <= 65536)
   if (v.usage !== undefined) usage(v.usage)
   return v
 }

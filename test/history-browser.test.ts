@@ -117,6 +117,21 @@ test("close, route change, deletion and disposal invalidate pending snapshots", 
     assert.equal(c.isCurrent("root"), false)
   }
 })
+
+test("temporary read failure preserves scroll and requests layout restoration for the same report", async t => {
+  const f = fixture(t), c = f.controller
+  c.open("root"); await tick(); f.pending.shift()!.resolve(selection); await tick()
+  c.scroll = 17
+  const reset = c.state.reset
+  f.commit(); f.pending.shift()!.reject(); await tick()
+  assert.equal(c.state.status, "error")
+  c.recordScroll(0) // The temporary message's measured scroll extent collapses.
+  assert.equal(c.scroll, 17)
+  f.commit(); f.pending.shift()!.resolve(selection); await tick()
+  assert.equal(c.scroll, 17)
+  assert.ok(c.state.reset > reset, "the remounted Markdown must restore its saved offset after layout")
+  c.recordScroll(23); assert.equal(c.scroll, 23)
+})
 test("late ancestry cannot reopen, invalid roots show error and never query a guessed scope", async t => {
   let resolve!: (root: string) => void
   const f = fixture(t, () => new Promise(r => { resolve = r }))

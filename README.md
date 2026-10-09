@@ -2,7 +2,7 @@
 
 Reviews pending permissions in the OpenCode sidebar using a separate LLM. Covers
 shell commands, file edits, MCP calls, custom tools, and external-directory access.
-Supports streaming explanations, optional one-time auto-approval, and
+Supports streaming explanations, saved report history, optional one-time auto-approval, and
 reviewer-aware Linux desktop notifications with distinct sounds.
 
 Requires OpenCode 1.18.35 on Linux.
@@ -70,7 +70,7 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 | `reviewMcp` | Review identifiable MCP tool and resource permissions. |
 | `reviewCustomTools` | Review permissions requested by registered custom tools. |
 | `reviewExternalDirectories` | Review directory access independently of the other switches. Directory approval can resume the operation without another prompt. |
-| `autoApprove` | Allow completed Safe reviews once after the visible countdown. |
+| `autoApprove` | Allow completed Safe reviews once after their countdown, including behind report history. |
 | `extraCareful` | Include the extra-careful prompt in auto-mode reviews. Defaults to `true`; set `false` to omit it. |
 | `autoApproveDelaySeconds` | Countdown duration, 0–3600 seconds. |
 | `notify` | Linux desktop notifications and sounds. Defaults to `true`; set `false` to disable both. |
@@ -108,7 +108,8 @@ provider charges, and unreported usage remains unknown.
 
 During an auto-approval countdown, click the countdown to allow once immediately,
 or Cancel to leave the request manual. Hiding or covering the panel also cancels
-that request's countdown. Cancel before using native Allow always or rejection
+that request's countdown, except when covered by this plugin's report history.
+Cancel before using native Allow always or rejection
 forms; those forms alone do not stop the countdown.
 Positive countdowns hold their configured starting number for one extra second
 before counting down. A zero-second setting still approves without that hold.
@@ -117,6 +118,39 @@ before counting down. A zero-second setting still approves without that hold.
 descendants. The setting is saved for resume. Both commands are also in the command
 palette. Disabling stops current reviews and countdowns while native permission
 controls remain available.
+
+### Report history
+
+Use `/reviewer-history` or **Reviewer: Report history** in the command palette to
+open the newest saved report for the current conversation and its descendants.
+Left/Right or the arrow buttons select older/newer entries; Up/Down and
+PageUp/PageDown scroll. Close or Escape closes history. Repeating the command
+returns to the newest report. History remains available with review disabled or
+invalid reviewer configuration, and does not force a hidden sidebar open.
+
+Each entry shows the original report, available usage, model, provider and outcome:
+**Auto approved**, **Manually approved**, **Cancelled**, or **Rejected**. Cancelled
+records a linked interruption or removed request after automation was cancelled;
+it does not prove that the tool never ran. Ambiguous outcomes are omitted, including
+native Allow once replies whose submitting client cannot be identified. History
+keeps the latest completed report, which can differ from the report that caused
+approval in another window.
+
+History can cover an ongoing review without stopping its countdown. A newly
+completed Safe review can also start its countdown beneath history after its full
+report is rendered. Native dialogs, including the command palette, still cancel an
+active countdown; opening history afterward cannot restart it. Browsing saved
+reports never approves a request or replays notifications.
+
+Reports are saved only after a qualifying permission resolution. Saved reports
+can contain private text and are retained in OpenCode's local state directory
+until their conversation is deleted. Deleting a root removes its descendants'
+details; deletion missed while OpenCode was closed is reconciled when that host
+scope is visited again. Windows using the same state directory share this history,
+partitioned by host directory and root conversation. Uncommitted reports can be
+lost on shutdown or prolonged storage failure.
+
+### Usage totals
 
 Token and cost totals appear below completed reports when available. Open
 Reviewer: Lifetime usage in the command palette for cumulative totals. OpenRouter
@@ -133,10 +167,11 @@ corrections and transport recovery. Manual approvals are not auto-approvals.
 Timings run from evaluation start, including evidence and retries, to the accepted
 attempt's first rating and final validated response, excluding rendering/countdown
 time. Non-streaming reviews use the final response time for both measurements.
-Only running averages and sample counts are stored, not individual timings.
-Totals persist across restarts. New metrics show partial history when older records
-lack them; averages include measured reviews only. Earlier unrecorded values cannot
-be reconstructed.
+Lifetime averages use running means and sample counts; stored review details also
+retain their individual timings. Totals persist across restarts and are shared
+across conversations and host directories using the same state directory.
+Deleting report history does not reduce lifetime totals. Averages include measured
+reviews only; unrecorded usage cannot be reconstructed.
 
 Reviews send the pending request, latest user prompt, project context, and relevant
 file snapshots, diffs, or tool arguments to your endpoint before approval. Shell

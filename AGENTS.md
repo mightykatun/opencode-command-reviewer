@@ -605,7 +605,44 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   drops candidates immediately, allows real transport finalizers to enqueue usage,
   and drains/terminates storage within 3.5 seconds of lifecycle abort. Live deletion
   invalidates candidates immediately, with bounded stored-ownership fallback for
-  deleted children; offline maintenance and dirty-deletion replay remain Phase 6.
+  deleted children. `history-maintenance.ts` reconciles missed offline deletions
+  and saturated/unavailable live deletion ownership reads as described below.
+
+- Maintenance uses indexed stored ownership pages of at most 100 in the exact
+  invocation host scope. One row runs per two-second turn, checking its root first
+  even if only descendants have stored rows. A turn has a five-second budget;
+  each public `session.get` has a 1.5-second abort bound. Keep one actual maintenance
+  transaction through host settlement and `HistoryRead.settled`, including after
+  timeout/disposal. No replacement probes or scans while that work still owns its
+  slot. Stop scheduling and publication on lifecycle abort. Never initialize an
+  instance in a stored target directory or use session-list omissions as absence.
+- The pinned `api.client.session.get` uses HTTP 404 with exactly
+  `{ name: "NotFoundError", data: { message: "Session not found: <requested ID>" } }`.
+  Validate the status, shape and requested identity. Generic missing data, another
+  error/404 shape, 403, cancellation, timeout and transport failures never delete.
+  Unknown roots prevent child probing; an absent root removes all its descendant
+  details, while an absent child removes only its own. Existing opaque tombstones
+  and contribution keys prevent resurrection/double counting; totals never decrease.
+- Live deletion immediately invalidates candidates and the browser. Before any
+  ownership read, mark one revisioned scope-wide maintenance-dirty bit, also used
+  for offline verified absence and failed deletion admission. It is not a missed-ID
+  queue or a lost-metrics estimate. Gate local history publication until a complete
+  healthy scan with the same dirty revision and an empty write queue reconciles it.
+  A new deletion restarts the scan; failed/inaccessible rows retry on later passes.
+  The conservative gate covers the current invocation scope, including unknown child
+  ownership, and uses existing Loading history copy. Lifetime reads remain separate.
+  Other instances learn deletion after durable commits through normal refresh.
+  Additive v1 indexes cover cascading session/review/attempt deletion lookups.
+- Run `npx tsx --test test/history-maintenance.test.ts` for actual two-client SQLite,
+  paging, outage recovery, dirty UI gating and retained transaction ownership. After
+  building, `node scripts/smoke-history-maintenance.mjs` loads the npm-packed plugin,
+  stops its TUI host, deletes native root/child sessions through an isolated public
+  API host, stops that host, and resumes the TUI. It proves native root cascading,
+  the actual NotFound response, transient 403 preservation/recovery, unchanged totals,
+  other-scope retention, rendered survivors and zero model/permission calls. Captures
+  live in `.runtime/history-maintenance/`. The 403 injection is fixture-local public
+  client adaptation, not a host-global patch. Synthetic nonexistent session IDs in
+  older fixtures can now be legitimately removed by maintenance.
 
 - Usage stays outside assessment JSON and model evidence. Tokens are a valid
   input/output pair; cost is independently available. For the normalized exact
@@ -691,7 +728,8 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   payload resets scroll. Save the bounded `(completed,tie,id)` order cursor so deletion
   falls forward to the nearest newer survivor, then backward, rather than to newest.
   Durable root tombstones close the panel. Locally deleted selections suppress stale
-  precommit snapshots, including unreadable payloads. Offline maintenance is Phase 6.
+  precommit snapshots, including unreadable payloads. Maintenance-dirty scope gating
+  also suppresses reopened/late snapshots until deletion reconciliation completes.
 - `history-view.tsx` uses the public app slot above the still-mounted live view.
   The 42-column panel has fixed heading/Close and outcome/navigation footer. Reuse
   `review-description.tsx` for sanitized Markdown and theme syntax. History metadata
@@ -720,7 +758,8 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   notification backend I/O, not configuration or readiness overrides. Assertions
   retain the existing one-second render grace, silent countdown, confirmed approval
   audio, and root completion notification. Captures/results/metrics are under
-  `.runtime/history-auto-<scenario>/`. Offline maintenance remains Phase 6.
+  `.runtime/history-auto-<scenario>/`. Offline maintenance has its separate packed
+  fixture described above.
 - Focused tests: `npx tsx --test test/history-browser.test.ts test/history-storage.test.ts`.
   After building, run `node scripts/smoke-history.mjs browse`; other implemented
   scenarios are `scroll`, `empty-error`, `resume`, `shared`, `delete`, `visibility`,

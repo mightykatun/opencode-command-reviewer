@@ -6,7 +6,7 @@
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
-  "description": "Safety reviews, optional one-time auto-approval and Linux desktop notifications for OpenCode permissions",
+  "description": "Safety reviews, report history, optional one-time auto-approval and Linux desktop notifications for OpenCode permissions",
   "type": "module",
   "repository": {
     "type": "git",

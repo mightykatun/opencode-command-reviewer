@@ -28,6 +28,7 @@ import type { NotificationProcesses } from "./notification-process.js"
 import { uiText } from "./ui-text.js"
 import { HistoryStore } from "./history-store.js"
 import { HistoryCoordinator, drainHistory } from "./history-coordinator.js"
+import { HistoryMaintenance } from "./history-maintenance.js"
 import { HistoryController, type HistoryViewState } from "./history-controller.js"
 import { HistoryView, type HistoryInput } from "./history-view.js"
 import { HistoryCover } from "./history-cover.js"
@@ -212,6 +213,10 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   const history = new HistoryCoordinator(api.state.path.directory, historyStore, (id, signal) => modes.root(id, signal))
   const [historyState, setHistoryState] = createSignal<HistoryViewState>({ open: false, status: "loading", reset: 0 })
   const browser = new HistoryController(api.state.path.directory, historyStore, (id, signal) => history.root(id, signal), setHistoryState)
+  const maintenance = new HistoryMaintenance(api.state.path.directory, historyStore,
+    (sessionID, signal) => api.client.session.get({ sessionID, directory: history.scope }, { signal, throwOnError: false }),
+    id => { history.invalidateSession(id); browser.deleted(id) })
+  maintenance.start()
   const historyInput: HistoryInput = { interactive: () => false, scroll: () => {} }
   const historyCover = new HistoryCover()
   const unregisterHistory = historyCommands(api, browser, () => historyInput.interactive(), (amount, page) => historyInput.scroll(amount, page))
@@ -278,8 +283,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   api.event.on("session.deleted", (event) => {
     const info = event.properties.info
     browser.deleted(info.id)
-    // Start ancestry before invalidating its cache. The public deletion event
-    // identifies roots directly; known child ancestry retains the normal bound.
+    // Roots are explicit in the event; unknown children use bounded stored ownership.
     const deletion = history.sessionDeleted(info)
     controller.deleted(info.id)
     void deletion.catch(() => {}).finally(() => modes.deleted(info.id))
@@ -298,6 +302,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   let cleanup: Promise<void> | undefined
   const stop = () => cleanup ??= (async () => {
     const abortAt = lifecycleAbortAt ?? performance.now()
+    maintenance.dispose()
     history.dispose()
     browser.dispose()
     unregisterHistory()

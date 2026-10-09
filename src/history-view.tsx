@@ -57,7 +57,7 @@ export function HistoryView(props: { api: TuiPluginApi; controller: HistoryContr
   props.input.scroll = (amount, page) => {
     if (!interactive() || !scroll) return
     scroll.scrollBy(amount * (page ? Math.max(1, scroll.height - 1) : 1))
-    props.controller.scroll = scroll.scrollTop
+    props.controller.recordScroll(scroll.scrollTop)
   }
   createEffect(() => {
     if (reset === props.state.reset) return
@@ -65,7 +65,7 @@ export function HistoryView(props: { api: TuiPluginApi; controller: HistoryContr
     scroll?.scrollTo(props.controller.scroll)
   })
   const frame = () => {
-    if (!scroll || scroll.isDestroyed) return
+    if (!scroll || scroll.isDestroyed || props.state.status !== "ready") return
     if (!restored) {
       if (record() && (!description || description.isDestroyed || !description.getChildrenCount() || !ready(description))) return
       // Markdown readiness precedes Yoga/scrollbar layout. Retain the controller's
@@ -74,7 +74,7 @@ export function HistoryView(props: { api: TuiPluginApi; controller: HistoryContr
       if (extent !== measured) { measured = extent; props.api.renderer.requestRender(); return }
       scroll.scrollTo(props.controller.scroll); restored = true
     }
-    else props.controller.scroll = scroll.scrollTop
+    else props.controller.recordScroll(scroll.scrollTop)
   }
   props.api.renderer.on(CliRenderEvents.FRAME, frame)
   onCleanup(() => {
