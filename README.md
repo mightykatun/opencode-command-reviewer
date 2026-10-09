@@ -82,7 +82,6 @@ rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
 
 <details>
 <summary>Usage</summary>
-
 The sidebar shows Safe, Unsafe, or Analysis unavailable. Explanations support
 Markdown and scrolling. If the sidebar is hidden, use OpenCode's Show sidebar
 command.
@@ -134,9 +133,10 @@ Reviews send the pending request, latest user prompt, project context, and relev
 file snapshots, diffs, or tool arguments to your endpoint before approval. Shell
 file snapshots can follow symlinks outside the project. Missing evidence is noted
 in the report; ratings are advice based on the supplied evidence.
+</details>
 
+<details>
 <summary>Desktop notifications</summary>
-
 Transient banners have an **Opencode (Session name)** heading and a small status icon: green
 checkmark for approvals, orange exclamation mark for attention, red X
 for errors, and a neutral code mark for completed responses. GNOME controls the
@@ -176,7 +176,6 @@ with a low-latency buffer; preparation never blocks permission approval.
 `stdbuf` makes delivery acknowledgements immediate instead of waiting for
 `notify-send` to flush its output when the banner closes.
 Disable overlapping notification plugins to avoid duplicate alerts.
-
 </details>
 
 ## Development
