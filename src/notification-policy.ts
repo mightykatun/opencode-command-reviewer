@@ -7,7 +7,7 @@ import { notificationClock, notificationText, type NotificationBackend, type Not
 import { withDeadline } from "./deadline.js"
 
 interface Target { root: string; sessionID: string; title: string }
-interface Banner { abort: AbortController; handle?: NotificationHandle; target: Target; expire?: () => void; reminder: boolean }
+interface Banner { abort: AbortController; handle?: NotificationHandle; target: Target; expire?: () => void }
 interface Pending {
   identity: NotificationInteraction
   target: Target
@@ -67,7 +67,6 @@ export class NotificationPolicy {
     const entry: Pending = { identity: { kind: "question", id }, target, phase: "waiting" }
     this.questions.set(id, entry)
     this.select(entry)
-    this.attention(entry, "question")
   }
   /** Native queue identity, independent of route visibility and notification eligibility. */
   pending(blockers: ReadonlyMap<string, NotificationInteraction>) {
@@ -79,8 +78,8 @@ export class NotificationPolicy {
   private select(entry: Pending) {
     const next = this.blockers.get(entry.target.root)
     const blocking = next?.kind === entry.identity.kind && next.id === entry.identity.id
+    entry.blocking = blocking
     if (entry.identity.kind === "permission") {
-      entry.blocking = blocking
       // Re-evaluate the latest outcome even on queue-only publications. Never
       // replay an assessment captured when this request first became pending.
       const view = this.views.get(entry.identity.id)
@@ -88,13 +87,10 @@ export class NotificationPolicy {
       else this.wait(entry)
       return
     }
-    if (entry.blocking === blocking) return
-    entry.blocking = blocking
-    this.stopReminder(entry)
-    // A reminder may still be preparing audio or waiting to reach the backend.
-    // Losing the queue position invalidates that delivery, not just its timer.
-    if (!blocking && entry.banner?.reminder) { this.withdraw(entry.banner); entry.banner = undefined }
-    if (blocking) this.remind(entry)
+    // Questions use the same gate for initial delivery and reminders. Withdrawing
+    // also aborts audio preparation or deferred delivery after queue preemption.
+    if (blocking) this.attention(entry, "question")
+    else this.wait(entry)
   }
   private stopReminder(entry: Pending) { entry.reminder?.(); entry.reminder = undefined }
   private remind(entry: Pending) {
@@ -111,7 +107,7 @@ export class NotificationPolicy {
       remaining -= Math.max(0, now - at) / 1000; at = now
       if (remaining > 0) { schedule(); return }
       this.withdraw(entry.banner)
-      entry.banner = this.dispatch({ ...message, title: uiText.notifications.reminder(message.title) }, entry.target, true)
+      entry.banner = this.dispatch({ ...message, title: uiText.notifications.reminder(message.title) }, entry.target)
       // No catch-up burst after a stalled event loop or suspended machine.
       remaining = this.config.staleReminderSeconds
       schedule()
@@ -142,9 +138,9 @@ export class NotificationPolicy {
     if (!controls.banner && !sound) return
     return { kind, title, body: notificationText(target.title), sessionID: target.sessionID, banner: controls.banner, sound }
   }
-  private dispatch(message: NotificationMessage, target: Target, reminder = false): Banner | undefined {
+  private dispatch(message: NotificationMessage, target: Target): Banner | undefined {
     if (this.stopped || this.banners.size >= 64) return
-    const banner: Banner = { abort: new AbortController(), target, reminder }
+    const banner: Banner = { abort: new AbortController(), target }
     this.banners.add(banner)
     // Dispatch off the controller's publication stack; failures never propagate.
     void Promise.resolve().then(() => {

@@ -52,8 +52,9 @@ test("notification settings are independently strict, default on, and use absolu
   assert.equal(notificationText("x".repeat(500)).length, 256)
 })
 
-test("questions notify immediately, baseline and repeated asks stay silent, resolution withdraws", async () => {
+test("front questions notify once, baseline and repeated asks stay silent, resolution withdraws", async () => {
   const f = fixture()
+  f.policy.pending(new Map([["root", { kind: "question", id: "new" }]]))
   f.policy.question("old", target, false); f.policy.question("old", target, true)
   f.policy.question("new", target, true); f.policy.question("new", target, true)
   await settle()
@@ -61,6 +62,65 @@ test("questions notify immediately, baseline and repeated asks stay silent, reso
   f.policy.resolved("question", "new")
   assert.equal(f.closed.length, 1)
   f.policy.dispose()
+})
+
+test("queued questions wait for the front before their initial notification and full reminder interval", async () => {
+  const f = fixture(false, true, true, { staleReminderSeconds: 10 })
+  f.policy.pending(new Map([["root", { kind: "question", id: "first" }]]))
+  f.policy.question("first", { ...target, title: "First question" }, true)
+  f.policy.question("second", { ...target, title: "Second question" }, true)
+  await settle(); assert.deepEqual(f.messages.map(m => m.body), ["First question"])
+  await f.advance(10000)
+  assert.deepEqual(f.messages.map(m => m.body), ["First question", "First question"])
+  f.policy.resolved("question", "first")
+  f.policy.pending(new Map([["root", { kind: "question", id: "second" }]]))
+  await settle(); assert.equal(f.messages[2]?.title, "Agent has a question")
+  assert.equal(f.messages[2]?.body, "Second question")
+  await f.advance(9999); assert.equal(f.messages.length, 3)
+  await f.advance(1); assert.equal(f.messages[3]?.title, "Agent has a question (Reminder)")
+  f.policy.resolved("question", "second"); await f.advance(20000)
+  assert.equal(f.messages.length, 4); await f.policy.dispose()
+})
+
+test("an automatically handled permission blocks questions without producing either attention or question alerts", async () => {
+  const f = fixture(true, true, true, { staleReminderSeconds: 1 })
+  f.add(view("a", "complete"))
+  f.policy.question("q", target, true)
+  await f.advance(60000); assert.equal(f.messages.length, 0)
+  f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 15 } }])
+  await f.advance(10000); assert.equal(f.messages.length, 0)
+  f.policy.snapshot([], new Map([["root", { kind: "question", id: "q" }]]))
+  await settle(); assert.deepEqual(f.messages.map(m => m.kind), ["question"])
+  await f.policy.dispose()
+})
+
+for (const soundOnly of [false, true]) {
+  test(`question preemption cancels deferred ${soundOnly ? "sound-only" : "banner"} delivery and queued resolution cannot replay`, async () => {
+    const f = fixture(false, true, true, { notifications: { question: { banner: !soundOnly, sound: soundOnly } } })
+    f.policy.pending(new Map([["root", { kind: "question", id: "q" }]])); f.policy.question("q", target, true)
+    f.policy.pending(new Map([["root", { kind: "permission", id: "p" }]]))
+    await settle(); assert.deepEqual(f.messages, []); assert.equal(f.timers.size, 0)
+    f.policy.resolved("question", "q")
+    f.policy.pending(new Map([["root", { kind: "question", id: "q" }]]))
+    await f.advance(60000); assert.deepEqual(f.messages, [])
+    f.policy.question("deleted", target, true); f.policy.deleted("root")
+    f.policy.pending(new Map([["root", { kind: "question", id: "deleted" }]]))
+    await f.advance(60000); assert.deepEqual(f.messages, [])
+    await f.policy.dispose()
+  })
+}
+
+test("question queue loss aborts an in-flight backend and withdraws a late handle", async () => {
+  let release!: (handle: { close(): void }) => void, signal!: AbortSignal, closed = 0
+  const policy = new NotificationPolicy(parseNotificationConfig({ staleReminderSeconds: 0 }), false, {
+    show: (_message, parent) => { signal = parent; return new Promise(resolve => { release = resolve }) }, dispose() {},
+  })
+  policy.pending(new Map([["root", { kind: "question", id: "q" }]])); policy.question("q", target, true)
+  await settle()
+  policy.pending(new Map([["root", { kind: "permission", id: "p" }]]))
+  assert.equal(signal.aborted, true)
+  release({ close() { closed++ } }); await settle(); assert.equal(closed, 1)
+  await policy.dispose()
 })
 
 test("advisory waits for final assessments, including safe, and ignores previews and baseline permissions", async () => {
@@ -152,6 +212,7 @@ test("positive countdown stays silent through submission and only confirmed succ
 
 test("every reviewer banner is delivered but its audio is rate limited without suppressing attention", async () => {
   const f = fixture(true)
+  f.policy.pending(new Map([["root", { kind: "question", id: "q" }]]))
   for (const id of ["a", "b"]) f.policy.approved(view(id).request, target)
   f.policy.question("q", target, true); await settle()
   assert.deepEqual(f.messages.map(m => [m.kind, m.sound]), [["approved", true], ["approved", false], ["question", true]])
@@ -173,6 +234,7 @@ test("turn outcomes deduplicate across error/idle; disable, mute, disposal and l
   const policy = new NotificationPolicy(parseNotificationConfig(), false, {
     show: () => new Promise(resolve => { release = resolve }), dispose() {},
   })
+  policy.pending(new Map([["root", { kind: "question", id: "q" }]]))
   policy.question("q", target, true); await settle(); policy.resolved("question", "q")
   release({ close() { closed++ } }); await settle(); assert.equal(closed, 1); policy.dispose()
 })
@@ -239,16 +301,16 @@ test("only the selected blocker repeats per root, and queue handoff waits a full
   f.policy.question("q", target, true)
   f.policy.question("other", { ...target, root: "other", sessionID: "other" }, true)
   f.policy.pending(new Map([["root", { kind: "permission", id: "a" }], ["other", { kind: "question", id: "other" }]]))
-  await settle(); assert.equal(f.messages.length, 3, "queued Unsafe permission has no initial notification")
+  await settle(); assert.equal(f.messages.length, 2, "queued permissions and questions have no initial notification")
   await f.advance(10000)
-  assert.deepEqual(f.messages.slice(3).map(m => [m.kind, m.sessionID]), [["attention", "root"], ["question", "other"]])
+  assert.deepEqual(f.messages.slice(2).map(m => [m.kind, m.sessionID]), [["attention", "root"], ["question", "other"]])
   f.policy.resolved("permission", "a")
   f.policy.pending(new Map([["root", { kind: "permission", id: "b" }]]))
-  await settle(); assert.equal(f.messages[5]?.title, "Unsafe permission needs human approval", "newly actionable request gets its initial notification")
-  await f.advance(9999); assert.equal(f.messages.length, 6)
-  await f.advance(1); assert.equal(f.messages[6]?.kind, "unsafe")
+  await settle(); assert.equal(f.messages[4]?.title, "Unsafe permission needs human approval", "newly actionable request gets its initial notification")
+  await f.advance(9999); assert.equal(f.messages.length, 5)
+  await f.advance(1); assert.equal(f.messages[5]?.kind, "unsafe")
   f.policy.pending(new Map([["root", { kind: "permission", id: "baseline" }]]))
-  await f.advance(10000); assert.equal(f.messages.length, 7, "a silent baseline blocker must not promote a later request")
+  await f.advance(10000); assert.equal(f.messages.length, 6, "a silent baseline blocker must not promote a later request")
   f.policy.deleted("root"); f.policy.deleted("other")
   assert.equal(f.timers.size, 0)
   await f.policy.dispose()

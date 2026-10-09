@@ -78,12 +78,15 @@ test("only event-born requests in visited roots notify; baseline snapshots and u
   await settle(); assert.equal(f.banners.length, 1)
   f.host.visit("other"); await settle(); assert.equal(f.banners.length, 1)
   f.emit("question.asked", { id: "new-question", sessionID: "child", questions: [] }); await settle()
+  assert.equal(f.banners.length, 1, "questions wait behind all native permissions")
+  for (const requestID of ["new", "old"]) f.emit("permission.replied", { requestID, sessionID: "root", reply: "once" })
+  f.host.snapshot([]); await settle()
   assert.equal(f.banners[1]?.body, "Root title"); assert.equal(f.banners[1]?.sessionID, "root")
   f.emit("question.asked", { id: "deep-question", sessionID: "deep", questions: [] }); await settle()
-  assert.equal(f.banners[2]?.sessionID, "root", "child routes have no native input prompts in the pinned host")
+  assert.equal(f.banners.length, 2, "deep descendants have no native root input prompt in the pinned host")
   f.emit("question.replied", { requestID: "new-question", sessionID: "child", answers: [] })
   f.emit("question.asked", { id: "new-question", sessionID: "child", questions: [] }); await settle()
-  assert.equal(f.banners.length, 3); f.host.dispose()
+  assert.equal(f.banners.length, 2); f.host.dispose()
 })
 
 test("request events arriving during root visitation survive asynchronous baseline registration", async () => {
@@ -93,6 +96,7 @@ test("request events arriving during root visitation survive asynchronous baseli
   f.emit("question.asked", { id: "during-visit", sessionID: "root", questions: [] })
   await settle(); assert.equal(f.banners.length, 0)
   f.sessions.set("root", { id: "root", title: "Root title" }); release("root")
+  await f.tick()
   await settle(); assert.equal(f.banners.length, 1)
   assert.equal(f.banners[0]?.body, "Root title"); f.host.dispose()
 })
@@ -168,8 +172,9 @@ test("native priority includes silent baseline blockers and hands reminders off 
   f.host.visit("root"); await settle()
   f.emit("question.asked", { id: "q", sessionID: "root", questions: [] }); await settle()
   await f.advance(10000)
-  assert.deepEqual(f.banners.map(m => m.title), ["Agent has a question"], "an older child question blocks reminders without replay")
+  assert.equal(f.banners.length, 0, "an older child question blocks initial notifications and reminders without replay")
   f.emit("question.replied", { requestID: "baseline", sessionID: "child", answers: [] })
+  await settle(); assert.equal(f.banners[0]?.title, "Agent has a question")
   await f.advance(9999); assert.equal(f.banners.length, 1)
   await f.advance(1); assert.equal(f.banners[1]?.title, "Agent has a question (Reminder)")
   const p = request("p")
@@ -181,6 +186,7 @@ test("native priority includes silent baseline blockers and hands reminders off 
   assert.deepEqual(f.banners.slice(-2).map(m => [m.kind, m.sessionID]), [["unsafe", "root"], ["question", "other"]])
   f.emit("permission.replied", { requestID: "p", sessionID: "root", reply: "once" }); f.host.snapshot([])
   f.emit("question.rejected", { requestID: "other", sessionID: "other" })
+  await settle() // Returning to the front starts a new actionable question episode.
   const before = f.banners.length
   await f.advance(9999); assert.equal(f.banners.length, before)
   await f.advance(1); assert.equal(f.banners.at(-1)?.title, "Agent has a question (Reminder)")
@@ -210,16 +216,16 @@ test("pending question reads retain ownership and event-raced results cannot res
   })
   f.host.visit("root"); await settle()
   f.emit("question.asked", { id: "q", sessionID: "root", questions: [] }); await settle()
-  await f.advance(10000); assert.equal(calls, 1); assert.equal(f.banners.length, 1)
+  await f.advance(10000); assert.equal(calls, 1); assert.equal(f.banners.length, 0)
   f.emit("question.rejected", { requestID: "q", sessionID: "root" })
   resolve([{ id: "q", sessionID: "root", questions: [] }]); await settle()
   await f.advance(2000); assert.equal(calls, 2)
   await f.host.dispose()
   resolve([{ id: "q", sessionID: "root", questions: [] }]); await settle()
-  await f.advance(10000); assert.equal(f.banners.length, 1); assert.equal(f.timers.size, 0)
+  await f.advance(10000); assert.equal(f.banners.length, 0); assert.equal(f.timers.size, 0)
 })
 
-test("question read outages pause only question reminders and recovery waits a full interval", async () => {
+test("question read outages withdraw question delivery and recovery restarts the reminder interval", async () => {
   let fail = false
   const f = fixture(undefined, { staleReminderSeconds: 10 }, async () => {
     if (fail) throw new Error("public list unavailable")
@@ -234,8 +240,9 @@ test("question read outages pause only question reminders and recovery waits a f
   assert.equal(f.banners.filter(m => m.kind === "question").length, 1)
   assert.equal(f.banners.filter(m => m.kind === "attention").length, 2)
   fail = false; await f.advance(2000)
-  await f.advance(9999); assert.equal(f.banners.filter(m => m.kind === "question").length, 1)
-  await f.advance(1); assert.equal(f.banners.filter(m => m.kind === "question").length, 2)
+  assert.equal(f.banners.filter(m => m.kind === "question").length, 2)
+  await f.advance(9999); assert.equal(f.banners.filter(m => m.kind === "question").length, 2)
+  await f.advance(1); assert.equal(f.banners.filter(m => m.kind === "question").length, 3)
   await f.host.dispose()
 })
 
@@ -249,11 +256,11 @@ test("question deadline expiry retains the actual read slot through late settlem
   f.emit("question.asked", { id: "q", sessionID: "root", questions: [] }); await settle()
   await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }))
   await settle(); assert.equal(signal.aborted, true)
-  await f.advance(10000); assert.equal(calls, 1); assert.equal(f.banners.length, 1)
+  await f.advance(10000); assert.equal(calls, 1); assert.equal(f.banners.length, 0)
   release([{ id: "q", sessionID: "root", questions: [] }]); await settle()
   await f.advance(2000); assert.equal(calls, 2)
   await f.host.dispose(); release([]); await settle()
-  assert.equal(f.banners.length, 1); assert.equal(f.timers.size, 0)
+  assert.equal(f.banners.length, 0); assert.equal(f.timers.size, 0)
 })
 
 test("host publishes queue and review outcomes atomically across a snapshot-only handoff", async () => {

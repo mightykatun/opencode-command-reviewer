@@ -356,20 +356,20 @@ npm run check:package  # builds twice, compares hashes, checks exact package con
   Reminders retain the original presentation and channels with only ` (Reminder)`
   appended to event text. Replace the previous banner. Dismissal/click/focus does
   not resolve an interaction. Cancel timers on resolution, deletion and disposal.
-- One blocker per visited root may remind, independently of the selected route.
+- One blocker per visited root may notify and remind, independently of the selected route.
   `notification-order.ts` mirrors pinned native ordering: permissions before questions,
   then code-unit session/request order across roots and direct children. Baseline,
   disabled and silent requests still block; deeper descendants have no native root
-  input prompt and only get initial question notifications. Initial permission
-  attention/Unsafe delivery also requires this queue position. Publish review outcomes
+  input prompt and receive no pending-request alerts. Initial permission
+  attention/Unsafe/question delivery also requires this queue position. Publish review outcomes
   and queue selection atomically; handoff re-evaluates the current view, never a saved
   notification decision. Losing position or eligibility aborts pending initial/reminder
-  delivery. Newly actionable manual permissions get their initial notification, then
-  reminders wait a full interval. Question reminder handoff also waits a full interval.
+  delivery. Handoff sends the eligible permission/question initial notification,
+  then waits a full interval before the first reminder.
   `NotificationHost` polls the public pending-question list every two seconds under
   a five-second bound, retaining actual read ownership through late settlement.
   Revision guards reject event-raced snapshots; snapshots never create notification
-  births. Failed reads pause question reminders until healthy ordering is known.
+  births. Failed reads pause question delivery until healthy ordering is known.
   Permission ordering/resolution continues to use the controller's reconciled views.
 - Countdowns send no desktop banner or audio; confirmed automatic success uses approval audio
   for positive/zero delays. Approval sounds are limited to one per two seconds.

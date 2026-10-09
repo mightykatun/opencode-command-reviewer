@@ -67,34 +67,51 @@ launching OpenCode. The inline key takes precedence. Omit both for an unauthenti
 endpoint. Remove `instructions` to use the built-in prompts and
 `notificationSoundDirectory` to use the bundled sounds.
 
-The remaining values above are the defaults. Restart OpenCode after changing
-configuration. Reviews run when OpenCode asks for permission, so set the relevant
-rules to `ask` in `opencode.json`. Existing `allow` rules skip review.
+The connection, credential and directory values above are examples, not defaults.
+All boolean, numeric and per-type notification values shown are the defaults.
+Restart OpenCode after changing configuration. Reviews run when OpenCode asks for
+permission, so set the relevant rules to `ask` in `opencode.json`. Existing `allow`
+rules skip review.
 
 ## Options reference
 
-| Option | Behavior |
-| --- | --- |
-| `stream` | Show the rating and explanation as they arrive. Requires SSE support from the endpoint. |
-| `reviewBash` | Review native shell commands. |
-| `reviewEdits` | Review native edit, write, and apply-patch requests. |
-| `reviewMcp` | Review identifiable MCP tool and resource permissions. |
-| `reviewCustomTools` | Review permissions requested by registered custom tools. |
-| `reviewExternalDirectories` | Review directory access independently of the other switches. Directory approval can resume the operation without another prompt. |
-| `autoApprove` | Allow completed Safe reviews once after their countdown, including behind report history. |
-| `extraCareful` | Include the extra-careful prompt in auto-mode reviews. Defaults to `true`; set `false` to omit it. |
-| `autoApproveDelaySeconds` | Countdown duration, 0–3600 seconds. |
-| `notify` | Linux desktop notifications and sounds. Defaults to `true`; set `false` to disable both. |
-| `notifySound` | Play notification sounds. Defaults to `true`; set `false` to keep banners silent. |
-| `staleReminderSeconds` | Repeat pending human-interaction notifications every 60 seconds by default. Nonnegative safe integer seconds; `0` disables reminders. Only the front-of-queue blocker per conversation repeats. |
-| `notifications` | Per-type `banner` and `sound` booleans for `attention`, `unsafe`, `question`, `approved`, `error`, and `ended`. Omitted types and fields default to `true`. |
-| `notificationSoundDirectory` | Absolute custom sound directory. Use any of the six notification type names as basenames with `.wav` or `.mp3`; WAV takes precedence. Missing or unusable files fall back to that type's bundled sound. |
-| `formatRetries` | Additional attempts to correct malformed assessment JSON, 0–100. |
-| `maxOutputTokens` | Provider output-token limit, sent as `max_tokens`. Defaults to 2,048; accepts positive safe integers within your provider/model's supported range. Retries keep the same limit. |
-| `timeoutMs` | Total review deadline, 1–3,600,000 ms. |
-| `maxFiles` | File limit per review, 1–1,000. |
-| `maxEvidenceBytes` | Evidence limit, 1–16,777,216 bytes. Whole files or diffs may be omitted; oversized mandatory arguments fail review. |
-| `instructions` | Absolute directory containing overrides for the [prompt templates](https://github.com/mightykatun/opencode-reviewer/tree/main/prompts). Missing templates use the built-ins. |
+These are options inside the plugin's configuration object in `tui.json`.
+Defaults apply only to omitted options; `null` is invalid. Boolean and integer
+options require JSON booleans and numbers, not quoted strings. Integer ranges are
+inclusive, fractions are invalid, and the maximum safe integer is
+9,007,199,254,740,991. Unknown option names are rejected.
+
+| Option | Type | Default | Accepted values and behavior |
+| --- | --- | --- | --- |
+| `baseURL` | string | Required | HTTP(S) API base URL; `/chat/completions` is appended after removing trailing slashes. Embedded credentials, query strings and fragments are rejected. |
+| `model` | string | Required | Nonempty model identifier accepted by the configured endpoint. |
+| `apiKey` | string | Unset | Nonempty Bearer token. Takes precedence over `apiKeyEnv`. |
+| `apiKeyEnv` | string | Unset | Environment-variable name matching `[A-Za-z_][A-Za-z_0-9]*`. Without an inline key, its value must be set and nonblank when a review runs. Omit both key options for no Authorization header. |
+| `instructions` | string | Unset (built-ins) | Absolute, NUL-free directory path containing overrides for the [prompt templates](https://github.com/mightykatun/opencode-reviewer/tree/main/prompts), not inline instructions. Missing named files use built-ins; supplied files must be readable, regular, non-symlink, nonempty UTF-8 text up to 64 KiB. Fixed contracts cannot be overridden. |
+| `stream` | boolean | `false` | Request SSE and show provisional rating/text updates. Approval still requires a completed, validated and rendered report. |
+| `reviewBash` | boolean | `true` | Review native shell-command permissions. |
+| `reviewEdits` | boolean | `true` | Review native `edit`, `write` and `apply_patch` permissions. |
+| `reviewMcp` | boolean | `false` | Review identifiable MCP tool and resource permissions. |
+| `reviewCustomTools` | boolean | `false` | Review permissions requested by registered custom tools. |
+| `reviewExternalDirectories` | boolean | `false` | Review directory access independently of operation-review switches. Directory approval can resume the operation without another prompt. |
+| `autoApprove` | boolean | `false` | Allow completed, validated and rendered Safe reviews once after their countdown, including behind this plugin's report history. |
+| `extraCareful` | boolean | `true` | Include extra-careful guidance when `autoApprove` is enabled. Setting `false` omits that guidance without disabling automatic approval. |
+| `autoApproveDelaySeconds` | integer | `15` | `0`–`3600` seconds. Positive values have an extra one-second initial hold; `0` skips the wait but retains rendering and eligibility checks. |
+| `notify` | boolean | `true` | Master switch for desktop banners, sounds and reminders. `false` overrides all per-type controls. |
+| `notifySound` | boolean | `true` | Master switch for notification audio. `false` silences every type and reminder without disabling enabled banners. |
+| `staleReminderSeconds` | integer | `60` | `0` through the maximum safe integer, in seconds. `0` disables reminders; otherwise eligible pending human interactions repeat at this interval, limited to the native front-of-queue blocker per conversation. |
+| `notifications` | object | All types: `banner: true`, `sound: true` | Keys: `attention`, `unsafe`, `question`, `approved`, `error`, `ended`. Each entry is an object with optional `banner` and `sound` booleans. Omitted types/fields remain enabled; unknown types/fields are invalid. Controls also apply to reminders. |
+| `notificationSoundDirectory` | string | Unset (bundled sounds) | Absolute, NUL-free path, at most 4096 string code units. Use the six notification type names as basenames: usable `.wav` first, then `.mp3`, then the corresponding bundled sound. |
+| `formatRetries` | integer | `1` | `0`–`100` additional assessment-format correction attempts. `0` disables format corrections, not independent transport recovery. |
+| `maxOutputTokens` | integer | `2048` | `1` through the maximum safe integer. Sent as `max_tokens` on every reviewer POST, including retries/corrections. Your provider/model enforces its supported output limit. |
+| `timeoutMs` | integer | `30000` | `1`–`3600000` milliseconds shared across evidence collection, HTTP requests, retries and corrections; not a fresh budget per POST. |
+| `maxFiles` | integer | `6` | `1`–`1000` distinct file candidates per shell/edit review, including unavailable candidates. |
+| `maxEvidenceBytes` | integer | `131072` | `1`–`16777216` UTF-8 bytes for command/source content, edit diffs or category-specific JSON evidence. Optional items are omitted whole; oversized mandatory evidence fails analysis. This is not a cap on the full prompt or HTTP request. |
+
+Notification channels are independent: `banner: false, sound: true` is sound-only;
+`banner: true, sound: false` is banner-only; both `false` disable that type.
+`notify` and `notifySound` take precedence. Invalid notification settings disable
+notification work without invalidating otherwise valid review settings.
 
 My LLMs insist on writing a bunch of useless text to my README, so I collapsed them here in case anyone wants to inflict themselves (or more likely their agent) the pain of reading it.
 
@@ -195,8 +212,8 @@ same state directory. Browsing and switching views do not add usage.
 
 Older retained history can provide a **partial** conversation baseline. Previously
 deleted details and usage predating history tracking cannot be attributed or
-reconstructed from legacy lifetime aggregates. This limitation is labeled in the
-dialog. Once recorded in conversation totals, deleting report details does not
+reconstructed from legacy lifetime aggregates. Once recorded in conversation totals,
+deleting report details does not
 reduce those totals or Lifetime. Storage failures show unavailable, not zero.
 
 Tokens describe received provider usage, not just the visible explanation. One
@@ -230,7 +247,8 @@ terminal is focused:
   reviews and terminal analysis failures can notify without a report.
 - **Unsafe permission needs human approval:** a completed, validated Unsafe review,
   with its own sound. Provisional streamed ratings never notify.
-- **Agent has a question:** a pending agent question, with its own sound.
+- **Agent has a question:** a pending agent question at the front of the native
+  input queue, with its own sound.
 - **Reviewer approved a permission:** sent with the approval sound after confirmed
   automatic approval, for both positive and zero delays. The countdown is silent.
   Approval sounds are limited to
@@ -239,10 +257,12 @@ terminal is focused:
 - **Session ended:** a completed root-agent response, not a question/permission
   pause or an explicit user interruption.
 
-Permission attention and Unsafe notifications, including their reminders, apply
-only to the current native permission blocker in each visited root conversation.
+Permission attention, Unsafe and question notifications, including their reminders,
+apply only to the current native input blocker in each visited root conversation.
 Requests queued behind it stay silent and are re-evaluated from their current
-review/approval state when they become actionable. A sequence that proceeds
+state when they become actionable. Questions wait behind pending permissions and
+earlier questions. A request resolved while queued never sends a delayed alert.
+A sequence of permissions that proceeds
 through automatic approval stays free of attention notifications. Losing the
 actionable position, restarting analysis or entering automatic approval cancels
 pending attention delivery and reminders.
@@ -260,11 +280,11 @@ from initial dispatch, even if desktop delivery fails. Reminders replace their
 previous banner and append **(Reminder)** to the event text, reusing the same
 sound, icon, session heading and click target. Only the native front-of-queue
 interaction per root conversation repeats: permissions precede questions, with
-the host's session/request ordering. Queued interactions wait; when the blocker
-changes, its replacement waits a full interval. Independent visited conversations
+the host's session/request ordering. Queued interactions stay silent. Handoff sends
+the next eligible request's initial notification, then waits a full interval before
+its first reminder. Independent visited conversations
 can each remind. The supported host presents input for roots and direct children;
-deeper descendants cannot become a native root-input permission notification or
-reminder target. Their questions can still receive initial question notifications.
+deeper descendants cannot become a native root-input notification or reminder target.
 
 Answering/dismissing a question in OpenCode, resolving a permission, deleting its
 session or closing the plugin stops its reminders. Closing/clicking a desktop

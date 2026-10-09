@@ -126,13 +126,14 @@ try {
   if (scenario === "question") {
     const deliveries = async () => (await records()).filter(r => soundOnly ? r.event === "sound" && r.kind === "question"
       : r.event === "notification" && r.title.startsWith("Agent has a question"))
-    const count = queue ? 2 : 1
-    await until(async s => s.includes("Choose a fixture option") && (await deliveries()).length >= count)
+    const count = 1
+    await until(async s => s.includes("Choose a fixture option") && (await deliveries()).length >= count
+      && (await records()).filter(r => r.event === "question.asked").length === (queue ? 2 : 1))
     assert.equal((await deliveries()).length, count)
     if (reminders) {
       await until(async () => (await deliveries()).length >= count + 2, 12000)
       const seen = await deliveries()
-      assert.equal(seen.length, count + 2, "only one blocker repeats even with queued questions")
+      assert.equal(seen.length, count + 2, "queued questions must send neither initial notifications nor reminders")
       // Initial delivery includes asynchronous decode/icon preparation. The
       // question birth precedes policy dispatch; its timestamp is the public
       // lower bound, not the later notify-send acknowledgement or queued banner.
@@ -149,7 +150,13 @@ try {
     if (queue) {
       const reply = (await records()).find(r => r.event === "question.replied")
       await until(async () => (await deliveries()).length > before, 8000)
-      assert.ok((await deliveries()).at(-1).at - reply.at >= interval * 1000 - 250, "next blocker waits a full interval after handoff")
+      const next = (await deliveries())[before]
+      assert.ok(next.at >= reply.at, "the next question cannot notify before native queue handoff")
+      if (!soundOnly) assert.equal(next.title, "Agent has a question", "handoff sends the deferred initial notification")
+      await until(async () => (await deliveries()).length >= before + 2, 8000)
+      const reminder = (await deliveries())[before + 1]
+      assert.ok(reminder.at - reply.at >= interval * 1000 - 250, "the new blocker waits a full interval before reminding")
+      if (!soundOnly) assert.equal(reminder.title, "Agent has a question (Reminder)")
       runtime.tmux("send-keys", "-t", "smoke", "Enter")
       await until(async () => (await records()).filter(r => r.event === "question.replied").length === 2, 10000)
     }
