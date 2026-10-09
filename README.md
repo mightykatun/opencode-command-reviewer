@@ -4,6 +4,8 @@ Reviews pending permissions in the OpenCode sidebar using a separate LLM. Covers
 shell commands, file edits, MCP calls, custom tools, and external-directory access.
 Supports streaming explanations, auto-approval, and Linux desktop notifications with distinct sounds.
 
+![](./assets/recording.gif)
+
 Requires OpenCode 1.18.35 or newer on Linux.
 
 ## Install and config
