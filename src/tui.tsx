@@ -236,13 +236,16 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   let notifications: NotificationHost | undefined
   if (notificationConfig?.notify) {
     try {
-      const click: NotificationClick = (id, target) => {
+      const click: NotificationClick = (id, target) => { click.begin?.(id, target).commit() }
+      click.begin = (id, target) => {
         // A newer approval click supersedes an older save wait or deferred reveal,
         // even when its navigation must wait for the current native dialog.
         setRevealHistory(undefined)
         if (target) browser.close()
         else browser.cancelPendingPermission()
-        notifications?.click(id, target)
+        const lease = notifications!.beginClick(id, target)
+        lease.signal.addEventListener("abort", () => { setRevealHistory(undefined); browser.cancelPendingPermission() }, { once: true })
+        return lease
       }
       const backend = notificationBackend ? notificationBackend(click, notificationConfig) : new LinuxNotifications(notificationConfig, click)
       notifications = new NotificationHost(api,
@@ -251,9 +254,9 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
           const result = await api.client.question.list({ directory: api.state.path.directory }, { signal, throwOnError: true })
           if (!result.data) throw new Error("Pending questions unavailable")
           return result.data
-        }, undefined, (id, target) => {
+        }, undefined, (id, target, lease) => {
           if (controller.retained(id, target)) setRevealHistory({ session: id, live: target })
-          else browser.openPermission(id, target, () => setRevealHistory({ session: id }))
+          else browser.openPermission(id, target, () => { if (lease.current()) setRevealHistory({ session: id }) })
         })
     } catch { /* Desktop initialization cannot change review behavior. */ }
   }
@@ -284,7 +287,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
     setViews(views)
     // Solid cleanup can synchronously cancel an older countdown during this
     // publication. Read current controller state rather than replaying its input.
-    notifications?.snapshot(controller.pendingViews)
+    if (!controller.reconciling) notifications?.snapshot(controller.pendingViews)
   }, reviewOptions, { ...(observer ? {
     list: (signal: AbortSignal) => {
       const pending = controller.views
@@ -319,7 +322,8 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
   // Startup recovery and bounded reconciliation cover attachment to an existing
   // request and cancellation paths that do not emit permission.replied.
   const pendingRefresh = new PendingRefresh(controller,
-    (signal) => measured(hostTrace, "pending-refresh", () => approval.list(signal)), api.lifecycle.signal)
+    (signal) => measured(hostTrace, "pending-refresh", () => approval.list(signal)), api.lifecycle.signal,
+    healthy => notifications?.snapshot(controller.pendingViews, healthy))
   const refresh = () => pendingRefresh.refresh()
   const unregisterMode = sessionModeCommands(api, modes, (root) => { controller.modeChanged(root); void refresh() })
   void refresh()
@@ -365,6 +369,7 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
       app: () => {
         createEffect(() => {
           const route = api.route.current
+          notifications?.routeChanged()
           browser.route(route.name === "session" ? route.params?.sessionID as string | undefined : undefined)
         })
         createEffect(() => {

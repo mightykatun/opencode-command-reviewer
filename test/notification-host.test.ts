@@ -9,6 +9,8 @@ import { parseNotificationConfig } from "../src/notification-config.js"
 import type { NotificationMessage } from "../src/notification-types.js"
 import type { HistoryTarget } from "../src/history-records.js"
 import type { View } from "../src/controller.js"
+import { Controller } from "../src/controller.js"
+import { PendingRefresh } from "../src/pending-refresh.js"
 import { SessionModes, type AncestryReader } from "../src/session-mode.js"
 
 const request = (id = "p", sessionID = "root"): PermissionRequest => ({ id, sessionID, permission: "bash", patterns: [], always: [], metadata: {} })
@@ -75,7 +77,7 @@ function fixture(resolve: AncestryReader = async id => id, options: Record<strin
 }
 
 test("only event-born requests in visited roots notify; baseline snapshots and unrelated roots stay silent", async () => {
-  const f = fixture(); f.host.visit("root")
+  const f = fixture(); f.host.snapshot([], true); f.host.visit("root")
   const old: View = { request: request("old"), status: "unavailable" }
   f.host.snapshot([old]); await settle(); assert.equal(f.banners.length, 0)
   f.emit("permission.asked", request("new"))
@@ -99,6 +101,7 @@ test("only event-born requests in visited roots notify; baseline snapshots and u
 test("request events arriving during root visitation survive asynchronous baseline registration", async () => {
   let release!: (value: string) => void
   const f = fixture(() => new Promise(resolve => { release = resolve }))
+  f.host.snapshot([], true)
   f.sessions.delete("root"); f.host.visit("root")
   f.emit("question.asked", { id: "during-visit", sessionID: "root", questions: [] })
   await settle(); assert.equal(f.banners.length, 0)
@@ -176,6 +179,7 @@ test("deleted roots/children, route changes, newer ordinary clicks, and disposal
 
 test("root completion requires a new turn and final message; retries, question pauses, tool steps and children stay silent", async () => {
   const f = fixture()
+  f.host.snapshot([], true)
   f.message({ id: "old", role: "user" }); f.host.visit("root")
   f.emit("session.idle", { sessionID: "root" }); await f.tick(); assert.equal(f.banners.length, 0)
   f.message({ id: "user", role: "user" })
@@ -226,6 +230,7 @@ test("click respects native dialogs and deleted targets; disposal removes event 
 
 test("native priority includes silent baseline blockers and hands reminders off after a full interval", async () => {
   const f = fixture(undefined, { staleReminderSeconds: 10 })
+  f.host.snapshot([], true)
   f.questions.set("baseline", { id: "baseline", sessionID: "child", questions: [] })
   f.host.visit("root"); await settle()
   f.emit("question.asked", { id: "q", sessionID: "root", questions: [] }); await settle()
@@ -255,6 +260,7 @@ test("native priority includes silent baseline blockers and hands reminders off 
 
 test("public question reconciliation stops missed resolutions, never admits baseline notifications", async () => {
   const f = fixture(undefined, { staleReminderSeconds: 10 })
+  f.host.snapshot([], true)
   f.host.visit("root"); await settle()
   f.emit("question.asked", { id: "q", sessionID: "child", questions: [] }); await settle()
   await f.advance(10000); assert.equal(f.banners.length, 2)
@@ -272,6 +278,7 @@ test("pending question reads retain ownership and event-raced results cannot res
     calls++
     return new Promise(yes => { resolve = yes })
   })
+  f.host.snapshot([], true)
   f.host.visit("root"); await settle()
   f.emit("question.asked", { id: "q", sessionID: "root", questions: [] }); await settle()
   await f.advance(10000); assert.equal(calls, 1); assert.equal(f.banners.length, 0)
@@ -289,6 +296,7 @@ test("question read outages withdraw question delivery and recovery restarts the
     if (fail) throw new Error("public list unavailable")
     return [{ id: "q", sessionID: "root", questions: [] }]
   })
+  f.host.snapshot([], true)
   f.host.visit("root"); f.host.visit("other"); await settle()
   f.emit("question.asked", { id: "q", sessionID: "root", questions: [] })
   const p = request("p", "other")
@@ -310,6 +318,7 @@ test("question deadline expiry retains the actual read slot through late settlem
     calls++; signal = current
     return new Promise(resolve => { release = resolve })
   })
+  f.host.snapshot([], true)
   f.host.visit("root"); await settle()
   f.emit("question.asked", { id: "q", sessionID: "root", questions: [] }); await settle()
   await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }))
@@ -336,6 +345,98 @@ test("host publishes queue and review outcomes atomically across a snapshot-only
   f.host.snapshot([{ request: b, status: "analyzing", autoApproval: { status: "cancelled" } }])
   await f.advance(5000); assert.equal(f.banners.length, 1)
   await f.host.dispose()
+})
+
+test("W4: questions cannot outrun an unknown initial permission baseline", async () => {
+  const f = fixture()
+  f.host.visit("root"); await settle()
+  f.pending.set("child", [request("baseline", "child")])
+  f.emit("question.asked", { id: "fresh", sessionID: "root", questions: [] })
+  await settle()
+  assert.deepEqual(f.banners, [])
+  await f.host.dispose()
+})
+
+test("W4: event-born question admission recovers on healthy polling after ancestry failure", async () => {
+  let calls = 0
+  const f = fixture(async () => { calls++; throw new Error("metadata temporarily unavailable") })
+  f.host.snapshot([], true)
+  f.host.visit("root"); await settle()
+  f.sessions.delete("child")
+  f.emit("question.asked", { id: "recover", sessionID: "child", questions: [] })
+  await settle(); assert.equal(calls, 1)
+  f.sessions.set("child", { id: "child", parentID: "root", title: "Child" })
+  await f.tick(); await settle()
+  assert.deepEqual(f.banners.map(m => m.kind), ["question"])
+  await f.host.dispose()
+})
+
+for (const session of ["root", "child"]) test(`permission baseline integration: held/failed/raced reads preserve ${session} silent blockers`, async t => {
+  const f = fixture(undefined, { staleReminderSeconds: 10 })
+  const controller = new Controller(async () => null, () => {
+    if (!controller.reconciling) f.host.snapshot(controller.pendingViews)
+  }, { reviewBash: false, reviewEdits: false })
+  let resolve!: (requests: PermissionRequest[]) => void, reject!: (error: Error) => void
+  const refresh = new PendingRefresh(controller, () => new Promise((yes, no) => { resolve = yes; reject = no }), new AbortController().signal,
+    healthy => f.host.snapshot(controller.pendingViews, healthy))
+  t.after(async () => { refresh.dispose(); await controller.dispose(); await f.host.dispose() })
+  f.host.visit("root"); await settle()
+  let wait = refresh.refresh(); await settle()
+  f.emit("question.asked", { id: "q", sessionID: "root", questions: [] }); await settle()
+  assert.equal(f.banners.length, 0)
+  reject(new Error("offline")); await wait
+  wait = refresh.refresh(); await settle()
+  controller.deleted("unknown") // Invalidates this read, including an empty result.
+  resolve([]); await wait; assert.equal(f.banners.length, 0)
+  wait = refresh.refresh(); await settle()
+  resolve([request("silent", session)]); await wait; await settle()
+  await f.advance(10000); assert.equal(f.banners.length, 0)
+  wait = refresh.refresh(); await settle(); resolve([]); await wait; await settle()
+  assert.deepEqual(f.banners.map(m => m.title), ["Agent has a question"])
+  await f.advance(9999); assert.equal(f.banners.length, 1)
+  await f.advance(1); assert.equal(f.banners[1]?.title, "Agent has a question (Reminder)")
+})
+
+test("reconciliation notification batching cannot expose a question between permission removal and insertion", async t => {
+  const f = fixture()
+  const controller = new Controller(async () => null, () => {
+    if (!controller.reconciling) f.host.snapshot(controller.pendingViews)
+  }, { reviewBash: false, reviewEdits: false })
+  t.after(async () => { await controller.dispose(); await f.host.dispose() })
+  controller.reconcile([request("old")], controller.revision)
+  f.host.snapshot(controller.pendingViews, true); f.host.visit("root"); await settle()
+  f.emit("question.asked", { id: "q", sessionID: "root", questions: [] })
+  controller.reconcile([request("new", "child")], controller.revision)
+  await settle(); assert.deepEqual(f.banners, [])
+})
+
+test("capacity release readmits a third event-born question without extra births", async () => {
+  const releases = new Map<string, (root: string) => void>()
+  const f = fixture(id => new Promise(resolve => releases.set(id, resolve)))
+  f.host.snapshot([], true); f.host.visit("root"); await settle()
+  for (const id of ["a", "b", "c"]) f.emit("question.asked", { id, sessionID: id, questions: [] })
+  await settle(); assert.equal(releases.size, 2)
+  f.sessions.set("a", { id: "a", title: "A", parentID: "root" }); releases.get("a")!("root")
+  await settle(); assert.equal(releases.size, 3)
+  f.emit("question.rejected", { requestID: "b", sessionID: "b" })
+  f.sessions.set("c", { id: "c", title: "C", parentID: "root" }); releases.get("c")!("root")
+  releases.get("b")!("root"); await settle()
+  assert.equal(f.banners.length, 1)
+  f.emit("question.replied", { requestID: "a", sessionID: "a" }); await settle()
+  assert.equal(f.banners.length, 2)
+  await f.host.dispose()
+})
+
+test("action-time leases immediately invalidate old work, including route away and back", () => {
+  const f = fixture(), aborted: string[] = []
+  const first = f.host.beginClick("root", { session: "child", permission: "first" })
+  first.signal.addEventListener("abort", () => aborted.push("first"))
+  const second = f.host.beginClick("other")
+  assert.deepEqual(aborted, ["first"])
+  first.commit(); assert.deepEqual(f.navigated, [])
+  f.route("other"); f.host.routeChanged(); f.route("root"); f.host.routeChanged()
+  second.commit(); assert.deepEqual(f.navigated, [])
+  f.host.dispose()
 })
 
 test("notification ancestry admission owns actual metadata reads after deadline and disposal", async t => {

@@ -10,6 +10,8 @@ import { gnomeTerminalIdentity, activateGnomeTerminal } from "../src/notificatio
 import { OwnedNotificationProcesses, type NotificationProcesses, type ProcessResult } from "../src/notification-process.js"
 import { fixtureWav } from "./notification-fixtures.js"
 import type { HistoryTarget } from "../src/history-records.js"
+import { NotificationPolicy } from "../src/notification-policy.js"
+import { parseNotificationConfig } from "../src/notification-config.js"
 
 const identity = { service: ":1.123", screen: "00000000-0000-0000-0000-000000000001" }
 const message = { kind: "attention" as const, title: "Session needs attention", body: "<root>&\u001b", sessionID: "root", banner: true, sound: false }
@@ -261,4 +263,102 @@ test("sound-only preparation and active playback remain owned by resolution and 
   while (signals.length < 2 && performance.now() < secondDeadline) await settle()
   assert.equal(signals.length, 2, "cached playback must start")
   await backend.dispose(); await third?.closed; assert.equal(signals[1]!.aborted, true)
+})
+
+test("W4: actionable sound waits behind two held players without being lost", async () => {
+  const f = fakeProcesses()
+  const held: (() => void)[] = [], played: string[] = []
+  f.processes.start = (_command, args, _ms, signal) => {
+    played.push(path.basename(args.at(-1)!))
+    let finish!: () => void
+    const result = new Promise<ProcessResult>(resolve => { finish = () => resolve({ code: 0, stdout: "" }) })
+    held.push(finish); signal.addEventListener("abort", finish, { once: true })
+    return { result, cancel: finish }
+  }
+  const sound = { format: "wav" as const, data: fixtureWav().toString("base64") }
+  const audio = new NotificationAudio(f.processes, undefined, { approved: sound, ended: sound, unsafe: sound })
+  const signal = new AbortController().signal
+  await audio.ready("approved", signal); await audio.ready("ended", signal); await audio.ready("unsafe", signal)
+  const first = audio.play("approved", signal), second = audio.play("ended", signal)
+  await settle()
+  const third = audio.play("unsafe", signal)
+  await settle(); assert.equal(played.length, 2)
+  held[0]!(); held[1]!(); await settle()
+  assert.deepEqual(played, ["approved.wav", "ended.wav", "unsafe.wav"])
+  held[2]!(); await Promise.all([first, second, third]); await audio.dispose()
+})
+
+test("W4: action receipt, not delayed notify-send EOF, owns latest navigation", async () => {
+  const f = fakeProcesses(), clicks: string[] = []
+  const backend = new LinuxNotifications({ notify: true, notifySound: false }, id => clicks.push(id), f.processes, identity)
+  await backend.show({ ...message, sessionID: "old" }, new AbortController().signal)
+  await backend.show({ ...message, sessionID: "new" }, new AbortController().signal)
+  const banners = f.calls.filter(c => c.command === "notify-send")
+  banners[0]!.line!("41"); banners[0]!.line!("default")
+  banners[1]!.line!("42"); banners[1]!.line!("default")
+  banners[1]!.finish({ code: 0, stdout: "" }); await settle()
+  banners[0]!.finish({ code: 0, stdout: "" }); await settle()
+  assert.deepEqual(clicks, ["new"])
+  await backend.dispose()
+})
+
+for (const outcome of ["play", "resolution", "preemption", "deletion", "disposal"] as const) test(`policy/backend sound-only contention: ${outcome}`, async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "reviewer-audio-contention-"))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  for (const kind of ["approved", "ended", "question"]) await writeFile(path.join(directory, kind + ".wav"), fixtureWav())
+  const held: (() => void)[] = [], played: string[] = []
+  const processes: NotificationProcesses = {
+    start(command, args, _ms, signal) {
+      assert.equal(command, "paplay"); played.push(path.basename(args.at(-1)!))
+      let finish!: () => void
+      const result = new Promise<ProcessResult>(resolve => { finish = () => resolve({ code: 0, stdout: "" }) })
+      held.push(finish); signal.addEventListener("abort", finish, { once: true })
+      return { result, cancel: finish }
+    }, dispose() { for (const finish of held) finish() },
+  }
+  const config = parseNotificationConfig({ notificationSoundDirectory: directory, staleReminderSeconds: 0,
+    notifications: { approved: { banner: false }, ended: { banner: false }, question: { banner: false } } })
+  const backend = new LinuxNotifications(config, () => {}, processes, null)
+  const policy = new NotificationPolicy(config, true, backend)
+  t.after(() => policy.dispose())
+  const target = { root: "root", sessionID: "root", title: "Fixture" }
+  policy.approved({ id: "p", sessionID: "root", permission: "bash", patterns: [], always: [], metadata: {} }, target)
+  policy.turn("ended", "turn", target)
+  const deadline = performance.now() + 2000
+  while (played.length < 2 && performance.now() < deadline) await settle()
+  assert.equal(played.length, 2)
+  policy.pending(new Map([["root", { kind: "question", id: "q" }]])); policy.question("q", target, true)
+  await settle(); assert.equal(played.length, 2)
+  if (outcome === "resolution") policy.resolved("question", "q")
+  if (outcome === "preemption") policy.pending(new Map([["root", { kind: "permission", id: "earlier" }]]))
+  if (outcome === "deletion") policy.deleted("root")
+  const disposing = outcome === "disposal" ? policy.dispose() : undefined
+  held[0]!(); held[1]!()
+  const end = performance.now() + 2000
+  if (outcome === "play") while (played.length < 3 && performance.now() < end) await settle()
+  else await settle()
+  assert.equal(played.includes("question.wav"), outcome === "play")
+  held[2]?.(); await disposing
+})
+
+test("a newer action aborts an old held activation before any old navigation", async () => {
+  const f = fakeProcesses(), clicks: string[] = []
+  const start = f.processes.start
+  let release!: () => void, oldSignal!: AbortSignal, held = false
+  f.processes.start = (command, args, ms, signal, line) => {
+    if (!held && args.includes("org.gnome.Shell.SearchProvider2.GetSubsearchResultSet")) {
+      held = true; oldSignal = signal
+      const result = new Promise<ProcessResult>(resolve => { release = () => resolve({ code: 0, stdout: `(['${identity.screen}'],)` }) })
+      return { result, cancel() {} }
+    }
+    return start(command, args, ms, signal, line)
+  }
+  const backend = new LinuxNotifications({ notify: true, notifySound: false }, id => clicks.push(id), f.processes, identity)
+  for (const sessionID of ["old", "new"]) await backend.show({ ...message, sessionID }, new AbortController().signal)
+  const banners = f.calls.filter(c => c.command === "notify-send")
+  banners[0]!.line!("41"); banners[0]!.line!("default"); banners[0]!.finish({ code: 0, stdout: "" }); await settle()
+  banners[1]!.line!("42"); banners[1]!.line!("default"); banners[1]!.finish({ code: 0, stdout: "" }); await settle()
+  assert.equal(oldSignal.aborted, true); assert.deepEqual(clicks, [])
+  release(); await settle(); assert.deepEqual(clicks, ["new"])
+  await backend.dispose()
 })

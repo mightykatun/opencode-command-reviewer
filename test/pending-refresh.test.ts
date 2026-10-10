@@ -65,7 +65,7 @@ test("refresh bursts coalesce into one follow-up without discarding a valid acti
   assert.deepEqual(f.state.snapshots.map((value) => value.requests[0]?.id), ["first", "fresh"])
 })
 
-for (const outcome of ["resolve", "reject"] as const) test(`expired noncooperative read ignores its late ${outcome} during a newer refresh generation`, async (t) => {
+for (const outcome of ["resolve", "reject"] as const) test(`expired noncooperative read owns capacity until late ${outcome}, then coalesces recovery`, async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] })
   const f = fixture(t)
   const first = f.refresh.refresh()
@@ -79,7 +79,7 @@ for (const outcome of ["resolve", "reject"] as const) test(`expired noncooperati
   await first
   await settle()
   assert.equal(f.calls[0]!.signal.aborted, true)
-  assert.equal(f.calls.length, 2)
+  assert.equal(f.calls.length, 1, "a caller deadline cannot free the physical read slot")
   if (outcome === "resolve") f.calls[0]!.resolve([request("expired")])
   else f.calls[0]!.reject(new Error("late read failure"))
   await settle()

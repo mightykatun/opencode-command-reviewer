@@ -4,7 +4,12 @@ import type { HistoryTarget } from "./history-records.js"
 export const notificationKinds = ["attention", "unsafe", "question", "approved", "error", "ended"] as const
 export type NotificationKind = typeof notificationKinds[number]
 export interface NotificationInteraction { kind: "permission" | "question"; id: string }
-export type NotificationClick = (sessionID: string, history?: HistoryTarget) => void
+export interface NotificationClickLease { signal: AbortSignal; current(): boolean; commit(): void; cancel(): void }
+/** Callable convenience for synchronous fixture actions. Desktop adapters acquire
+ * begin at the action line, before waiting for token/EOF/activation. */
+export type NotificationClick = ((sessionID: string, history?: HistoryTarget) => void) & {
+  begin?: (sessionID: string, history?: HistoryTarget) => NotificationClickLease
+}
 export interface NotificationMessage {
   kind: NotificationKind
   title: string
@@ -14,7 +19,13 @@ export interface NotificationMessage {
   banner: boolean
   sound: boolean
 }
-export interface NotificationHandle { close(): void | Promise<void>; closed?: Promise<void> }
+export interface NotificationHandle {
+  close(): void | Promise<void>
+  /** Physical channel work, including queued/active audio, has settled. */
+  closed?: Promise<void>
+  /** Actual first dispatch (or terminal attempt failure), never queue admission. */
+  dispatched?: Promise<void>
+}
 export interface NotificationBackend {
   show(message: NotificationMessage, signal: AbortSignal): Promise<NotificationHandle | undefined>
   dispose(): void | Promise<void>

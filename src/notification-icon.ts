@@ -58,6 +58,7 @@ export function smallNotificationIcon(kind: NotificationKind = "ended"): Buffer 
 }
 
 export class NotificationIcon {
+  constructor(private io = { mkdtemp, writeFile, rm }) {}
   private stopped = false
   private directory?: Promise<string>
   private workers = new Map<NotificationKind, Promise<string | undefined>>()
@@ -66,13 +67,16 @@ export class NotificationIcon {
     let worker = this.workers.get(kind)
     if (!worker) {
       worker = (async () => {
-        this.directory ??= mkdtemp(path.join(tmpdir(), "opencode-reviewer-icon-"))
+        this.directory ??= this.io.mkdtemp(path.join(tmpdir(), "opencode-reviewer-icon-"))
         const directory = await this.directory
         if (this.stopped) return
         const file = path.join(directory, `${kind}.png`)
-        await writeFile(file, smallNotificationIcon(kind), { flag: "wx", mode: 0o600 })
+        await this.io.writeFile(file, smallNotificationIcon(kind), { flag: "wx", mode: 0o600 })
         return this.stopped ? undefined : file
       })()
+      // The caller's deadline callback may never run. Own rejection immediately,
+      // independently of that wait, while retaining the worker for cleanup.
+      void worker.catch(() => {})
       this.workers.set(kind, worker)
     }
     return withDeadline(signal, 1500, () => worker!).catch(() => undefined)
@@ -82,7 +86,7 @@ export class NotificationIcon {
     const worker = (async () => {
       await Promise.allSettled([...this.workers.values()])
       const directory = await this.directory?.catch(() => undefined)
-      if (directory) await rm(directory, { recursive: true, force: true }).catch(() => {})
+      if (directory) await this.io.rm(directory, { recursive: true, force: true }).catch(() => {})
     })()
     await withDeadline(new AbortController().signal, 2000, () => worker).catch(() => {})
   }

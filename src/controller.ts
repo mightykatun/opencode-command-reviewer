@@ -77,12 +77,17 @@ export class Controller {
   private acknowledgements = new Map<AbortController, { request: PermissionRequest; root?: string }>()
   private approvalWorkers = new Set<Promise<unknown>>()
   private approvalRead?: Promise<PermissionRequest[]>
+  private reconciliation = 0
+  private reconciliationPublished = false
   constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
     private options: Options = { reviewBash: true, reviewEdits: true },
     private approval?: Approval, private time: ApprovalClock = clock, private modes?: SessionModeGate,
     private approvalObserver?: ApprovalObserver, private ratingObserver?: (safe: boolean, timing: ReviewTiming) => unknown,
     private lifecycleObserver?: ReviewLifecycleObserver) {}
   get revision() { return this.version }
+  /** Notifications consume only the final pending snapshot. UI publications keep
+   * their synchronous W1 visibility/cancellation behavior during reconciliation. */
+  get reconciling() { return this.reconciliation > 0 }
   get views() { return [...this.entries.values()].map((entry) => entry.view) }
   get pendingViews() { return this.views.filter(view => !view.resolved) }
   retained(root: string, target: HistoryTarget) {
@@ -90,7 +95,10 @@ export class Controller {
     return entry?.fastApproval === "confirmed" && entry.view.status === "analyzing"
       && entry.view.request.sessionID === target.session && entry.root === root ? entry.view : undefined
   }
-  private publish() { if (!this.stopped) this.changed(this.views) }
+  private publish() {
+    if (this.reconciling) this.reconciliationPublished = true
+    if (!this.stopped) this.changed(this.views)
+  }
   private approvalFact(fact: ApprovalFact) {
     if (this.stopped) return
     try { void Promise.resolve(this.approvalObserver?.(fact)).catch(() => {}) } catch {}
@@ -502,27 +510,36 @@ export class Controller {
   /** Reject stale HTTP snapshots if permission events arrived during the request. */
   reconcile(requests: readonly PermissionRequest[], revision: number) {
     if (this.stopped || this.version !== revision) return
-    const ids = new Set(requests.map((request) => request.id))
-    for (const [id, entry] of this.entries) if (!ids.has(id) && !entry.view.resolved) this.replied(id, true, "reconciled")
-    for (const request of requests) {
-      const entry = this.entries.get(request.id)
-      if (entry?.approvalRefresh && entry.view.autoApproval?.status === "checking") {
-        entry.approvalRefresh = false
-        entry.approvalAbort = undefined
-        entry.view = { ...entry.view, autoApproval: undefined }
+    this.reconciliation++
+    try {
+      const ids = new Set(requests.map((request) => request.id))
+      for (const [id, entry] of this.entries) if (!ids.has(id) && !entry.view.resolved) this.replied(id, true, "reconciled")
+      for (const request of requests) {
+        const entry = this.entries.get(request.id)
+        if (entry?.approvalRefresh && entry.view.autoApproval?.status === "checking") {
+          entry.approvalRefresh = false
+          entry.approvalAbort = undefined
+          entry.view = { ...entry.view, autoApproval: undefined }
+          this.publish()
+        }
+        if (entry?.view.autoApproval?.status === "failed" && !entry.view.approvalPendingConfirmed) {
+          entry.view = { ...entry.view, approvalPendingConfirmed: true }
+          this.publish()
+        }
+        if (entry && !entry.root) entry.gateRevision = this.version
+        if (entry?.view.status === "suspended" && (entry.suspension === "unavailable" || !entry.root || this.modes?.enabled(entry.root))) {
+          // A failed saved-mode read is unknown, not a cached disabled choice.
+          // Only an accepted fresh snapshot may retry the gate, never enrichment directly.
+          this.entries.delete(request.id)
+        }
+        this.asked(request)
+      }
+    } finally {
+      this.reconciliation--
+      if (!this.reconciling && this.reconciliationPublished) {
+        this.reconciliationPublished = false
         this.publish()
       }
-      if (entry?.view.autoApproval?.status === "failed" && !entry.view.approvalPendingConfirmed) {
-        entry.view = { ...entry.view, approvalPendingConfirmed: true }
-        this.publish()
-      }
-      if (entry && !entry.root) entry.gateRevision = this.version
-      if (entry?.view.status === "suspended" && (entry.suspension === "unavailable" || !entry.root || this.modes?.enabled(entry.root))) {
-        // A failed saved-mode read is unknown, not a cached disabled choice.
-        // Only an accepted fresh snapshot may retry the gate, never enrichment directly.
-        this.entries.delete(request.id)
-      }
-      this.asked(request)
     }
   }
 

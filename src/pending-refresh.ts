@@ -14,7 +14,8 @@ export class PendingRefresh {
   private generation = 0
   private abort = new AbortController()
   private signal: AbortSignal
-  constructor(private pending: PendingState, private read: (signal: AbortSignal) => Promise<PermissionRequest[]>, parent: AbortSignal) {
+  constructor(private pending: PendingState, private read: (signal: AbortSignal) => Promise<PermissionRequest[]>, parent: AbortSignal,
+    private health?: (healthy: boolean) => void) {
     this.signal = AbortSignal.any([parent, this.abort.signal])
   }
 
@@ -24,18 +25,28 @@ export class PendingRefresh {
     this.syncing = true
     const generation = ++this.generation
     const revision = this.pending.revision
+    let worker: Promise<PermissionRequest[]> | undefined
+    const report = (healthy: boolean) => { if (!this.stopped && !this.signal.aborted) { try { this.health?.(healthy) } catch {} } }
     try {
-      const requests = await withDeadline(this.signal, 5000, this.read, "Pending permission refresh")
-      if (this.stopped || this.signal.aborted || this.generation !== generation || this.pending.revision !== revision) return
+      const requests = await withDeadline(this.signal, 5000, signal => worker = Promise.resolve().then(() => {
+        signal.throwIfAborted(); return this.read(signal)
+      }), "Pending permission refresh")
+      if (this.stopped || this.signal.aborted || this.generation !== generation || this.pending.revision !== revision) { report(false); return }
       this.pending.reconcile(requests, revision)
-    } catch { /* A later refresh retries the read; permission controls stay native. */ }
+      report(true)
+    } catch { report(false) }
     finally {
-      if (this.generation === generation) {
-        this.syncing = false
-        const again = this.again
-        this.again = false
-        if (again) void this.refresh()
+      const release = () => {
+        if (this.generation === generation) {
+          this.syncing = false
+          const again = this.again
+          this.again = false
+          if (again) void this.refresh()
+        }
       }
+      // Caller completion is bounded; physical settlement owns admission.
+      if (worker) void worker.then(release, release)
+      else release()
     }
   }
 

@@ -43,7 +43,7 @@ import { createEffect } from 'solid-js'
 const file = ${JSON.stringify(observations)}
 export default { id: 'history-render-probe', tui: async (api, options) => {
   const records = { renders: [], diagnostics: [], toggles: [], replies: [], notifications: [], gates: [], clicks: [], dropped: 0 }
-  let approvalClick
+  let approvalClick, deferredClick
   const clickApproval = () => {
     const approved = records.notifications.find(event => event.kind === 'approved')
     if (!approved || !approvalClick) return
@@ -74,7 +74,11 @@ export default { id: 'history-render-probe', tui: async (api, options) => {
   { key: 'f10', cmd: async () => {
     if (!records.other) records.other = (await api.client.session.create({ directory: api.state.path.directory, title: 'Other notification conversation' }, { throwOnError: true })).data.id
     api.route.navigate('session', { sessionID: records.other }); void persist()
-  } }] })
+  } }, { key: 'f11', cmd: () => {
+    const approved = records.notifications.find(event => event.kind === 'approved')
+    deferredClick = approvalClick.begin(approved.sessionID)
+    records.clicks.push({ phase: 'new-action-before-activation' }); void persist()
+  } }, { key: 'f12', cmd: () => { deferredClick.commit(); records.clicks.push({ phase: 'new-action-committed' }); void persist() } }] })
   const offClick = api.keymap.registerLayer({ priority: 200, mode: 'modal', bindings: [{ key: 'f9', cmd: clickApproval }] })
   api.event.on('permission.replied', event => { records.replies.push({ at: performance.now(), ...event.properties }); void persist() })
   const observe = event => {
@@ -349,12 +353,8 @@ try {
     const before = (await data()).notifications
     const callsBeforeReplay = calls.length
     assert.equal(before.filter(event => event.kind === "approved" && event.sound).length, 1)
-    const attention = before.filter(event => event.kind === "attention")
-    assert.ok(attention.length <= 1)
-    for (const event of attention) {
-      assert.ok(event.at >= validated.at + 900 && event.at <= ready.at,
-        "only the existing one-second final-render grace may notify before countdown; countdown stays silent")
-    }
+    assert.deepEqual(before.filter(event => event.kind === "attention"), [],
+      "Safe requests awaiting rendering/history-covered countdown stay silent")
     send("Left")
     await until(s => s.includes(`${Math.max(1, total - 1)}/${total}`))
     send("Right"); await until(s => s.includes(`${total}/${total}`))
@@ -385,12 +385,25 @@ try {
       send("Right"); await until(s => s.includes("2/2") && s.includes("Saved history " + newer))
       send("F9"); await until(s => s.includes("1/2") && s.includes("COVERED LIVE REPORT"))
       send("Escape"); await until(s => !s.includes("Analysis history"))
+      const oldRow = sql.db.prepare("SELECT * FROM history WHERE permission=?").get(approved.history.permission)
       sql.db.prepare("DELETE FROM history WHERE permission=?").run(approved.history.permission)
       send("F10"); await until(async () => (await data()).route === (await data()).other)
       send("F9"); await until(async () => (await data()).route === approved.sessionID)
       await sleep(5500)
       assert.doesNotMatch(capture(), /Analysis history|Saved history/)
       await save("notification-missing")
+      // Start another hidden save wait, then receive a newer ordinary action
+      // before its desktop activation/EOF completes. Restoring the old row must
+      // not reveal its panel while that newer action is still outstanding.
+      send("F9"); await until(async () => (await data()).clicks.length === 4)
+      send("F11"); await until(async () => (await data()).clicks.some(e => e.phase === "new-action-before-activation"))
+      const columns = Object.keys(oldRow)
+      sql.db.prepare(`INSERT INTO history (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`).run(...Object.values(oldRow))
+      await sleep(1200)
+      assert.doesNotMatch(capture(), /Analysis history|COVERED LIVE REPORT/, "a new action must immediately invalidate the old save/reveal")
+      send("F12"); await until(async () => (await data()).clicks.some(e => e.phase === "new-action-committed"))
+      await save("notification-new-action-cancels-save")
+      sql.db.prepare("DELETE FROM history WHERE permission=?").run(approved.history.permission)
       send("F6"); await until(s => s.includes("Saved history " + newer) && s.includes("1/1"))
     }
     assert.deepEqual((await data()).notifications, before, "history replay creates no notification birth or sound")

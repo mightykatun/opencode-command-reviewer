@@ -295,7 +295,7 @@ terminal is focused:
   automatic approval, including fast mode while its report is still streaming.
   Positive and zero delays also notify on success; the countdown is silent.
   Approval sounds are limited to
-  one every two seconds; every eligible banner is retained for delivery.
+  one every two seconds, including delayed playback.
 - **Session error:** an unrecovered session/provider failure, not a review failure.
 - **Session ended:** a completed root-agent response, not a question/permission
   pause or an explicit user interruption.
@@ -319,7 +319,8 @@ Sound-only delivery does not require a desktop banner or delivery acknowledgemen
 Invalid notification settings disable notification work without disabling reviews.
 
 Pending permissions and questions repeat after `staleReminderSeconds`, measured
-from initial dispatch, even if desktop delivery fails. Reminders replace their
+from actual initial dispatch, even if desktop delivery fails. Capacity waiting
+does not start the reminder clock or replace an undelivered initial alert. Reminders replace their
 previous banner and append **(Reminder)** to the event text, reusing the same
 sound, icon, session heading and click target. Only the native front-of-queue
 interaction per root conversation repeats: permissions precede questions, with
@@ -362,6 +363,18 @@ Audio is prepared before showing its banner and played from the normalized cache
 with a low-latency buffer; preparation never blocks permission approval.
 `stdbuf` makes delivery acknowledgements immediate instead of waiting for
 `notify-send` to flush its output when the banner closes.
+Delivery is bounded: up to 64 active tickets (48 routine), 256 waiting actionable
+episodes, and 128 waiting routine events. A full routine backlog drops new
+approval/error/completion events; already admitted events retain their exact
+targets. Actionable attention/Unsafe/question work has priority, rotating among
+roots; after eight actionable dispatches, waiting routine work gets a turn.
+Each root has only its current actionable episode, and waiting reminders coalesce.
+The process pool allows 24 children: 20 banners (16 routine), two players, one
+withdrawal and one activation. Audio preparation has two actual-operation slots;
+audio waiting is bounded to 64 requests. Cancellation and timeouts do not free
+physical slots until their operations settle. Queued actionable work is canceled
+when its request resolves or loses native queue ownership. Desktop/process
+failures remain best-effort and do not delay permission approval.
 Disable overlapping notification plugins to avoid duplicate alerts.
 </details>
 

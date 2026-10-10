@@ -6,9 +6,13 @@ import { notificationClock, notificationText, type NotificationBackend, type Not
   type NotificationHandle, type NotificationKind, type NotificationMessage, type NotificationInteraction } from "./notification-types.js"
 import { withDeadline } from "./deadline.js"
 import type { HistoryTarget } from "./history-records.js"
+import { actionable, NotificationQueue } from "./notification-queue.js"
 
 interface Target { root: string; sessionID: string; title: string }
-interface Banner { abort: AbortController; handle?: NotificationHandle; target: Target; expire?: () => void }
+interface Banner {
+  abort: AbortController; handle?: NotificationHandle; target: Target; expire?: () => void
+  root: string; attention: boolean; message: NotificationMessage; attempted?: () => void
+}
 interface Pending {
   identity: NotificationInteraction
   target: Target
@@ -44,6 +48,9 @@ export class NotificationPolicy {
   private views = new Map<string, View>()
   private blockers = new Map<string, NotificationInteraction>()
   private banners = new Set<Banner>()
+  private active = new Set<Banner>()
+  private queue = new NotificationQueue<Banner>(256, 128)
+  private draining = false
   private stopped = false
   private lastApprovalSound = -Infinity
   constructor(private config: NotificationConfig, private auto: boolean,
@@ -108,10 +115,9 @@ export class NotificationPolicy {
       remaining -= Math.max(0, now - at) / 1000; at = now
       if (remaining > 0) { schedule(); return }
       this.withdraw(entry.banner)
-      entry.banner = this.dispatch({ ...message, title: uiText.notifications.reminder(message.title) }, entry.target)
-      // No catch-up burst after a stalled event loop or suspended machine.
-      remaining = this.config.staleReminderSeconds
-      schedule()
+      entry.reminder = undefined
+      entry.banner = this.dispatch({ ...message, title: uiText.notifications.reminder(message.title) }, entry.target,
+        () => { if (entry.message === message) this.remind(entry) })
     }
     entry.reminder = () => { stopped = true; cancel?.() }
     schedule()
@@ -121,10 +127,10 @@ export class NotificationPolicy {
     banner.expire?.()
     banner.abort.abort()
     if (banner.handle) { try { void Promise.resolve(banner.handle.close()).catch(() => {}) } catch {} }
-    this.banners.delete(banner)
+    if (!this.active.has(banner)) this.release(banner)
+    else if (banner.handle && !banner.handle.closed) this.release(banner)
   }
   private show(kind: NotificationKind, title: string, target: Target, history?: HistoryTarget): Banner | undefined {
-    if (this.banners.size >= 64) return
     const message = this.message(kind, title, target)
     return message ? this.dispatch(history ? { ...message, history: { ...history } } : message, target) : undefined
   }
@@ -139,28 +145,50 @@ export class NotificationPolicy {
     if (!controls.banner && !sound) return
     return { kind, title, body: notificationText(target.title), sessionID: target.sessionID, banner: controls.banner, sound }
   }
-  private dispatch(message: NotificationMessage, target: Target): Banner | undefined {
-    if (this.stopped || this.banners.size >= 64) return
-    const banner: Banner = { abort: new AbortController(), target }
+  private dispatch(message: NotificationMessage, target: Target, attempted?: () => void): Banner | undefined {
+    if (this.stopped) return
+    const banner: Banner = { abort: new AbortController(), target, root: target.root, attention: actionable(message.kind), message, attempted }
+    // Routine overflow is an explicit terminal drop. Actionable intents have one
+    // current episode per tracked root, independent of the 64 active tickets.
+    if (!this.queue.add(banner)) return
     this.banners.add(banner)
-    // Dispatch off the controller's publication stack; failures never propagate.
-    void Promise.resolve().then(() => {
-      if (banner.abort.signal.aborted || this.stopped) return
-      return this.backend.show(message, banner.abort.signal)
-    }).then((handle) => {
+    this.drain()
+    return banner
+  }
+  private release(banner: Banner) {
+    banner.expire?.(); this.queue.remove(banner); this.active.delete(banner); this.banners.delete(banner); this.drain()
+  }
+  private drain() {
+    if (this.stopped || this.draining) return
+    this.draining = true
+    queueMicrotask(() => {
+      this.draining = false
+      if (this.stopped) return
+      let banner: Banner | undefined
+      while (this.active.size < 64 && (banner = this.queue.take(value => value.attention || [...this.active].filter(v => !v.attention).length < 48))) {
+        this.active.add(banner); void this.deliver(banner)
+      }
+    })
+  }
+  private async deliver(banner: Banner) {
+    let attempted = false
+    const attempt = () => {
+      if (attempted || this.stopped || banner.abort.signal.aborted) return
+      attempted = true
+      banner.expire = this.clock.after(120000, () => this.withdraw(banner))
+      banner.attempted?.()
+    }
+    try {
+      if (banner.abort.signal.aborted || this.stopped) { this.release(banner); return }
+      const handle = await this.backend.show(banner.message, banner.abort.signal)
       banner.handle = handle
       if (banner.abort.signal.aborted || this.stopped) this.withdraw(banner)
-      else if (!handle) { banner.expire?.(); this.banners.delete(banner) }
-      else if (handle.closed) {
-        const release = () => { banner.expire?.(); this.banners.delete(banner) }
-        void handle.closed.then(release, release)
-      }
-    }).catch(() => this.withdraw(banner))
-    // Bound non-persistent click ownership even on desktops ignoring expiry.
-    const cancel = this.clock.after(120000, () => this.withdraw(banner))
-    banner.expire = cancel
-    banner.abort.signal.addEventListener("abort", cancel, { once: true })
-    return banner
+      if (handle?.dispatched) void handle.dispatched.then(attempt, attempt)
+      else attempt()
+      if (handle?.closed) await handle.closed
+      else if (handle && !banner.abort.signal.aborted) return // legacy embedding owns close/expiry
+    } catch { attempt(); this.withdraw(banner) }
+    this.release(banner)
   }
   private attention(entry: Pending, kind: "attention" | "unsafe" | "question" = "attention") {
     if (entry.phase === "attention" && entry.message?.kind === kind) return
@@ -168,8 +196,8 @@ export class NotificationPolicy {
     this.withdraw(entry.banner)
     entry.phase = "attention"
     entry.message = this.message(kind, uiText.notifications[kind], entry.target)
-    entry.banner = entry.message ? this.dispatch(entry.message, entry.target) : undefined
-    this.remind(entry)
+    const message = entry.message
+    entry.banner = message ? this.dispatch(message, entry.target, () => { if (entry.message === message) this.remind(entry) }) : undefined
   }
   private wait(entry: Pending) {
     this.stopReminder(entry)
@@ -213,7 +241,8 @@ export class NotificationPolicy {
     if (this.remember(`turn:${target.root}:${id}`)) this.show(kind, uiText.notifications[kind], target)
   }
   deleted(sessionID: string) {
-    for (const banner of this.banners) if (banner.target.root === sessionID || banner.target.sessionID === sessionID) this.withdraw(banner)
+    for (const banner of this.banners) if (banner.target.root === sessionID || banner.target.sessionID === sessionID
+      || banner.message.history?.session === sessionID) this.withdraw(banner)
     for (const [id, entry] of this.permissions) if (entry.target.root === sessionID || entry.target.sessionID === sessionID) this.resolved("permission", id)
     for (const [id, entry] of this.questions) if (entry.target.root === sessionID || entry.target.sessionID === sessionID) this.resolved("question", id)
   }

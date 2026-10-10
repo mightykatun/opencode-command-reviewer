@@ -1,0 +1,105 @@
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import { setImmediate as settle } from "node:timers/promises"
+import { open } from "node:fs/promises"
+import { NotificationAudio } from "../src/notification-audio.js"
+import { NotificationProcessPool, type NotificationProcesses, type ProcessResult, type ProcessScheduling } from "../src/notification-process.js"
+import { NotificationQueue } from "../src/notification-queue.js"
+import { fixtureWav } from "./notification-fixtures.js"
+
+function transport() {
+  const calls: { command: string; args: readonly string[]; signal: AbortSignal; finish(): void }[] = []
+  const raw: NotificationProcesses = {
+    start(command, args, _ms, signal) {
+      let finish!: () => void
+      const result = new Promise<ProcessResult>(resolve => { finish = () => resolve({ code: 0, stdout: "" }) })
+      calls.push({ command, args, signal, finish })
+      return { result, cancel() {} } // deliberately noncooperative until physical settlement
+    }, dispose() { for (const call of calls) call.finish() },
+  }
+  return { raw, calls }
+}
+
+test("process capacity owns 24 physical children, queues the next banner and reserves both control lanes", async () => {
+  const f = transport(), pool = new NotificationProcessPool(f.raw)
+  const signal = new AbortController().signal
+  const start = (id: string, lane: ProcessScheduling["lane"] = "banner", attention = true) =>
+    pool.start("fixture", [id], 120000, signal, undefined, { lane, root: id, attention })!
+  const banners = Array.from({ length: 20 }, (_, i) => start(String(i)))
+  const later = start("later")
+  start("audio1", "audio"); start("audio2", "audio"); start("withdraw", "close"); start("click", "activation")
+  await settle()
+  assert.equal(f.calls.length, 24)
+  assert.ok(f.calls.some(c => c.args[0] === "withdraw")); assert.ok(f.calls.some(c => c.args[0] === "click"))
+  assert.ok(!f.calls.some(c => c.args[0] === "later"))
+  banners[0]!.cancel(); await settle()
+  assert.equal(f.calls.length, 24, "abort is not child close")
+  f.calls.find(c => c.args[0] === "0")!.finish(); await settle()
+  assert.equal(f.calls.length, 25); assert.equal(await later.started, true)
+  pool.dispose(); await later.result
+})
+
+test("routine banners leave actionable capacity and queued cancellation never dispatches", async () => {
+  const f = transport(), pool = new NotificationProcessPool(f.raw), signal = new AbortController().signal
+  for (let i = 0; i < 20; i++) pool.start("fixture", [String(i)], 100, signal, undefined, { lane: "banner", attention: false })
+  await settle(); assert.equal(f.calls.length, 16)
+  const abort = new AbortController()
+  const cancelled = pool.start("fixture", ["cancelled"], 100, abort.signal, undefined, { lane: "banner" })!
+  abort.abort(); await cancelled.result
+  pool.start("fixture", ["urgent"], 100, signal, undefined, { lane: "banner", attention: true })
+  await settle(); assert.equal(f.calls.at(-1)?.args[0], "urgent")
+  pool.dispose(); assert.ok(!f.calls.some(c => c.args[0] === "cancelled"))
+})
+
+test("bounded priority rotates roots and services a routine item after eight actionable items", () => {
+  const queue = new NotificationQueue<{ root: string; attention: boolean; id: string }>(30, 2)
+  for (const root of ["a", "b", "c"]) for (let i = 0; i < 9; i++) assert.equal(queue.add({ root, attention: true, id: root + i }), true)
+  queue.add({ root: "r", attention: false, id: "routine" })
+  const selected = Array.from({ length: 9 }, () => queue.take()!.id)
+  assert.deepEqual(selected, ["a0", "b0", "c0", "a1", "b1", "c1", "a2", "b2", "routine"])
+  assert.equal(queue.add({ root: "r", attention: false, id: "r1" }), true)
+  assert.equal(queue.add({ root: "r", attention: false, id: "r2" }), true)
+  assert.equal(queue.add({ root: "r", attention: false, id: "overflow" }), false)
+})
+
+test("sound preparation reserves two slots before deferred callbacks and retains them after timeout", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const f = transport(), writes: (() => void)[] = []
+  const sound = { format: "wav" as const, data: fixtureWav().toString("base64") }
+  const audio = new NotificationAudio(f.raw, undefined, { attention: sound, unsafe: sound, question: sound }, {
+    open, mkdtemp: (async () => "/fixture-sounds") as never,
+    writeFile: () => new Promise<void>(resolve => writes.push(resolve)), rm: async () => {},
+  })
+  const signal = new AbortController().signal
+  const waits = [audio.ready("attention", signal), audio.ready("unsafe", signal), audio.ready("question", signal)]
+  for (let i = 0; i < 20 && writes.length < 2; i++) await settle()
+  assert.equal(writes.length, 2)
+  t.mock.timers.tick(2000); await settle()
+  assert.equal(await waits[0], false); assert.equal(await waits[1], false)
+  assert.equal(writes.length, 2, "timed-out writes still own preparation slots")
+  writes[0]!()
+  for (let i = 0; i < 20 && writes.length < 3; i++) await settle()
+  assert.equal(writes.length, 3)
+  writes[1]!(); writes[2]!(); assert.equal(await waits[2], true)
+  await audio.dispose()
+})
+
+test("approval playback spacing begins at actual player dispatch after cold preparation", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  let now = 0, release!: () => void
+  t.mock.method(performance, "now", () => now)
+  const f = transport()
+  const audio = new NotificationAudio(f.raw, undefined, { approved: { format: "wav", data: fixtureWav().toString("base64") } }, {
+    open, mkdtemp: (async () => "/fixture") as never,
+    writeFile: () => new Promise<void>(resolve => { release = resolve }), rm: async () => {},
+  })
+  const first = audio.play("approved", new AbortController().signal), second = audio.play("approved", new AbortController().signal)
+  for (let i = 0; i < 20 && !release; i++) await settle()
+  now = 1800; t.mock.timers.tick(1800); release(); await settle()
+  assert.equal(f.calls.length, 1)
+  now = 2000; t.mock.timers.tick(200); await settle(); assert.equal(f.calls.length, 1)
+  now = 3799; t.mock.timers.tick(1799); await settle(); assert.equal(f.calls.length, 1)
+  now = 3800; t.mock.timers.tick(1); await settle(); assert.equal(f.calls.length, 2)
+  for (const call of f.calls) call.finish()
+  await Promise.all([first, second]); await audio.dispose()
+})

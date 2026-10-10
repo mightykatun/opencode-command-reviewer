@@ -1,7 +1,8 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { inflateSync } from "node:zlib"
-import { smallNotificationIcon } from "../src/notification-icon.js"
+import { smallNotificationIcon, NotificationIcon } from "../src/notification-icon.js"
+import { setImmediate as settle } from "node:timers/promises"
 
 test("status PNGs have centered colored glyphs, smooth edges and balanced transparent padding", () => {
   const shapes = new Set<string>()
@@ -35,4 +36,20 @@ test("status PNGs have centered colored glyphs, smooth edges and balanced transp
     shapes.add(JSON.stringify(positions))
   }
   assert.equal(shapes.size, 5, "Unsafe shares the attention exclamation shape, with its own red color")
+})
+
+for (const stage of ["directory", "write"] as const) test(`W4: immediate icon cancellation owns late ${stage} rejection`, async () => {
+  let reject!: (error: Error) => void, removed = 0
+  const failure = new Promise<never>((_resolve, no) => { reject = no })
+  const icon = new NotificationIcon({
+    mkdtemp: (() => stage === "directory" ? failure : Promise.resolve("/fixture-icon")) as never,
+    writeFile: () => failure,
+    rm: async () => { removed++ },
+  })
+  const abort = new AbortController()
+  const result = icon.file(abort.signal); abort.abort()
+  assert.equal(await result, undefined)
+  reject(new Error("simulated ENOSPC")); await settle()
+  await icon.dispose()
+  assert.equal(removed, stage === "directory" ? 0 : 1)
 })

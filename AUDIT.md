@@ -27,14 +27,15 @@ Implementation starts from `0aaf9d6`. Checkboxes require passing evidence, not a
   - [x] Separate local maintenance progress from external invalidation; prove linear cleanup and healthy reconciliation.
   - [x] Bound/coalesce actual ancestry operations through timeout, reopen, late settlement, and disposal.
   - [x] Pass SQLite/controller composition tests and storage/maintenance/statistics/mode host fixtures; record outputs.
-  - [ ] Commit the verified W3 checkpoint.
-- [ ] W4: notification admission, delivery, and navigation (A10-A15)
-  - [ ] Own icon-worker rejection immediately and retain eventual cleanup.
-  - [ ] Recover only eligible event-born question admission after metadata/capacity recovery.
-  - [ ] Gate questions on healthy permission ordering and publish reconciliation atomically.
-  - [ ] Schedule bounded actionable audio and banner/process work with explicit overflow, fairness, and abort ownership.
-  - [ ] Acquire click generation at action receipt and invalidate superseded activation/navigation.
-  - [ ] Pass notification composition/saturation/race tests and queue/fast/history host fixtures; record outputs and commit.
+  - [x] Commit the verified W3 checkpoint: `92e0bd5`.
+- [x] W4: notification admission, delivery, and navigation (A10-A15)
+  - [x] Own icon-worker rejection immediately and retain eventual cleanup.
+  - [x] Recover only eligible event-born question admission after metadata/capacity recovery.
+  - [x] Gate questions on healthy permission ordering and publish reconciliation atomically.
+  - [x] Schedule bounded actionable audio and banner/process work with explicit overflow, fairness, and abort ownership.
+  - [x] Acquire click generation at action receipt and invalidate superseded activation/navigation.
+  - [x] Pass notification composition/saturation/race tests and queue/fast/history host fixtures; record outputs.
+  - [ ] Commit the verified W4 checkpoint.
 - [ ] W5: publication and archive correctness (A16, A17, A25)
   - [ ] Bind explicit signed provenance to verified release source/archive and independent workflow identity, with offline actual-npm coverage.
   - [ ] Preserve pending release runs with bounded platform queuing and unchanged semantic channel policy.
@@ -98,6 +99,23 @@ node scripts/smoke-history-auto.mjs notification     PASS .runtime/w3-host-histo
 ```
 
 W3 interface contract: `AncestryRead = Promise<string> & { settled?: Promise<void> }` preserves caller deadlines separately from actual traversal cleanup; forwarding functions retain the original handle. `SessionModes` allows two actual traversals, coalesces same-session reads, and does not release ownership on caller timeout. Browser/statistics retain one active lookup and the newest replacement. The extended statistics host fixture recorded one read per held session, maximum concurrency one, two aborted callers, and zero outstanding reads after recovery (`.runtime/statistics/ancestry.json`). Maintenance now distinguishes publication invalidation from external scan invalidation; local cleanup preserves its cursor and requires durable deletion plus a healthy confirming pass.
+
+**W4:** seven initial targeted regressions failed before their fixes. Final notification/pending-refresh/approval/fast/controller suite passed **369/369**. `npm run check` passed typecheck, **981 source tests**, **77 helpers**, and build; diff checks passed. An intermediate aggregate run hit `History storage unavailable` in unchanged concurrent SQLite initialization; isolated rerun and the subsequent full aggregate passed without weakening storage assertions.
+
+```text
+node scripts/smoke-notification-w4.mjs baseline                         PASS held permission baseline then one eligible question
+node scripts/smoke-notification-w4.mjs capacity                         PASS 70 approvals and actionable audio through saturation
+node scripts/smoke-notification-w4.mjs click                            PASS older delayed EOF cannot override newer action
+node scripts/smoke-notification-queue.mjs main --stream                 PASS 3 automatic approvals, no attention
+node scripts/smoke-notification-queue.mjs children --stream             PASS 2 automatic approvals, no attention
+node scripts/smoke-notification-queue.mjs mixed --stream                PASS 1 automatic/2 manual, ordered alerts
+node scripts/smoke-fast-mode.mjs complete                              PASS retained response and exact live/history target
+node scripts/smoke-history-auto.mjs notification                       PASS exact target and immediate superseded save/reveal cancellation
+node scripts/smoke-notification-events.mjs question --reminders --queue --sound-only
+                                                                      PASS sound-only handoff/reminders/resolution cleanup
+```
+
+W4 evidence: `.runtime/notification-w4-{baseline,capacity,click}/results.json`, `.runtime/notification-queue-{main,children,mixed}-stream.json`, `.runtime/fast-mode-complete/results.json`, `.runtime/history-auto-notification/results.json`, and `.runtime/notification-question-reminders-queue-sound-only.json`. Process I/O was isolated; these are not physical sound/focus claims. Delivery bounds are 64 active tickets (48 routine), 256 waiting actionable episodes, 128 waiting routine events, 24 children split into 20 banners (16 routine), two players, one withdrawal, and one activation. Audio has two actual preparations and 64 waiting plays. Actionable work rotates roots, yielding to routine work after eight actionable dispatches. Routine backlog overflow drops new routine events explicitly; README describes this policy. Click leases begin at action receipt, and initial permission baseline readiness is explicit. Pending-refresh and ancestry slots retain actual settlement ownership.
 
 ## 1. Scope, provenance, and status
 

@@ -3,7 +3,7 @@ import { uiText } from "./ui-text.js"
 import type { Message, PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2"
 import type { ApprovalFact, View } from "./controller.js"
 import type { NotificationPolicy } from "./notification-policy.js"
-import { notificationClock, type NotificationClock } from "./notification-types.js"
+import { notificationClock, type NotificationClock, type NotificationClickLease } from "./notification-types.js"
 import { notificationBlockers, type PendingInteraction } from "./notification-order.js"
 import { withDeadline } from "./deadline.js"
 import type { HistoryTarget } from "./history-records.js"
@@ -16,6 +16,7 @@ interface Request {
   target?: Target
   root?: string
   resolving?: boolean
+  retryAt?: number
 }
 interface Root {
   since: number
@@ -34,7 +35,7 @@ export class NotificationHost {
   private visiting = new Map<string, number>()
   private permissions = new Map<string, Request>()
   private questions = new Map<string, Request>()
-  private dispatched = new Map<string, { target: Target; automatic: boolean }>()
+  private dispatched = new Map<string, { target: Target; session: string; automatic: boolean }>()
   private closed = new Set<string>()
   private views: readonly View[] = []
   private subscriptions: (() => void)[] = []
@@ -47,17 +48,20 @@ export class NotificationHost {
   private deletedSessions = new Set<string>()
   private questionSnapshot: readonly Pick<QuestionRequest, "id" | "sessionID">[] = []
   private questionsReady = false
+  private permissionsReady = false
+  private admissionQueued = false
   private questionRevision = 0
   private questionRead = false
   private questionPoll?: () => void
   private abort = new AbortController()
-  private pendingClick?: { sessionID: string; history: HistoryTarget; route: string }
+  private pendingClick?: { sessionID: string; history?: HistoryTarget; route: string; lease: NotificationClickLease }
+  private clickOwner?: { sessionID: string; history?: HistoryTarget; route: string; lease: NotificationClickLease }
   private clickWait?: () => void
   constructor(private api: HostApi, private policy: NotificationPolicy,
     private resolveRoot: AncestryReader,
     private readQuestions: (signal: AbortSignal) => Promise<readonly QuestionRequest[]>,
     private clock: NotificationClock = notificationClock,
-    private openHistory?: (sessionID: string, target: HistoryTarget) => void) {
+    private openHistory?: (sessionID: string, target: HistoryTarget, lease: NotificationClickLease) => void) {
     const on = api.event.on
     this.subscriptions.push(
       on("permission.asked", e => this.asked("permission", e.properties)),
@@ -90,6 +94,7 @@ export class NotificationHost {
         for (const [id, request] of this.questions) this.admit("question", id, request)
         this.selectBlockers()
       }),
+      on("session.updated", () => { this.admissions(); this.selectBlockers() }),
     )
     this.pollQuestions()
   }
@@ -118,6 +123,7 @@ export class NotificationHost {
       this.questionsReady = true
       const ids = new Set(requests.map(r => r.id))
       for (const id of this.questions.keys()) if (!ids.has(id)) this.resolved("question", id)
+      this.admissions()
       this.selectBlockers()
     } catch {
       if (!this.stopped) { this.questionsReady = false; this.selectBlockers() }
@@ -136,7 +142,8 @@ export class NotificationHost {
     for (const [id, request] of this.permissions) add("permission", id, request.sessionID)
     // Public list snapshots establish ordering and reconciliation, never births.
     // Without a healthy baseline an unseen question could be ahead of a fresh one.
-    if (this.questionsReady) {
+    const unknownPermission = [...pending.values()].some(value => !this.api.state.session.get(value.sessionID))
+    if (this.questionsReady && this.permissionsReady && !unknownPermission) {
       for (const request of this.questionSnapshot) add("question", request.id, request.sessionID)
       for (const [id, request] of this.questions) add("question", id, request.sessionID)
     }
@@ -164,6 +171,7 @@ export class NotificationHost {
       await read?.settled?.catch(() => {})
       if (this.ancestry.get(id) === worker) this.ancestry.delete(id)
       this.lookups--
+      this.admissions()
     }
     void worker.then(release, release)
     this.ancestry.set(id, worker)
@@ -208,10 +216,10 @@ export class NotificationHost {
     // authorizes a notification. Startup snapshot-only requests never enter here.
   }
   private admit(kind: "permission" | "question", id: string, request: Request) {
-    if (request.target || this.stopped) return
+    if (request.target || this.stopped || this.deletedSessions.has(request.sessionID)) return
     const rootID = request.root ?? this.rootOf(request.sessionID)
     if (!rootID) {
-      if (request.resolving) return
+      if (request.resolving || (request.retryAt ?? 0) > this.clock.now()) return
       const lookup = this.lookup(request.sessionID)
       if (!lookup) return
       request.resolving = true
@@ -220,7 +228,7 @@ export class NotificationHost {
         if (this.stopped || entries.get(id) !== request) return
         request.root = root
         this.admit(kind, id, request)
-      }).catch(() => {}).finally(() => { request.resolving = false })
+      }).catch(() => { request.retryAt = this.clock.now() + 2000 }).finally(() => { request.resolving = false; this.selectBlockers() })
       return
     }
     const root = this.roots.get(rootID)
@@ -236,8 +244,20 @@ export class NotificationHost {
       else request.target = undefined
     }
   }
-  snapshot(views: readonly View[]) {
+  private admissions() {
+    if (this.stopped || this.admissionQueued) return
+    this.admissionQueued = true
+    queueMicrotask(() => {
+      this.admissionQueued = false
+      if (this.stopped) return
+      for (const [id, request] of this.permissions) this.admit("permission", id, request)
+      for (const [id, request] of this.questions) this.admit("question", id, request)
+      this.selectBlockers()
+    })
+  }
+  snapshot(views: readonly View[], permissionHealthy?: boolean) {
     if (this.stopped) return
+    if (permissionHealthy !== undefined) this.permissionsReady = permissionHealthy
     this.views = views
     for (const request of this.permissions.values()) if (request.target) {
       request.target.title = this.api.state.session.get(request.target.root)?.title ?? uiText.notifications.fallbackSession
@@ -252,7 +272,7 @@ export class NotificationHost {
     if (this.stopped) return
     if (fact.type === "dispatched") {
       const target = this.permissions.get(fact.request.id)?.target
-      if (target && this.dispatched.size < 1024) this.dispatched.set(fact.request.id, { target, automatic: fact.automatic })
+      if (target && this.dispatched.size < 1024) this.dispatched.set(fact.request.id, { target, session: fact.request.sessionID, automatic: fact.automatic })
     } else if (fact.type === "confirmed") {
       const dispatched = this.dispatched.get(fact.request.id)
       this.dispatched.delete(fact.request.id)
@@ -320,16 +340,33 @@ export class NotificationHost {
     })
   }
   click(sessionID: string, history?: HistoryTarget) {
-    this.clearClick()
-    if (history && this.openHistory) {
-      this.pendingClick = { sessionID, history: { ...history }, route: this.clickRoute() }
-      this.activateClick()
-      return
-    }
-    if (this.stopped || this.deletedSessions.has(sessionID) || this.api.ui.dialog.open || !this.api.state.session.get(sessionID)) return
-    this.api.route.navigate("session", { sessionID })
+    this.beginClick(sessionID, history).commit()
   }
-  private clearClick() { this.clickWait?.(); this.clickWait = undefined; this.pendingClick = undefined }
+  beginClick(sessionID: string, history?: HistoryTarget): NotificationClickLease {
+    this.clearClick()
+    const abort = new AbortController()
+    const target = { sessionID, history: history ? { ...history } : undefined, route: this.clickRoute(), lease: undefined as unknown as NotificationClickLease }
+    let committed = false
+    const lease: NotificationClickLease = {
+      signal: abort.signal,
+      current: () => !abort.signal.aborted && !this.stopped && !this.api.lifecycle.signal.aborted
+        && this.clickOwner === target && this.clickRoute() === target.route && !this.deletedSessions.has(sessionID)
+        && (!target.history || !this.deletedSessions.has(target.history.session)) && !!this.api.state.session.get(sessionID),
+      cancel: () => { abort.abort(); if (this.clickOwner === target) { this.clickWait?.(); this.clickWait = undefined; this.pendingClick = undefined; this.clickOwner = undefined } },
+      commit: () => {
+        if (committed || !lease.current()) return
+        committed = true
+        if (target.history && this.openHistory) { this.pendingClick = target; this.activateClick(); return }
+        if (this.api.ui.dialog.open) return
+        target.route = JSON.stringify(["session", sessionID])
+        this.api.route.navigate("session", { sessionID })
+      },
+    }
+    target.lease = lease; this.clickOwner = target
+    return lease
+  }
+  routeChanged() { if (this.clickOwner && this.clickRoute() !== this.clickOwner.route) this.clearClick() }
+  private clearClick() { this.clickOwner?.lease.cancel(); this.clickWait?.(); this.clickWait = undefined; this.pendingClick = undefined }
   private clickRoute() {
     const route = this.api.route.current
     return JSON.stringify([route?.name, route?.name === "session" ? route.params?.sessionID : undefined])
@@ -337,8 +374,7 @@ export class NotificationHost {
   private activateClick() {
     const target = this.pendingClick
     if (!target) return
-    if (this.stopped || this.api.lifecycle.signal.aborted || this.clickRoute() !== target.route || this.deletedSessions.has(target.sessionID)
-      || this.deletedSessions.has(target.history.session) || !this.api.state.session.get(target.sessionID)) { this.clearClick(); return }
+    if (!target.lease.current()) { this.clearClick(); return }
     if (this.api.ui.dialog.open) {
       // Only the latest click waits; keep the user's dialog intact.
       this.clickWait = this.clock.after(100, () => {
@@ -347,14 +383,15 @@ export class NotificationHost {
       })
       return
     }
-    this.clearClick()
+    this.clickWait?.(); this.clickWait = undefined; this.pendingClick = undefined
     try {
+      target.route = JSON.stringify(["session", target.sessionID])
       this.api.route.navigate("session", { sessionID: target.sessionID })
-      this.openHistory?.(target.sessionID, target.history)
+      if (target.history && target.lease.current()) this.openHistory?.(target.sessionID, target.history, target.lease)
     } catch { /* Navigation cannot affect review/approval. */ }
   }
   private deleted(id: string) {
-    if (this.pendingClick?.sessionID === id || this.pendingClick?.history.session === id) this.clearClick()
+    if (this.clickOwner?.sessionID === id || this.clickOwner?.history?.session === id) this.clearClick()
     this.questionRevision++
     if (this.deletedSessions.size >= 4096) this.deletedSessions.delete(this.deletedSessions.values().next().value!)
     this.deletedSessions.add(id)
@@ -362,7 +399,7 @@ export class NotificationHost {
     this.created.delete(id)
     for (const [key, request] of this.permissions) if (request.sessionID === id || request.target?.root === id) this.resolved("permission", key)
     for (const [key, request] of this.questions) if (request.sessionID === id || request.target?.root === id) this.resolved("question", key)
-    for (const [key, dispatch] of this.dispatched) if (dispatch.target.root === id || dispatch.target.sessionID === id) this.dispatched.delete(key)
+    for (const [key, dispatch] of this.dispatched) if (dispatch.target.root === id || dispatch.session === id) this.dispatched.delete(key)
     this.policy.deleted(id)
     this.selectBlockers()
   }
