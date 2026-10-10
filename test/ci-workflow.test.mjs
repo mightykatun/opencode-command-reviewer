@@ -56,6 +56,7 @@ test("active release validation runs the same helper inventory with a complete s
   assert.doesNotMatch(validate, /node --test test\/smoke-measurements\.test\.mjs/)
   const policy = validate.split("      - name: Check out active validation policy\n")[1].split("\n      - ")[0]
   for (const file of [...inventory, "scripts/test-helpers.mjs", "scripts/helper-tests.json", "scripts/smoke-runtime.mjs",
+    "scripts/release-provenance.mjs", "scripts/bundled-sounds.mjs",
     "scripts/smoke-reviewer.mjs", "scripts/smoke-notification-recorder.mjs", "scripts/smoke-stages.mjs", "scripts/smoke-permissions.mjs", "scripts/smoke.mjs",
     "test/release-fixture.mjs", "test/npm-cli-smoke.test.mjs", "package.json", "package-lock.json", "README.md", "AGENTS.md", ".github/workflows/ci.yml"]) {
     assert.ok(policy.includes(`/${file}\n`), `active policy checkout must include ${file}`)

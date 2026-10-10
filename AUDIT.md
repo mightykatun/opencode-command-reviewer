@@ -35,12 +35,13 @@ Implementation starts from `0aaf9d6`. Checkboxes require passing evidence, not a
   - [x] Schedule bounded actionable audio and banner/process work with explicit overflow, fairness, and abort ownership.
   - [x] Acquire click generation at action receipt and invalidate superseded activation/navigation.
   - [x] Pass notification composition/saturation/race tests and queue/fast/history host fixtures; record outputs.
-  - [ ] Commit the verified W4 checkpoint.
-- [ ] W5: publication and archive correctness (A16, A17, A25)
-  - [ ] Bind explicit signed provenance to verified release source/archive and independent workflow identity, with offline actual-npm coverage.
-  - [ ] Preserve pending release runs with bounded platform queuing and unchanged semantic channel policy.
-  - [ ] Verify the exact six-category sound mapping in emitted and packed bundles.
-  - [ ] Pass helper, reproducibility/archive, and npm 12.2.0 smoke checks without publishing; record outputs and commit.
+  - [x] Commit the verified W4 checkpoint: `6a48c88`.
+- [x] W5: publication and archive correctness (A16, A17, A25)
+  - [x] Bind explicit signed provenance to verified release source/archive and independent workflow identity, with offline actual-npm coverage.
+  - [x] Preserve pending release runs with bounded platform queuing and unchanged semantic channel policy.
+  - [x] Verify the exact six-category sound mapping in emitted and packed bundles.
+  - [x] Pass helper, reproducibility/archive, and npm 12.2.0 smoke checks without publishing; record outputs.
+  - [ ] Commit the verified W5 checkpoint.
 - [ ] W6: maintainability, fixture reliability, and scoped maintenance (A18-A23, A26-A28)
   - [ ] Inventory runtime entrypoints/scenarios and add a pinned-host CI selection with host-independent completeness checks.
   - [ ] Share atomic serialized observation publication and selected-result/postcondition palette synchronization.
@@ -116,6 +117,10 @@ node scripts/smoke-notification-events.mjs question --reminders --queue --sound-
 ```
 
 W4 evidence: `.runtime/notification-w4-{baseline,capacity,click}/results.json`, `.runtime/notification-queue-{main,children,mixed}-stream.json`, `.runtime/fast-mode-complete/results.json`, `.runtime/history-auto-notification/results.json`, and `.runtime/notification-question-reminders-queue-sound-only.json`. Process I/O was isolated; these are not physical sound/focus claims. Delivery bounds are 64 active tickets (48 routine), 256 waiting actionable episodes, 128 waiting routine events, 24 children split into 20 banners (16 routine), two players, one withdrawal, and one activation. Audio has two actual preparations and 64 waiting plays. Actionable work rotates roots, yielding to routine work after eight actionable dispatches. Routine backlog overflow drops new routine events explicitly; README describes this policy. Click leases begin at action receipt, and initial permission baseline readiness is explicit. Pending-refresh and ancestry slots retain actual settlement ownership.
+
+**W5:** pre-fix release checks failed provenance adoption, queue retention, and absent new helpers. Final expanded release/sound/workflow suite passed **78 tests**; actual npm CLI suite passed **7**. `npm run check` passed typecheck, **981 source tests**, **91 helpers**, and build. `npm run check:package` passed two reproducible builds, all six sound mappings, and the exact five-file archive; combined artifact/npm CLI checks passed **9** (overlapping earlier counts). `node scripts/smoke-notification-events.mjs question --sound-only` passed on the pinned host with recorded processes (`.runtime/notification-question-sound-only.json`). No live OIDC, signing/log request, or publication was performed.
+
+W5 implementation: `release-provenance.mjs` constructs explicit source/archive/policy/validation/signing identities and signs through pinned npm 12.2.0/Sigstore 5.0.0 in a 120-second killable child. npm verifies `--provenance-file` before upload. Offline tests exercise actual npm subject/digest checks, OIDC option forwarding, attachment construction, and invalid-bundle rejection. Bundles stay outside the artifact directory; private XDG storage contains TUF state. `queue: max` preserves up to 100 pending releases. The actual production sound mapping is emitted as inspectable JSON and verified by key-to-byte association, including removed/swapped/decoy mutation tests. W5 verified bundle SHA-256: `9eff01083da6d8a977cc8313bd5a40139be3f2c51b100d4d62e06b671987a45e`; archive unpacked size 889,560 bytes.
 
 ## 1. Scope, provenance, and status
 

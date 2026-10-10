@@ -1,8 +1,10 @@
 [
+  "test/bundled-sounds.test.mjs",
   "test/ci-workflow.test.mjs",
   "test/npm-publication.test.mjs",
   "test/publish-release.test.mjs",
   "test/release-artifact.test.mjs",
+  "test/release-provenance.test.mjs",
   "test/release-version.test.mjs",
   "test/release-workflow.test.mjs",
   "test/smoke-measurements.test.mjs",

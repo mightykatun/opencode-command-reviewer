@@ -5,12 +5,13 @@ import { setTimeout } from "node:timers/promises"
 import { expectedArtifact, loadReleaseArtifact } from "./release-artifact.mjs"
 import { publicationTag, validatePublicationPackage } from "./release-version.mjs"
 import { archiveIntegrity, Pending, registryReader, verifyPublication } from "./npm-publication.mjs"
+import { prepareProvenance, releaseStatement } from "./release-provenance.mjs"
 
 // Publish the same verified bytes attached to GitHub. Existing versions are immutable:
 // reruns (or the authenticated first-publication bootstrap) must match exactly.
 export async function publishRelease(tarball, pkg, bytes, {
   fetcher = fetch, run = execFileSync, now = () => performance.now(), sleep = setTimeout,
-  readTimeoutMs = 30000, intervalMs = 1000,
+  readTimeoutMs = 30000, intervalMs = 1000, provenance,
 } = {}) {
   validatePublicationPackage(pkg)
   const integrity = archiveIntegrity(bytes)
@@ -41,15 +42,21 @@ export async function publishRelease(tarball, pkg, bytes, {
     if (remaining > 0) await sleep(Math.min(intervalMs, remaining))
   }
   assert.ok(tag !== undefined, `Registry lookup could not be verified within ${readTimeoutMs / 1000}s: ${reason}; no upload was attempted`)
-  run("npm", ["publish", tarball, "--ignore-scripts", "--access", "public",
-    "--provenance", "--tag", tag, "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"], { stdio: "inherit" })
+  assert.equal(typeof provenance, "function", "New uploads require explicit verified provenance")
+  const signed = await provenance()
+  try {
+    assert.ok(signed?.file && typeof signed.dispose === "function", "Missing signed provenance file")
+    run("npm", ["publish", tarball, "--ignore-scripts", "--access", "public",
+      "--provenance-file", signed.file, "--tag", tag, "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"], { stdio: "inherit" })
+  } finally { await signed?.dispose?.() }
   return { status: "submitted", tag }
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const directory = process.argv[2]
   assert.ok(directory && process.argv.length === 3, "Expected one verified artifact directory")
-  const { tarball, pkg, bytes } = await loadReleaseArtifact(directory, expectedArtifact())
-  const result = await publishRelease(tarball, pkg, bytes)
+  const { manifest, tarball, pkg, bytes } = await loadReleaseArtifact(directory, expectedArtifact())
+  const statement = releaseStatement(manifest, bytes)
+  const result = await publishRelease(tarball, pkg, bytes, { provenance: () => prepareProvenance(statement) })
   await verifyPublication(pkg, bytes, result.tag === "archive" ? undefined : result.tag)
 }

@@ -2,6 +2,7 @@ import { build } from "esbuild"
 import { transformAsync } from "@babel/core"
 import { readFile } from "node:fs/promises"
 import inventory from "../src/prompt-files.json" with { type: "json" }
+import { soundBanner } from "./bundled-sounds.mjs"
 
 const prompts = Object.fromEntries(await Promise.all(
   Object.entries(inventory).map(async ([name, file]) => [
@@ -31,7 +32,8 @@ await build({
   platform: "node",
   format: "esm",
   target: "es2023",
-  define: { __REVIEW_PROMPTS__: JSON.stringify(prompts), __REVIEW_SOUNDS__: JSON.stringify(sounds), __HISTORY_WORKER__: JSON.stringify(historyWorker.outputFiles[0].text) },
+  banner: { js: soundBanner(sounds) },
+  define: { __REVIEW_PROMPTS__: JSON.stringify(prompts), __REVIEW_SOUNDS__: "__REVIEWER_BUNDLED_SOUNDS__", __HISTORY_WORKER__: JSON.stringify(historyWorker.outputFiles[0].text) },
   external: ["solid-js", "solid-js/*", "@opentui/*", "@opencode-ai/*"],
   plugins: [{
     name: "notification-decoder-only",

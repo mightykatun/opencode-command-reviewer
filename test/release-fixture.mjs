@@ -53,3 +53,13 @@ export function artifactFixture(bytes = archiveFixture(), { version = "0.4.0", .
     RELEASE_VALIDATION_ATTEMPT: expected.runAttempt, RELEASE_INTEGRITY: expected.integrity }
   return { expected, manifest, env }
 }
+
+export function provenanceEnv(env, overrides = {}) {
+  return { ...env, GITHUB_ACTIONS: "true", GITHUB_SERVER_URL: "https://github.com",
+    GITHUB_REPOSITORY: "mightykatun/opencode-reviewer", GITHUB_REPOSITORY_ID: "12345", GITHUB_REPOSITORY_OWNER_ID: "6789",
+    GITHUB_WORKFLOW_REF: "mightykatun/opencode-reviewer/.github/workflows/release.yml@refs/heads/main",
+    GITHUB_WORKFLOW_SHA: env.RELEASE_WORKFLOW_COMMIT, GITHUB_SHA: env.RELEASE_WORKFLOW_COMMIT,
+    GITHUB_REF: "refs/heads/main", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_RUN_ID: env.RELEASE_RUN_ID,
+    GITHUB_RUN_ATTEMPT: "2", RUNNER_ENVIRONMENT: "github-hosted", RELEASE_DEFAULT_BRANCH: "main",
+    RELEASE_INPUT_TAG: env.RELEASE_TAG, ...overrides }
+}

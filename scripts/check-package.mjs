@@ -6,6 +6,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { inspectPackageArchive } from "./release-artifact.mjs"
 import { validatePublicationPackage } from "./release-version.mjs"
+import { verifyBundledSounds } from "./bundled-sounds.mjs"
 
 validatePublicationPackage(JSON.parse(await readFile("package.json", "utf8")))
 execFileSync(process.execPath, ["scripts/build.mjs"], { stdio: "inherit" })
@@ -14,9 +15,9 @@ const first = await digest()
 execFileSync(process.execPath, ["scripts/build.mjs"], { stdio: "inherit" })
 assert.equal(await digest(), first, "two builds must produce identical bundles")
 const bundle = await readFile("dist/tui.js", "utf8")
-for (const kind of ["attention", "approved", "error", "ended"]) {
-  assert.ok(bundle.includes((await readFile(`sounds/${kind}.mp3`)).toString("base64")), `bundle must contain the exact supplied ${kind} sound`)
-}
+const sounds = Object.fromEntries(await Promise.all(["attention", "unsafe", "question", "approved", "error", "ended"]
+  .map(async kind => [kind, await readFile(`sounds/${kind}.mp3`)])))
+verifyBundledSounds(bundle, sounds)
 assert.ok(bundle.includes("mpeg_frame_decoder_create"), "MP3 decoding must be bundled")
 assert.ok(!bundle.includes('"worker_threads"'), "unused MP3 worker adapters must not enter the package")
 assert.ok(bundle.includes("historyWorkerSource") && bundle.includes("bun:sqlite") && bundle.includes("BEGIN IMMEDIATE"), "production history worker must be embedded")
@@ -39,6 +40,7 @@ try {
   assert.equal(pack.version, manifest.version)
   assert.equal(pack.filename, `${manifest.name}-${manifest.version}.tgz`)
   const { pkg, files } = inspectPackageArchive(await readFile(path.join(directory, pack.filename)))
+  verifyBundledSounds(files.get("dist/tui.js").toString("utf8"), sounds)
   assert.deepEqual(pkg, manifest, "actual archive manifest must match package.json")
   assert.deepEqual(pack.files.map((file) => file.path).sort(), [...files.keys()].sort())
   for (const [file, bytes] of files) assert.ok(bytes.equals(await readFile(file)), `actual packed ${file} must match verified source`)

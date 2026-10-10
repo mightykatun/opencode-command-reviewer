@@ -4,13 +4,17 @@ import { execFileSync } from "node:child_process"
 import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { archiveFixture, artifactFixture } from "./release-fixture.mjs"
+import { archiveFixture, artifactFixture, provenanceEnv } from "./release-fixture.mjs"
 import { PUBLICATION_TIMEOUT_MS } from "../scripts/npm-publication.mjs"
 
 const workflow = await readFile(new URL("../.github/workflows/release.yml", import.meta.url), "utf8")
 const validate = workflow.split("\n  validate:\n")[1]?.split("\n  publish:\n")[0]
 const publish = workflow.split("\n  publish:\n")[1]
 const step = (job, name) => job.split(`      - name: ${name}\n`)[1]?.split("\n      - ")[0]
+
+test("release concurrency retains pending versions within GitHub's bounded queue", () => {
+  assert.match(workflow, /\nconcurrency:\n  group: release-opencode-reviewer\n  cancel-in-progress: false\n  queue: max\n/)
+})
 
 test("workflow separates read-only validation from artifact-only privileged publication", () => {
   assert.ok(validate && publish)
@@ -26,7 +30,7 @@ test("workflow separates read-only validation from artifact-only privileged publ
   assert.match(policy, /sparse-checkout-cone-mode: false/)
   assert.match(policy, /persist-credentials: false/)
   const paths = [...policy.matchAll(/^            (\/.+)$/gm)].map((match) => match[1])
-  assert.deepEqual(paths, ["/scripts/release-version.mjs", "/scripts/release-artifact.mjs", "/scripts/publish-release.mjs",
+  assert.deepEqual(paths, ["/scripts/release-version.mjs", "/scripts/release-artifact.mjs", "/scripts/release-provenance.mjs", "/scripts/publish-release.mjs",
     "/scripts/npm-publication.mjs", "/scripts/github-release.mjs"])
   assert.match(publish, /npm install --global npm@12\.2\.0 --ignore-scripts/)
   assert.match(step(publish, "Publish package and verify npm availability"), /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/)
@@ -56,6 +60,9 @@ test("artifact transfer binds an immutable ID and manifest expectations to valid
   }
   assert.match(workflow, /RELEASE_WORKFLOW_COMMIT: \$\{\{ github\.workflow_sha \}\}/)
   assert.match(workflow, /RELEASE_RUN_ID: \$\{\{ github\.run_id \}\}/)
+  assert.match(workflow, /RELEASE_DEFAULT_BRANCH: \$\{\{ github\.event\.repository\.default_branch \}\}/)
+  assert.match(workflow, /RELEASE_INPUT_TAG: \$\{\{ inputs\.tag \|\| '' \}\}/)
+  assert.doesNotMatch(workflow, /(?:^|\n)\s+(?:GITHUB_SHA|GITHUB_REF|GITHUB_WORKFLOW_SHA|GITHUB_RUN_ATTEMPT):/)
   const upload = step(validate, "Upload immutable release artifact")
   assert.match(upload, /overwrite: false/)
   assert.match(upload, /if-no-files-found: error/)
@@ -91,13 +98,16 @@ test("publish job creates a private cache before npm and exports it to subsequen
   const temp = path.join(root, "runner temp"), envFile = path.join(root, "github-env")
   await mkdir(temp)
   execFileSync("bash", ["-c", command], { env: { ...process.env, RUNNER_TEMP: temp, GITHUB_ENV: envFile }, stdio: "pipe" })
-  const exported = (await readFile(envFile, "utf8")).trim()
-  assert.ok(exported.startsWith("NPM_CONFIG_CACHE="))
-  const cache = exported.slice("NPM_CONFIG_CACHE=".length)
+  const exported = Object.fromEntries((await readFile(envFile, "utf8")).trim().split("\n").map(line => {
+    const at = line.indexOf("="); return [line.slice(0, at), line.slice(at + 1)]
+  }))
+  const cache = exported.NPM_CONFIG_CACHE
   assert.equal(path.dirname(cache), temp)
   assert.ok((await lstat(cache)).isDirectory())
   assert.equal((await lstat(cache)).mode & 0o777, 0o700)
   assert.match(path.basename(cache), /^npm-release-cache\./)
+  assert.equal(exported.XDG_DATA_HOME, path.join(cache, "xdg"))
+  assert.equal((await lstat(exported.XDG_DATA_HOME)).mode & 0o777, 0o700)
 })
 
 test("validation gates dispatch branch and exact tag commit before exporting package identity", () => {
@@ -129,7 +139,7 @@ test("artifact-only CLIs publish and attach the exact validated bytes without pr
   const tarball = path.join(artifact, manifest.archive.filename)
   await writeFile(tarball, bytes)
   await writeFile(path.join(artifact, "release-manifest.json"), JSON.stringify(manifest))
-  for (const helper of ["release-version", "release-artifact", "npm-publication", "publish-release", "github-release"]) {
+  for (const helper of ["release-version", "release-artifact", "release-provenance", "npm-publication", "publish-release", "github-release"]) {
     await writeFile(path.join(policy, `${helper}.mjs`), await readFile(new URL(`../scripts/${helper}.mjs`, import.meta.url)))
   }
   const setup = `
@@ -139,9 +149,25 @@ test("artifact-only CLIs publish and attach the exact validated bytes without pr
     import { syncBuiltinESMExports } from "node:module";
     const bytes = Buffer.from(${JSON.stringify(bytes.toString("base64"))}, "base64");
     let submitted = false;
-    childProcess.execFileSync = (command, args) => {
+    childProcess.execFileSync = (command, args, options) => {
+      if (command === process.execPath) {
+        assert.equal(args.at(-1), "sign");
+        const statement = JSON.parse(options.input);
+        assert.equal(statement.predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit, "a".repeat(40));
+        assert.equal(statement.predicate.buildDefinition.resolvedDependencies[1].digest.gitCommit, "b".repeat(40));
+        return JSON.stringify({ mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+          dsseEnvelope: { payloadType: "application/vnd.in-toto+json", payload: Buffer.from(options.input).toString("base64"), signatures: [{ sig: "offline" }] },
+          verificationMaterial: { tlogEntries: [{}] } });
+      }
       const file = command === "npm" ? args[1] : args[1] === "upload" ? args[3] : undefined;
       if (file) assert.ok(readFileSync(file).equals(bytes), "every upload reads exactly the validated archive");
+      if (command === "npm") {
+        const provenance = args[args.indexOf("--provenance-file") + 1];
+        assert.ok(provenance.startsWith(process.env.RUNNER_TEMP + "/release-provenance-"));
+        const bundle = JSON.parse(readFileSync(provenance));
+        assert.ok(bundle.dsseEnvelope.payload);
+        args = args.map(value => value === provenance ? "<signed-file>" : value);
+      }
       submitted = true;
       console.log("WRITE " + JSON.stringify({ command, args }));
     };
@@ -161,10 +187,10 @@ test("artifact-only CLIs publish and attach the exact validated bytes without pr
   `
   const run = (helper, override = {}) => execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(setup)}`,
     path.join(policy, `${helper}.mjs`), artifact], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, ...env, GITHUB_REPOSITORY: "mightykatun/opencode-reviewer", GH_TOKEN: "fixture-token", ...override } })
+    env: { ...process.env, ...provenanceEnv(env), RUNNER_TEMP: root, GH_TOKEN: "fixture-token", ...override } })
   const writes = (output) => output.trim().split("\n").filter((line) => line.startsWith("WRITE ")).map((line) => JSON.parse(line.slice(6)))
   assert.deepEqual(writes(run("publish-release")), [{ command: "npm", args: ["publish", tarball, "--ignore-scripts", "--access", "public",
-    "--provenance", "--tag", "archive", "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"] }])
+    "--provenance-file", "<signed-file>", "--tag", "archive", "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"] }])
   assert.deepEqual(writes(run("github-release")), [
     { command: "gh", args: ["release", "upload", "v0.4.0", tarball, "--repo", "mightykatun/opencode-reviewer", "--clobber"] },
     { command: "gh", args: ["release", "edit", "v0.4.0", "--draft=false", "--prerelease=false", "--latest=false", "--repo", "mightykatun/opencode-reviewer"] },

@@ -226,10 +226,19 @@
   workflow runs on pushed `v*` tags or manual dispatch from the default branch with
   an existing tag. Tag commit and canonical version must match the manifests;
   build metadata is rejected. Creating a GitHub release is not a trigger.
+  Package-wide concurrency uses `queue: max` with cancellation disabled, retaining
+  up to 100 pending runs. Overflow is canceled; channel safety still uses SemVer.
 - Keep the read-only validation and privileged publication jobs separate. Publish
   the exact verified archive, using policy helpers from `github.workflow_sha`;
   never build/install project dependencies or run package code in the publish job.
   npm 12.2.0 uses OIDC with optional `NPM_TOKEN` fallback and a private job cache.
+  Explicit provenance binds archive SHA-512 and tag source separately from policy
+  commit and validation/signing attempts. Its pinned npm Sigstore toolchain signs
+  in a 120-second child, then npm verifies `--provenance-file` before upload.
+  Never substitute GitHub trigger identity or fall back to unsigned publication.
+  Keep signing bundles outside the artifact directory and TUF's `XDG_DATA_HOME`
+  inside the private job cache. Offline tests replace signing/crypto/network
+  boundaries; they must never request real OIDC tokens or transparency-log writes.
   Uploads never retry. Existing versions verify immutable bytes without retagging;
   channel advancement follows SemVer in `scripts/npm-publication.mjs`.
 - npm can accept an upload long before registry availability. Read-only publication

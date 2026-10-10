@@ -9,12 +9,181 @@ import { gunzipSync } from "node:zlib"
 import { archiveIntegrity } from "../scripts/npm-publication.mjs"
 import { inspectPackageArchive, packageFiles } from "../scripts/release-artifact.mjs"
 import { npmReleaseVersion } from "../scripts/release-version.mjs"
-import { archiveFixture, fixturePackage, highBitNumericArchiveFixture } from "./release-fixture.mjs"
+import { archiveFixture, artifactFixture, fixturePackage, highBitNumericArchiveFixture, provenanceEnv } from "./release-fixture.mjs"
 
 const globalRoot = execFileSync("npm", ["root", "--global"], { encoding: "utf8" }).trim()
 const npmRoot = path.join(globalRoot, "npm")
 assert.equal(JSON.parse(await readFile(path.join(npmRoot, "package.json"), "utf8")).version, "12.2.0", "This separate smoke test requires installed npm 12.2.0")
 const npmRequire = createRequire(path.join(npmRoot, "package.json"))
+
+test("actual npm provenance builder and file verifier adopt signed release source with offline boundaries", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "npm provenance offline "))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const bytes = archiveFixture(), fixture = artifactFixture(bytes)
+  const program = `
+    import assert from "node:assert/strict";
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import { writeFile } from "node:fs/promises";
+    import net from "node:net";
+    import http from "node:http";
+    import https from "node:https";
+    import { releaseStatement, attestStatement } from ${JSON.stringify(new URL("../scripts/release-provenance.mjs", import.meta.url).href)};
+    const deny = () => { throw new Error("UNEXPECTED LIVE NETWORK"); };
+    net.Socket.prototype.connect = deny; http.request = deny; https.request = deny; globalThis.fetch = deny;
+    syncBuiltinESMExports();
+    const root = ${JSON.stringify(npmRoot)};
+    const require = createRequire(root + "/node_modules/libnpmpublish/lib/provenance.js");
+    const install = (name, exports) => { const id = require.resolve(name); require.cache[id] = { id, filename: id, loaded: true, exports }; };
+    let signed = [], verified = [], uploads = [];
+    install("sigstore", {
+      async attest(payload, type, options) {
+        signed.push(JSON.parse(payload));
+        assert.equal(type, "application/vnd.in-toto+json");
+        if (options.explicitFixture !== true) {
+          assert.equal(options.retry, 0); assert.equal(options.timeout, 10000); assert.equal(options.tlogUpload, true);
+        }
+        return { mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+          dsseEnvelope: { payloadType: type, payload: payload.toString("base64"), signatures: [{ sig: "offline-fixture" }] },
+          verificationMaterial: { tlogEntries: [{}] } };
+      },
+      async verify(bundle) {
+        assert.equal(bundle.dsseEnvelope.signatures[0].sig, "offline-fixture", "crypto boundary rejects invalid signatures");
+        verified.push(bundle);
+      },
+    });
+    const fakeFetch = async (url, options) => {
+      assert.equal(options.method, "PUT"); assert.equal(options.provenanceFile, ${JSON.stringify(path.join(root, "explicit.sigstore"))});
+      uploads.push(options.body); return {};
+    };
+    fakeFetch.pickRegistry = () => "https://registry.npmjs.org/";
+    fakeFetch.json = async (url, options) => {
+      assert.equal(new URL(url).pathname, "/-/npm/v1/oidc/token/exchange/package/opencode-reviewer");
+      assert.equal(options.method, "POST"); return { token: "offline-exchange" };
+    };
+    install("npm-registry-fetch", fakeFetch);
+    install("make-fetch-happen", async url => {
+      assert.equal(new URL(url).origin, "https://oidc.invalid");
+      assert.equal(new URL(url).searchParams.get("audience"), "npm:registry.npmjs.org");
+      return { ok: true, status: 200, json: async () => ({ value: "e30." + Buffer.from(JSON.stringify({ repository_visibility: "public" })).toString("base64") + ".offline" }) };
+    });
+    install("libnpmaccess", { getVisibility: deny });
+    const { generateProvenance, verifyProvenance } = require(root + "/node_modules/libnpmpublish/lib/provenance.js");
+    const publish = require(root + "/node_modules/libnpmpublish/lib/publish.js");
+    const bytes = Buffer.from(${JSON.stringify(bytes.toString("base64"))}, "base64");
+    const statement = releaseStatement(${JSON.stringify(fixture.manifest)}, bytes, process.env);
+    const subject = statement.subject[0];
+    await generateProvenance([subject], { explicitFixture: true });
+    assert.equal(signed[0].predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit, "b".repeat(40), "stock npm uses the trigger commit");
+    const bundle = await attestStatement(statement, { npmRoot: root });
+    assert.equal(signed[1].predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit, "a".repeat(40));
+    assert.equal(signed[1].predicate.buildDefinition.resolvedDependencies[1].digest.gitCommit, "b".repeat(40));
+    const file = ${JSON.stringify(path.join(root, "explicit.sigstore"))};
+    await writeFile(file, JSON.stringify(bundle));
+    assert.deepEqual(await verifyProvenance(subject, file), bundle);
+    const opts = { provenanceFile: file, defaultTag: "archive", access: "public", fetchRetries: 0 };
+    const configValues = new Map();
+    const config = { get: key => configValues.get(key), set: (key, value) => configValues.set(key, value),
+      delete: key => configValues.delete(key), isDefault: key => { assert.equal(key, "provenance"); return true; } };
+    const { oidc } = require(root + "/lib/utils/oidc.js");
+    await oidc({ packageName: "opencode-reviewer", registry: "https://registry.npmjs.org/", opts, config, enableProvenanceAutoConfiguration: true });
+    assert.equal(opts["//registry.npmjs.org/:_authToken"], "offline-exchange", "actual OIDC exchange succeeded");
+    assert.equal(opts.provenanceFile, file); assert.equal(opts.provenance, undefined);
+    await publish(${JSON.stringify(fixturePackage())}, bytes, opts);
+    assert.equal(uploads.length, 1); assert.equal(signed.length, 2, "file publication must not auto-generate provenance");
+    const attachments = uploads[0]._attachments;
+    assert.equal(attachments["opencode-reviewer-0.4.0.sigstore"].data, JSON.stringify(bundle));
+    assert.ok(Buffer.from(attachments["opencode-reviewer-0.4.0.tgz"].data, "base64").equals(bytes));
+    assert.deepEqual(uploads[0]["dist-tags"], { archive: "0.4.0" });
+    for (const change of [
+      s => { s.subject[0].name = "pkg:npm/wrong@0.4.0"; },
+      s => { s.subject[0].digest.sha512 = "0".repeat(128); },
+      s => { s.subject.push(s.subject[0]); }, s => { s.subject = []; },
+    ]) {
+      const wrong = structuredClone(statement); change(wrong);
+      const bad = structuredClone(bundle); bad.dsseEnvelope.payload = Buffer.from(JSON.stringify(wrong)).toString("base64");
+      await writeFile(file, JSON.stringify(bad));
+      const previous = verified.length;
+      await assert.rejects(publish(${JSON.stringify(fixturePackage())}, bytes, opts));
+      assert.equal(verified.length, previous, "subject mismatch rejects before crypto verification");
+      assert.equal(uploads.length, 1);
+    }
+    const invalidSignature = structuredClone(bundle); invalidSignature.dsseEnvelope.signatures[0].sig = "invalid";
+    await writeFile(file, JSON.stringify(invalidSignature));
+    await assert.rejects(publish(${JSON.stringify(fixturePackage())}, bytes, opts), /crypto boundary/);
+    await assert.rejects(publish(${JSON.stringify(fixturePackage())}, bytes, { ...opts, provenanceFile: file + ".absent" }), /Invalid provenance/);
+    assert.equal(uploads.length, 1);
+    console.log(JSON.stringify({ signed: signed.length, verified: verified.length, uploads: uploads.length }));
+  `
+  const output = execFileSync(process.execPath, ["--input-type=module", "-e", program], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000,
+    env: { PATH: process.env.PATH, HOME: root, XDG_DATA_HOME: root, ...provenanceEnv(fixture.env),
+      ACTIONS_ID_TOKEN_REQUEST_URL: "https://oidc.invalid/token", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "offline-fixture" },
+  })
+  assert.deepEqual(JSON.parse(output), { signed: 2, verified: 2, uploads: 1 })
+})
+
+test("actual npm CLI forwards --provenance-file through crypto verification before its intercepted PUT", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "npm file adoption "))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const bytes = archiveFixture(), tarball = path.join(root, "verified.tgz"), file = path.join(root, "signed provenance.sigstore")
+  const capture = path.join(root, "boundary.json"), config = path.join(root, "user.npmrc"), empty = path.join(root, "global.npmrc")
+  await writeFile(tarball, bytes)
+  await writeFile(config, "//registry.npmjs.org/:_authToken=offline-fixture\n")
+  await writeFile(empty, "")
+  const preload = `
+    import assert from "node:assert/strict";
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import { writeFileSync } from "node:fs";
+    import net from "node:net";
+    import http from "node:http";
+    import https from "node:https";
+    const deny = () => { throw new Error("UNEXPECTED LIVE NETWORK"); };
+    net.Socket.prototype.connect = deny; http.request = deny; https.request = deny; globalThis.fetch = deny;
+    syncBuiltinESMExports();
+    const require = createRequire(${JSON.stringify(path.join(npmRoot, "package.json"))});
+    const install = (name, exports) => { const id = require.resolve(name); require.cache[id] = { id, filename: id, loaded: true, exports }; };
+    let verified = false;
+    install("sigstore", { attest: deny, verify: async bundle => {
+      assert.equal(bundle.dsseEnvelope.signatures[0].sig, "offline-fixture"); verified = true;
+    } });
+    const fakeFetch = async (url, options) => {
+      assert.equal(options.method, "PUT"); assert.equal(verified, true);
+      assert.equal(options.provenanceFile, ${JSON.stringify(file)});
+      writeFileSync(${JSON.stringify(capture)}, JSON.stringify(options.body));
+      return {};
+    };
+    fakeFetch.pickRegistry = () => "https://registry.npmjs.org/";
+    fakeFetch.json = deny;
+    install("npm-registry-fetch", fakeFetch);
+    const pacote = require("pacote");
+    pacote.packument = async () => ({ versions: {} });
+  `
+  const subject = { name: "pkg:npm/opencode-reviewer@0.4.0", digest: { sha512: Buffer.from(archiveIntegrity(bytes).slice(7), "base64").toString("hex") } }
+  const bundle = { mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json", dsseEnvelope: {
+    payloadType: "application/vnd.in-toto+json", payload: Buffer.from(JSON.stringify({ subject: [subject] })).toString("base64"),
+    signatures: [{ sig: "offline-fixture" }],
+  } }
+  const run = () => execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(preload)}`,
+    path.join(npmRoot, "bin/npm-cli.js"), "publish", tarball, "--ignore-scripts", "--json", "--provenance-file", file,
+    "--access", "public", "--tag", "archive", "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"], {
+    cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000,
+    env: { PATH: process.env.PATH, HOME: root, LANG: "C.UTF-8", NPM_CONFIG_CACHE: path.join(root, "cache"), XDG_DATA_HOME: path.join(root, "xdg"),
+      NPM_CONFIG_USERCONFIG: config, NPM_CONFIG_GLOBALCONFIG: empty, NPM_CONFIG_UPDATE_NOTIFIER: "false" },
+  })
+  await writeFile(file, JSON.stringify(bundle))
+  run()
+  const payload = JSON.parse(await readFile(capture, "utf8"))
+  assert.equal(payload._attachments["opencode-reviewer-0.4.0.sigstore"].data, JSON.stringify(bundle))
+  assert.ok(Buffer.from(payload._attachments["opencode-reviewer-0.4.0.tgz"].data, "base64").equals(bytes))
+  await rm(capture)
+  for (const wrong of [{ ...subject, name: "pkg:npm/decoy@0.4.0" }, { ...subject, digest: { sha512: "0".repeat(128) } }]) {
+    await writeFile(file, JSON.stringify({ ...bundle, dsseEnvelope: { ...bundle.dsseEnvelope,
+      payload: Buffer.from(JSON.stringify({ subject: [wrong] })).toString("base64") } }))
+    assert.throws(run, error => { assert.match(error.stdout + error.stderr, /does not match the package/); return true })
+    await assert.rejects(lstat(capture), { code: "ENOENT" })
+  }
+  assert.ok((await readFile(tarball)).equals(bytes))
+})
 
 test("release identities match npm 12's actual semver cleaning and bounds", () => {
   const semver = npmRequire("semver")

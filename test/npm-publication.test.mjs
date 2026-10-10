@@ -3,7 +3,11 @@ import assert from "node:assert/strict"
 import { createServer } from "node:http"
 import { setTimeout as sleep } from "node:timers/promises"
 import { archiveIntegrity, PUBLICATION_TIMEOUT_MS, registryReader, verifyPublication } from "../scripts/npm-publication.mjs"
-import { publishRelease } from "../scripts/publish-release.mjs"
+import { publishRelease as publish } from "../scripts/publish-release.mjs"
+
+const publishRelease = (tarball, pkg, bytes, options) => publish(tarball, pkg, bytes, {
+  provenance: async () => ({ file: "/tmp/fixture.sigstore", dispose: async () => {} }), ...options,
+})
 
 const pkg = { name: "opencode-reviewer", version: "0.4.1", publishConfig: { access: "public", registry: "https://registry.npmjs.org/" } }
 const bytes = Buffer.from("verified archive")

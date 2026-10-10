@@ -1,7 +1,11 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { publishRelease } from "../scripts/publish-release.mjs"
+import { publishRelease as publish } from "../scripts/publish-release.mjs"
+
+const publishRelease = (tarball, pkg, bytes, options) => publish(tarball, pkg, bytes, {
+  provenance: async () => ({ file: "/tmp/fixture.sigstore", dispose: async () => {} }), ...options,
+})
 
 const pkg = { name: "opencode-reviewer", version: "0.4.0", publishConfig: { access: "public", registry: "https://registry.npmjs.org/" } }
 const bytes = Buffer.from("verified archive fixture")
@@ -10,6 +14,43 @@ const readClock = () => {
   let at = 0
   return { now: () => at, sleep: async (ms) => { at += ms }, readTimeoutMs: 25, intervalMs: 10 }
 }
+
+test("new uploads adopt the signed provenance file and release its ownership after npm settles", async () => {
+  const calls = []
+  await publishRelease("/tmp/verified.tgz", pkg, bytes, {
+    fetcher: async () => new Response(null, { status: 404 }),
+    provenance: async () => { calls.push("sign"); return { file: "/tmp/private signing/release.sigstore", dispose: async () => calls.push("dispose") } },
+    run: (command, args) => {
+      calls.push("upload")
+      assert.equal(command, "npm")
+      assert.equal(args[args.indexOf("--provenance-file") + 1], "/tmp/private signing/release.sigstore")
+      assert.ok(!args.includes("--provenance"))
+    },
+  })
+  assert.deepEqual(calls, ["sign", "upload", "dispose"])
+})
+
+test("missing or failed signing prevents upload and uncertain uploads dispose without retries", async () => {
+  let signs = 0, writes = 0, disposed = 0
+  const options = { fetcher: async () => new Response(null, { status: 404 }), run: () => { writes++ } }
+  await assert.rejects(publish("/tmp/verified.tgz", pkg, bytes, options), /explicit verified provenance/)
+  await assert.rejects(publish("/tmp/verified.tgz", pkg, bytes, { ...options,
+    provenance: async () => { signs++; throw new Error("signing failed") },
+  }), /signing failed/)
+  assert.equal(writes, 0)
+  assert.equal(signs, 1)
+  await assert.rejects(publish("/tmp/verified.tgz", pkg, bytes, { ...options,
+    provenance: async () => { signs++; return { file: "/tmp/signed.sigstore", dispose: async () => { disposed++ } } },
+    run: () => { writes++; throw new Error("uncertain upload") },
+  }), /uncertain upload/)
+  assert.equal(signs, 2)
+  assert.equal(writes, 1)
+  assert.equal(disposed, 1)
+  await publish("/tmp/verified.tgz", pkg, bytes, { ...options,
+    fetcher: async () => Response.json({ dist: { integrity } }), provenance: async () => { throw new Error("must not sign existing bytes") },
+  })
+  assert.equal(writes, 1)
+})
 
 test("identical published archives are idempotent and never invoke npm", async () => {
   let writes = 0
@@ -51,7 +92,7 @@ test("new releases publish the existing archive, with semantic channels and prov
       run: (command, args) => {
         calls++
         assert.equal(command, "npm")
-        assert.deepEqual(args, ["publish", "/tmp/verified.tgz", "--ignore-scripts", "--access", "public", "--provenance", "--tag", tag, "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"])
+        assert.deepEqual(args, ["publish", "/tmp/verified.tgz", "--ignore-scripts", "--access", "public", "--provenance-file", "/tmp/fixture.sigstore", "--tag", tag, "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"])
       },
     }), { status: "submitted", tag })
     assert.equal(calls, 1)
@@ -82,7 +123,7 @@ test("new uploads advance only their semantic channel and archive historical ver
     assert.deepEqual(reads, [`/opencode-reviewer/${version}`, "/-/package/opencode-reviewer/dist-tags"])
     assert.deepEqual(result, { status: "submitted", tag })
     assert.deepEqual(writes, [{ command: "npm", args: ["publish", "/tmp/verified.tgz", "--ignore-scripts", "--access", "public",
-      "--provenance", "--tag", tag, "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"] }])
+      "--provenance-file", "/tmp/fixture.sigstore", "--tag", tag, "--registry", "https://registry.npmjs.org/", "--fetch-retries=0"] }])
   }
 })
 
