@@ -166,11 +166,22 @@ test("all directory origins have their own scope and do not capture targets or d
     const input = { filePath: "/outside/target", command: "cat /outside/target", content: "PRIVATE-EDIT-BODY", patchText: "*** Begin Patch\n*** Add File: /outside/target\n+PRIVATE-PATCH-BODY\n*** End Patch", pattern: "*" }
     const f = fixture(tool, input)
     const req = { ...request("external_directory"), patterns: ["/outside/*"], metadata: { filepath: "/outside/target", parentDir: "/outside" } }
-    const result = await f.evaluate(req, { ...config, reviewBash: false, reviewEdits: false, reviewMcp: false, reviewCustomTools: false })
+    const options = { ...config, reviewBash: false, reviewEdits: false, reviewMcp: false, reviewCustomTools: false }
+    let probes = 0
+    const files = new FileAccess({ open: async () => { probes++; throw new Error("directory review must not open targets") },
+      realpath: async () => { probes++; throw new Error("directory review must not canonicalize targets") } })
+    const result = await evaluateEvidence(req, f.reader, options, options, "", signal(), () => f.calls.push("identified"), files)
     assert.ok(result?.kind === "external-directory")
     assert.equal(result.tool, tool)
-    assert.deepEqual(result.permission.patterns, req.patterns)
-    assert.deepEqual(result.permission.metadata, req.metadata)
+    assert.deepEqual(result.permission, { id: req.id, type: "external_directory", patterns: req.patterns, always: req.always,
+      tool: req.tool, metadata: req.metadata, metadataStatus: "Host directory metadata included" })
+    assert.notEqual(result.permission.metadata, req.metadata)
+    assert.notEqual(result.permission.patterns, req.patterns)
+    assert.equal(result.userPrompt, "Actual root request")
+    assert.equal(result.location.instanceDirectory, "/invocation")
+    assert.equal(result.session?.root?.directory, "/origin")
+    assert.equal(probes, 0)
+    assert.equal(f.calls.filter(call => call === "message").length, 1)
     assert.ok(!("files" in result) && !("changes" in result))
     if (["edit", "write", "apply_patch"].includes(tool)) {
       assert.doesNotMatch(JSON.stringify(result), /PRIVATE-/)
@@ -190,8 +201,12 @@ test("broken invocation identity, duplicate call IDs, stale parts and cancellati
     { ...original, parts: [{ ...f.part, state: { status: "pending", input: {}, raw: "" } }] }]) {
     const reader = { ...f.reader, message: async () => message } as ContextReader
     await assert.rejects(loadInvocation(request("custom"), reader, signal()), /unavailable|mismatched/)
+    await assert.rejects(evaluateEvidence(request("external_directory"), reader, config, config, "", signal(),
+      () => assert.fail("invalid directory linkage cannot identify a review"), new FileAccess()), /unavailable|mismatched/)
   }
   await assert.rejects(loadInvocation({ ...request("x"), tool: undefined }, f.reader, signal()), /linkage/)
+  await assert.rejects(f.evaluate({ ...request("external_directory"), tool: undefined }), /linkage/)
+  await assert.rejects(f.evaluate(request("external_directory"), config, AbortSignal.abort()), { name: "AbortError" })
   await assert.rejects(f.evaluate(request("x"), config, AbortSignal.abort()), { name: "AbortError" })
 })
 

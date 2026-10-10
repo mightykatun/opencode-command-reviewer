@@ -52,7 +52,6 @@ export type HistoryEvent =
   | { type: "permissionResolved"; context: HistoryReview; at: number; outcome: HistoryOutcome; payload: HistoryPayload }
   | { type: "permissionOutcome"; context: HistoryReview; at: number; outcome: "manual" | "rejected" }
   | { type: "sessionDeleted"; context: HistoryScope; at: number }
-export interface HistoryOperation { writer: string; sequence: number; event: HistoryEvent }
 export interface HistoryOrder { completed: number; tie: string; id: string }
 export type HistoryQuery =
   | { type: "totals"; conversation?: { scope: string; root: string } }

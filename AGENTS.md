@@ -86,7 +86,7 @@
 ## Host and build boundaries
 
 - Verified target: local Linux OpenCode **1.18.35**, pinned in the manifest and SDK.
-  Do not infer newer-host compatibility from README's broader minimum wording.
+  Newer host versions require separate compatibility verification.
   Use public `@opencode-ai/plugin/tui` APIs/slots, never private UI imports or native
   approval-dialog patches.
 - Package and plugin ID are `opencode-reviewer`. `src/tui.tsx` exports the default

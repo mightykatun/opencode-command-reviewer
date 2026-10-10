@@ -9,7 +9,6 @@ import { AssessmentFormatError, StreamingAssessment } from "./streaming-assessme
 import { diagnosticAttempt, type DiagnosticObserver } from "./diagnostics.js"
 import { AssessmentStreamError, httpFailure, networkFailure, TransportRetries } from "./transport-retry.js"
 export { withDeadline } from "./deadline.js"
-export type { ReviewProgress } from "./types.js"
 
 export function parseAssessment(content: string): Assessment {
   const parser = new StreamingAssessment()

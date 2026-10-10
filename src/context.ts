@@ -96,13 +96,9 @@ function invocationFor(request: PermissionRequest, verified: Invocation): Invoca
 
 export async function loadContext(request: PermissionRequest, reader: ContextReader, signal: AbortSignal, scope: FileScope = fileAccess.scope(signal), verified?: Invocation): Promise<CommandContext | null> {
   signal.throwIfAborted()
-  if (request.permission !== "bash" && request.permission !== "external_directory") return null
-  if (!request.tool) {
-    if (request.permission === "external_directory") return null
-    throw new Error("Native shell tool context unavailable")
-  }
+  if (request.permission !== "bash") return null
+  if (!request.tool) throw new Error("Native shell tool context unavailable")
   const invocation = verified ? invocationFor(request, verified) : await nativeInvocation(request, reader, signal, "shell")
-  if (invocation.tool !== "bash" && request.permission === "external_directory") return null
   if (invocation.tool !== "bash") throw new Error("Pending native shell arguments unavailable")
   const { command, workdir } = invocation.input
   if (typeof command === "string" && command.length > 16 * 1024 * 1024) throw new Error("Shell command exceeds the 16 MiB preprocessing limit")

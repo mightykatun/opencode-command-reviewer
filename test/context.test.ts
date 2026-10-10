@@ -202,12 +202,12 @@ test("does not associate unrelated tool calls or non-shell requests", async () =
   assert.equal(await loadContext({ ...request, permission: "edit" }, reader(), new AbortController().signal), null)
 })
 
-test("forwards exact directory permission scope, metadata and proposed always patterns", async () => {
-  const external: PermissionRequest = { ...request, permission: "external_directory", patterns: ["/execution/*"], always: ["/execution/*"], metadata: { command: "python x.py", directories: ["/execution"], patterns: ["/execution/*"] } }
-  const result = await loadContext(external, reader(), new AbortController().signal)
+test("shell context and collection preserve exact permission scope, metadata and proposed always patterns", async () => {
+  const shell: PermissionRequest = { ...request, patterns: ["python x.py"], always: ["python *"], metadata: { command: "python x.py" } }
+  const result = await loadContext(shell, reader(), new AbortController().signal)
   assert.ok(result)
-  assert.deepEqual(result.permission, { id: external.id, type: external.permission, patterns: external.patterns, always: external.always, metadata: external.metadata, tool: external.tool })
-  assert.notEqual(result.permission!.metadata, external.metadata)
+  assert.deepEqual(result.permission, { id: shell.id, type: shell.permission, patterns: shell.patterns, always: shell.always, metadata: shell.metadata, tool: shell.tool })
+  assert.notEqual(result.permission!.metadata, shell.metadata)
   const evidence = await collectEvidence(result, { maxFiles: 4, maxEvidenceBytes: 65536 }, new AbortController().signal)
   assert.deepEqual(evidence.permission, result.permission)
   assert.deepEqual(evidence.session, result.session)
@@ -215,10 +215,10 @@ test("forwards exact directory permission scope, metadata and proposed always pa
   assert.ok(evidence.limitations.includes(result.limitations[0]!))
 })
 
-test("external-directory requests from reads are not sent for shell review", async () => {
-  const readPart: Part = { ...tool, tool: "read" }
-  assert.equal(await loadContext({ ...request, permission: "external_directory" }, reader({ message: async () => ({ info: assistant, parts: [readPart] }) }), new AbortController().signal), null)
-  assert.equal(await loadContext({ ...request, permission: "external_directory", tool: undefined }, reader(), new AbortController().signal), null)
+test("external-directory requests bypass the shell context loader before invocation lookup", async () => {
+  const host = reader({ message: async () => { throw new Error("directory requests belong to the directory evaluator") } })
+  assert.equal(await loadContext({ ...request, permission: "external_directory" }, host, new AbortController().signal), null)
+  assert.equal(await loadContext({ ...request, permission: "external_directory", tool: undefined }, host, new AbortController().signal), null)
 })
 
 test("distinguishes root repo, subagent directory, linked worktree and absolute command cwd", async () => {

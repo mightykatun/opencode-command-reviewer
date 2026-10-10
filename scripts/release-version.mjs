@@ -89,6 +89,6 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
   assert.match(process.env.RELEASE_COMMIT ?? "", /^[a-f0-9]{40}$/, "Expected the verified tag commit")
   assert.match(process.env.GITHUB_RUN_ATTEMPT ?? "", /^[1-9]\d*$/, "Expected the validation attempt")
   if (process.env.GITHUB_OUTPUT) await appendFile(process.env.GITHUB_OUTPUT,
-    `prerelease=${prerelease}\nversion=${pkg.version}\ntag=${process.env.RELEASE_TAG}\ncommit=${process.env.RELEASE_COMMIT}\nvalidation_attempt=${process.env.GITHUB_RUN_ATTEMPT}\n`)
+    `version=${pkg.version}\ntag=${process.env.RELEASE_TAG}\ncommit=${process.env.RELEASE_COMMIT}\nvalidation_attempt=${process.env.GITHUB_RUN_ATTEMPT}\n`)
   console.log(`Verified ${process.env.RELEASE_TAG}: ${prerelease ? "prerelease (next)" : "stable (latest)"}`)
 }

@@ -13,7 +13,7 @@ This plugin is meant to enable you to run sessions with less frequent input in a
 
 ![](./assets/recording.gif)
 
-Requires OpenCode 1.18.35 or newer on Linux.
+Verified with OpenCode 1.18.35 on Linux.
 
 ## Install and config
 

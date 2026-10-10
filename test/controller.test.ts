@@ -3,12 +3,16 @@ import assert from "node:assert/strict"
 import { setTimeout as sleep, setImmediate as settle } from "node:timers/promises"
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
 import { Controller as CoreController, displayText, visibleReview, type View } from "../src/controller.js"
-import { loadContext, type ContextReader } from "../src/context.js"
+import type { ContextReader } from "../src/context.js"
+import { evaluateEvidence } from "../src/evaluate.js"
+import { FileAccess } from "../src/file-access.js"
+import { parseConfig } from "../src/config.js"
 import { withDeadline } from "../src/reviewer.js"
 import type { Assessment, ReviewProgress, ReviewTiming } from "../src/types.js"
 import { SessionModes } from "../src/session-mode.js"
 
-// Existing directory lifecycle cases opt into the newly independent category.
+// Lifecycle seams explicitly control classification/completion. Composition cases
+// below use evaluateEvidence; directory review is independently enabled in both.
 class Controller extends CoreController {
   constructor(...args: ConstructorParameters<typeof CoreController>) {
     super(args[0], args[1], { ...args[2], reviewOptions: { reviewBash: true, reviewEdits: true, reviewExternalDirectories: true, ...args[2]?.reviewOptions } })
@@ -19,12 +23,14 @@ const request = (id: string, sessionID = "root", permission = "bash"): Permissio
 const result: Assessment = { safe: true, desc: "Counts fruit." }
 const tick = () => sleep(0)
 const getSession = (id: string) => ({ id })
+const config = parseConfig({ baseURL: "http://fixture.invalid/v1", model: "fixture", reviewExternalDirectories: true })
 
 const contextReader = (message: ContextReader["message"]): ContextReader => ({
   message,
   session: async () => undefined,
   messages: async () => [],
   projects: async () => [],
+  toolIDs: async () => ["bash"],
 })
 
 const shellMessage: ContextReader["message"] = async (sessionID, messageID) => ({
@@ -265,10 +271,8 @@ for (const failure of ["missing message", "reader error", "timeout"] as const) {
       if (req.id === "c-later") return Promise.resolve(result)
       callbacks.push(onIdentified)
       return withDeadline(parent, failure === "timeout" ? 10 : 1000, async (signal) => {
-        const context = await loadContext(req, reader, signal)
-        if (!context) return null
-        onIdentified()
-        return result
+        const evidence = await evaluateEvidence(req, reader, config, config, "", signal, onIdentified, new FileAccess())
+        return evidence ? result : null
       })
     }, (views) => {
       publications++
@@ -279,7 +283,8 @@ for (const failure of ["missing message", "reader error", "timeout"] as const) {
     controller.asked(request("b-bash"))
     controller.asked(request("c-later"))
     await failed
-    const expected = failure === "timeout" ? "Review timed out" : "Pending native shell message unavailable or arguments mismatched"
+    const expected = failure === "timeout" ? "Permission context lookup timed out"
+      : failure === "reader error" ? "Context unavailable" : "Pending tool message unavailable or mismatched"
     assert.equal(controller.views[0]?.error, expected)
     assert.equal(controller.views[0]?.assessment, undefined)
     assert.equal(controller.views[2]?.status, "complete")
@@ -302,9 +307,9 @@ test("context-identified directory review failures remain visible without a rati
   let finished!: () => void
   const failed = new Promise<void>((resolve) => { finished = resolve })
   const controller = new Controller(async (req, signal, onIdentified) => {
-    const context = await loadContext(req, contextReader(shellMessage), signal)
-    assert.ok(context)
-    onIdentified()
+    const evidence = await evaluateEvidence(req, contextReader(shellMessage), config, config, "", signal, onIdentified, new FileAccess())
+    assert.equal(evidence?.kind, "external-directory")
+    assert.ok(evidence && !("files" in evidence))
     throw new Error("Reviewer HTTP 503")
   }, (views) => { if (views[0]?.error) finished() })
   t.after(() => controller.dispose())
@@ -475,13 +480,14 @@ test("directory identification reveals analysis before completion and late ident
   assert.equal(visibleReview(controller.views, "root", getSession), completed)
 })
 
-test("unrelated external-directory requests remain hidden and each permission stage is reviewed separately", async () => {
+test("a null evaluator result stays hidden and directory/execution stages deduplicate independently", async () => {
   const evaluated: string[] = []
-  const controller = new Controller(async (req) => { evaluated.push(req.id); return req.id === "file-read" ? null : result }, () => {})
-  controller.asked(request("file-read", "root", "external_directory"))
+  // This is a deterministic lifecycle seam, not a claim that directory reads are unsupported.
+  const controller = new Controller(async (req) => { evaluated.push(req.id); return req.id === "unrelated" ? null : result }, () => {})
+  controller.asked(request("unrelated", "root", "external_directory"))
   await tick()
   assert.equal(controller.views[0]?.status, "unrelated")
-  controller.replied("file-read")
+  controller.replied("unrelated")
   const directory = request("directory", "root", "external_directory")
   const execution = { ...request("execute", "root", "bash"), tool: directory.tool }
   controller.asked(directory)
@@ -490,7 +496,7 @@ test("unrelated external-directory requests remain hidden and each permission st
   controller.asked(execution)
   controller.asked(execution)
   await tick()
-  assert.deepEqual(evaluated, ["file-read", "directory", "execute"])
+  assert.deepEqual(evaluated, ["unrelated", "directory", "execute"])
   assert.equal(controller.views[0]?.request.permission, "bash")
   controller.dispose()
 })

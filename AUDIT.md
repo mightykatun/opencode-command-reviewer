@@ -42,16 +42,17 @@ Implementation starts from `0aaf9d6`. Checkboxes require passing evidence, not a
   - [x] Verify the exact six-category sound mapping in emitted and packed bundles.
   - [x] Pass helper, reproducibility/archive, and npm 12.2.0 smoke checks without publishing; record outputs.
   - [x] Commit the verified W5 checkpoint: `b2c6e22`.
-- [ ] W6: maintainability, fixture reliability, and scoped maintenance (A18-A23, A26-A28)
+- [x] W6: maintainability, fixture reliability, and scoped maintenance (A18-A23, A26-A28)
   - [x] Inventory runtime entrypoints/scenarios and add a pinned-host CI selection with host-independent completeness checks.
   - [x] Share atomic serialized observation publication and selected-result/postcondition palette synchronization.
   - [x] Extract smoke scenario descriptors/families while preserving independent assertions and planning mode.
   - [x] Commit the verified W6a fixture-infrastructure checkpoint: `3b5001c`.
   - [x] Replace positional reviewer/controller injection with named dependencies and a distinct historical replay adapter.
   - [x] Extract the corrected live panel with explicit lifecycle ownership and stable request keying.
-  - [ ] Commit the verified W6b interface/panel checkpoint.
-  - [ ] Align compatibility/docs, remove confirmed unused interfaces/output/legacy routes, and evaluate compatible dependency updates.
-  - [ ] Pass aggregate/package/helper and representative real-host checks for changed surfaces; record outputs and commit.
+  - [x] Commit the verified W6b interface/panel checkpoint: `dd3c41a`.
+  - [x] Align compatibility/docs, remove confirmed unused interfaces/output/legacy routes, and evaluate compatible dependency updates.
+  - [x] Pass aggregate/package/helper and representative real-host checks for changed surfaces; record outputs.
+  - [ ] Commit the verified W6c cleanup/dependency checkpoint.
 - [ ] Final integration
   - [ ] Reconcile every A01-A28 item with implemented changes or an evidence-backed disposition.
   - [ ] Run final required checks, inspect diff/status, verify plan marks and commit history, and report exact remaining limitations.
@@ -139,6 +140,21 @@ W6a inventory covers 21 entrypoints and 11 helpers with aliases, scenarios/flags
 **W6b (A21,A23):** `live-review-panel.tsx` now owns renderable/readiness/frame/cleanup state and UI controls; `tui.tsx` retains service and route/history composition, stable sibling root, and request-ID keys. `ReviewGeometryProof` is unchanged. Reviewer and controller dependencies use named objects; historical/current replay adapters are separate and the historical tag is resolved to an immutable commit. `npm run check` passed **981 source tests**, **111 helpers**, typecheck, and build. Package reproducibility/five-file checks and **9 artifact/npm CLI tests** passed. Verified bundle SHA-256: `9cd301b38cf166afd36734b2b735803ac8c17762fd49e20f295dc2a76a158bd4`.
 
 Actual usage replay passed for current code and `v0.7.0` commit `a8a8b1e63e050d2d8e2703f79d85e42a21a8a8ae`: two POSTs, 2,700 input/70 output tokens, one retry/review, stable repeated/restart totals, retained failed/interrupted usage (`.runtime/usage-history-audit.json`, `.runtime/runtime-run-opzYPM/results.json`). The CI profile passed **7/7** (`.runtime/runtime-run-4pF736/`), followed by eight host cases: initially-short (`runtime-run-O0X4nw`), history-short (`runtime-run-m431d1`), history covered (`runtime-run-ocDgSE`), history notification (`runtime-run-6Hk9g8`), truncated/static/stats (`runtime-run-Ikr14Z`), statistics (`runtime-run-emLBgV`), history countdown (`runtime-run-eGNFSm`), and auto-scroll (`runtime-run-IKFzLK`), all under `.runtime/` with `results.json`. These are 15 exact host cases, not a full matrix.
+
+**W6c (A26-A28):** removed `HistoryOperation`, reviewer `ReviewProgress` re-export, unused workflow `prerelease` output, and the obsolete directory-to-shell context branch. Directory lifecycle tests now use production `evaluateEvidence`; scope/identity/cancellation/no-file-probe coverage remains. Compatibility wording names the verified host, and the stale layout comment is corrected. Focused context/controller/tools passed **102/102**; release-version/workflow passed **19/19**; typecheck passed.
+
+Dependency disposition: TypeScript upgraded from **5.8.2 to 5.9.3**, respecting `bun-ffi-structs`' TypeScript `^5` peer. Current registry metadata confirms `babel-preset-solid@1.9.16` requires Solid `^1.9.16`, incompatible with OpenTUI 0.4.5's exact Solid **1.9.12** peer. Preserve the verified OpenTUI/Solid/preset group; Babel 8 and TypeScript 7 remain separate compatibility migrations, and Node types remain aligned with supported Node majors. This is the evidence-backed A28 disposition, not an unimplemented vulnerability fix. Fresh `npm audit --json` returned **zero vulnerabilities** across 180 locked dependencies.
+
+Final code-state verification after `npm ci --ignore-scripts`: `npm run check` passed typecheck, **981 source tests**, **111 helpers**, and build. `npm run check:package` proved two identical builds, all-six sound mapping, exact five-file archive (**888,488 unpacked bytes**), SHA-256 **`06aeba29f5d8ee7ab8e50e8ccd3241f85bc43d7452179e4db0f70fcd930b2c1c`**. Artifact/npm CLI suite passed **9/9**. Aggregate log: `/home/user/.local/share/opencode/tool-output/tool_12499dbd90018YeKXQtDIDQ7Aa`.
+
+```text
+node scripts/test-runtime.mjs --profile ci                     PASS 7/7 .runtime/runtime-run-f4vCip/results.json
+node scripts/test-runtime.mjs smoke.mjs external               PASS .runtime/runtime-run-UuUESo/results.json
+node scripts/test-runtime.mjs smoke-evidence.mjs               PASS .runtime/runtime-run-Vf7p7Y/results.json
+node scripts/test-runtime.mjs smoke-evidence.mjs prompt-symlink PASS .runtime/runtime-run-NZmVjN/results.json
+```
+
+These final ten host cases ran serially through the runner against OpenCode 1.18.35. Phase-specific runs above additionally verify geometry restoration/history cover, notification saturation/latest click/sound-only, migration/maintenance/ancestry, and retained-history selection. Physical sound/GNOME focus, live external signing/registry publication, remote GitHub CI execution, and untested newer host versions remain outside the verification claims.
 
 ## 1. Scope, provenance, and status
 

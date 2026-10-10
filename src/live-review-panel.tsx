@@ -258,7 +258,7 @@ export function LiveReviewPanel(props: LiveReviewPanelProps) {
     })
   }
   return (
-    // OpenCode 1.18.34's sidebar is 42 columns, including its padding.
+    // The verified host's sidebar is 42 columns, including its padding.
     // The app slot lets this cover its title, sections, and footer while
     // the original sidebar remains mounted beneath it.
     <box ref={(value: BoxRenderable) => { panel = value }} renderAfter={() => {
