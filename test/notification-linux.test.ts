@@ -317,13 +317,13 @@ for (const outcome of ["play", "resolution", "preemption", "deletion", "disposal
     }, dispose() { for (const finish of held) finish() },
   }
   const config = parseNotificationConfig({ notificationSoundDirectory: directory, staleReminderSeconds: 0,
-    notifications: { approved: { banner: false }, ended: { banner: false }, question: { banner: false } } })
+    notifications: { approved: { banner: false, sound: true }, ended: { banner: false }, question: { banner: false } } })
   const backend = new LinuxNotifications(config, () => {}, processes, null)
   const policy = new NotificationPolicy(config, true, backend)
   t.after(() => policy.dispose())
   const target = { root: "root", sessionID: "root", title: "Fixture" }
   policy.approved({ id: "p", sessionID: "root", permission: "bash", patterns: [], always: [], metadata: {} }, target)
-  policy.turn("ended", "turn", target)
+  policy.turn("ended", "turn", { root: "other", sessionID: "other", title: "Other session" })
   const deadline = performance.now() + 2000
   while (played.length < 2 && performance.now() < deadline) await settle()
   assert.equal(played.length, 2)

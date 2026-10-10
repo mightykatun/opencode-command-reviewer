@@ -345,10 +345,11 @@ test("display follows root/direct-child approval order and hides unrelated sessi
   controller.asked(request("other-request", "other"))
   await tick()
   assert.equal(visibleReview(controller.views, "root", get)?.request.id, "sub-request")
-  assert.equal(visibleReview(controller.views, "sub", get), undefined)
+  assert.equal(visibleReview(controller.views, "sub", get)?.request.id, "sub-request")
   assert.equal(visibleReview(controller.views, undefined, get), undefined)
   controller.asked(request("root-request", "root", "read"))
   assert.equal(visibleReview(controller.views, "root", get), undefined)
+  assert.equal(visibleReview(controller.views, "sub", get), undefined, "child navigation cannot bypass the root queue blocker")
   controller.dispose()
 })
 
@@ -392,7 +393,10 @@ test("mixed-case session IDs take precedence over request IDs within root/direct
     }
     assert.equal(visibleReview(pending, "ses_a", get), undefined)
   }
-  for (const route of ["ses_A", "ses_B", "ses_1", "missing", undefined]) {
+  for (const route of ["ses_A", "ses_B"]) {
+    assert.equal(visibleReview(views, route, get)?.request.id, "per_z", "sibling routes retain root queue priority")
+  }
+  for (const route of ["ses_1", "missing", undefined]) {
     assert.equal(visibleReview(views, route, get), undefined)
   }
 })

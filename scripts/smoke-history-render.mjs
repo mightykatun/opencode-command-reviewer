@@ -308,7 +308,7 @@ try {
   assert.ok(Number(executions[0]) - terminalAt >= delay * 1000)
   assert.ok(Number(executions[0]) - startedAt >= delay * 1000 - 300)
   const reply = record.diagnostics.find(event => event.phase === "approval-reply")
-  assert.ok(reply.at - ready.at >= (delay ? delay + 1 : 0) * 1000 - 100, "positive countdown retains initial hold")
+  assert.ok(reply.at - ready.at >= (delay ? delay * 1000 + 200 : 0) - 100, "positive countdown retains its short initial grace")
   if (scenario === "countdown") {
     assert.ok(reply.at - ready.at < (delay + 2.5) * 1000, "cover changes did not restart countdown")
     const frames = record.renders.filter(event => event.stage === "frame" && event.auto === "countdown")
@@ -346,7 +346,7 @@ try {
     await until(async () => (await data()).notifications.some(event => event.kind === "ended"))
     const before = (await data()).notifications
     const callsBeforeReplay = calls.length
-    assert.equal(before.filter(event => event.kind === "approved" && event.sound).length, 1)
+    assert.equal(before.filter(event => event.kind === "approved" && event.sound).length, 0, "approval banners are silent by default")
     assert.deepEqual(before.filter(event => event.kind === "attention"), [],
       "Safe requests awaiting rendering/history-covered countdown stay silent")
     send("Left")

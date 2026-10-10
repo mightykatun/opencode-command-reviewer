@@ -50,7 +50,7 @@ OpenCode installs the [npm package](https://www.npmjs.com/package/opencode-revie
           "attention": { "banner": true, "sound": true },
           "unsafe": { "banner": true, "sound": true },
           "question": { "banner": true, "sound": true },
-          "approved": { "banner": true, "sound": true },
+          "approved": { "banner": true, "sound": false },
           "error": { "banner": true, "sound": true },
           "ended": { "banner": true, "sound": true }
         },
@@ -106,11 +106,11 @@ inclusive, fractions are invalid, and the maximum safe integer is
 | `autoApprove` | boolean | `false` | Allow Safe reviews once automatically. Normally waits for completion, validation, rendering and the countdown, including behind this plugin's report history. |
 | `fastMode` | boolean | `false` | Requires `autoApprove: true`. Approve a visible, front-of-queue request as soon as a Safe rating is parsed, bypassing the countdown. Respects `stream`; with `stream: false`, waits for the complete validated response. Finish the report and save it in the background after approval. |
 | `extraCareful` | boolean | `true` | Include extra-careful guidance when `autoApprove` is enabled. Setting `false` omits that guidance without disabling automatic approval. |
-| `autoApproveDelaySeconds` | integer | `15` | `0`–`3600` seconds. Positive values have an extra one-second initial hold; `0` skips the wait but retains rendering and eligibility checks. Ignored in fast mode. |
+| `autoApproveDelaySeconds` | integer | `15` | `0`–`3600` seconds. Positive values include an extra 200 ms initial grace; `0` skips the wait but retains rendering and eligibility checks. Ignored in fast mode. |
 | `notify` | boolean | `true` | Master switch for desktop banners, sounds and reminders. `false` overrides all per-type controls. |
 | `notifySound` | boolean | `true` | Master switch for notification audio. `false` silences every type and reminder without disabling enabled banners. |
 | `staleReminderSeconds` | integer | `60` | `0` through the maximum safe integer, in seconds. `0` disables reminders; otherwise eligible pending human interactions repeat at this interval, limited to the native front-of-queue blocker per conversation. |
-| `notifications` | object | All types: `banner: true`, `sound: true` | Keys: `attention`, `unsafe`, `question`, `approved`, `error`, `ended`. Each entry is an object with optional `banner` and `sound` booleans. Omitted types/fields remain enabled; unknown types/fields are invalid. Controls also apply to reminders. |
+| `notifications` | object | All banners enabled; all sounds enabled except `approved` | Keys: `attention`, `unsafe`, `question`, `approved`, `error`, `ended`. Each entry is an object with optional `banner` and `sound` booleans. Omitted types/fields retain their defaults; unknown types/fields are invalid. Controls also apply to reminders. |
 | `notificationSoundDirectory` | string | Unset (bundled sounds) | Absolute, NUL-free path, at most 4096 string code units. Use the six notification type names as basenames: usable `.wav` first, then `.mp3`, then the corresponding bundled sound. |
 | `formatRetries` | integer | `1` | `0`–`100` additional assessment-format correction attempts. `0` disables format corrections, not independent transport recovery. |
 | `maxOutputTokens` | integer | `4096` | `1` through the maximum safe integer. Sent as `max_tokens` on every reviewer POST, including retries/corrections. Your provider/model enforces its supported output limit. |
@@ -130,6 +130,10 @@ My LLMs insist on writing a bunch of useless text to my README, so I collapsed t
 The sidebar shows Safe, Unsafe, or Analysis unavailable. Explanations support
 Markdown and scrolling. If the sidebar is hidden, use OpenCode's Show sidebar
 command.
+
+When browsing a direct subagent, the same front-of-queue review appears in a
+right-hand panel at terminal widths of at least 120 columns. Its auto-approval
+countdown can start there without returning to the parent conversation.
 
 Skill-load review is enabled by default; set `skill` permissions to `ask` in
 `opencode.json` to receive reviews. Its prompt requires both bounded risk and clear
@@ -184,8 +188,8 @@ or Cancel to leave the request manual. Hiding or covering the panel also cancels
 that request's countdown, except when covered by this plugin's report history.
 Cancel before using native Allow always or rejection
 forms; those forms alone do not stop the countdown.
-Positive countdowns hold their configured starting number for one extra second
-before counting down. A zero-second setting still approves without that hold.
+Positive countdowns add a 200 ms initial grace and then update on remaining-time
+boundaries. A zero-second setting still approves without that grace.
 
 `/reviewer-disable` and `/reviewer-enable` control the current conversation and its
 descendants. The setting is saved for resume. Both commands are also in the command
@@ -291,11 +295,12 @@ terminal is focused:
   with its own sound. Provisional streamed ratings never notify.
 - **Agent has a question:** a pending agent question at the front of the native
   input queue, with its own sound.
-- **Reviewer approved a permission:** sent with the approval sound after confirmed
+- **Reviewer approved a permission:** a silent banner by default, sent after confirmed
   automatic approval, including fast mode while its report is still streaming.
   Positive and zero delays also notify on success; the countdown is silent.
-  Approval sounds are limited to
-  one every two seconds, including delayed playback.
+  Opt in with `notifications.approved.sound: true`. Approval sounds are limited to
+  one every two seconds, including delayed playback. Sounds from the same session
+  wait for the previous player to finish, so successive alerts do not overlap.
 - **Session error:** an unrecovered session/provider failure, not a review failure.
 - **Session ended:** a completed root-agent response, not a question/permission
   pause or an explicit user interruption.
@@ -311,7 +316,7 @@ actionable position, restarting analysis or entering automatic approval cancels
 pending attention delivery and reminders.
 
 Each type's `banner` and `sound` can be controlled independently. For example,
-`notifications.approved.banner: false` keeps approval sounds without banners;
+`notifications.approved: { "banner": false, "sound": true }` enables approval sounds without banners;
 `notifications.question.sound: false` keeps question banners silent. Set both to
 `false` to disable that type. `notify: false` overrides all types and disables
 reminders too; `notifySound: false` silences all types and their reminders.

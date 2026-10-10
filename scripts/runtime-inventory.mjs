@@ -27,7 +27,7 @@ export const runtimeInventory = {
       rules: [rule("stats", { scenarios: ["complete", "retry", "truncated", "nonstream"] })] }),
   "smoke-fast-mode.mjs": host(["complete", "retry", "error", "nonstream", "hidden", "dialog"], [], { requires: ["linux", "git", "python3", "tmux", "bundle", "node-sqlite"] }),
   "smoke-session-mode.mjs": host(["default"], ["notifications"], { requires: ["linux", "git", "python3", "tmux", "bundle"] }),
-  "smoke-skills.mjs": host(["root", "subagent", "disabled", "unsafe", "fast"], [], { requires: ["linux", "git", "python3", "tmux", "bundle", "node-sqlite"] }),
+  "smoke-skills.mjs": host(["root", "subagent", "subagent-view", "disabled", "unsafe", "fast"], [], { requires: ["linux", "git", "python3", "tmux", "bundle", "node-sqlite"] }),
   "smoke-evidence.mjs": host(["capture", "prompt-symlink"], [], { requires: ["linux", "git", "python3", "bash", "tmux", "bundle"] }),
   "smoke-approval-geometry.mjs": host(["resize", "initially-short", "history-short"], [], { requires: ["linux", "git", "python3", "tmux", "bundle"] }),
   "smoke-history.mjs": host(["browse", "scroll", "empty-error", "resume", "shared", "delete", "visibility", "disabled-invalid"], [], {

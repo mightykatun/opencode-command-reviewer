@@ -39,7 +39,7 @@ export function parseNotificationConfig(options: Record<string, unknown> = {}): 
     const entry = Object.hasOwn(input, kind) ? object(input[kind], `notifications.${kind}`) : {}
     for (const key of Object.keys(entry)) if (key !== "banner" && key !== "sound") throw new Error(`Unknown notifications.${kind} setting: ${key}`)
     const control = (key: "banner" | "sound") => {
-      const value = Object.hasOwn(entry, key) ? entry[key] : true
+      const value = Object.hasOwn(entry, key) ? entry[key] : !(kind === "approved" && key === "sound")
       if (typeof value !== "boolean") throw new Error(`notifications.${kind}.${key} must be a boolean`)
       return value
     }

@@ -37,11 +37,11 @@ function fixture(auto = false, notify = true, sound = true, options: Record<stri
   } }
 }
 
-test("notification settings are independently strict, default on, and use absolute sound paths", () => {
+test("notification settings are independently strict, default to silent approval banners, and use absolute sound paths", () => {
   assert.deepEqual(parseNotificationConfig(), { notify: true, notifySound: true, notificationSoundDirectory: undefined,
     staleReminderSeconds: 60, notifications: {
       attention: { banner: true, sound: true }, unsafe: { banner: true, sound: true }, question: { banner: true, sound: true },
-      approved: { banner: true, sound: true }, error: { banner: true, sound: true }, ended: { banner: true, sound: true },
+      approved: { banner: true, sound: false }, error: { banner: true, sound: true }, ended: { banner: true, sound: true },
     } })
   for (const name of ["notify", "notifySound"]) for (const value of [null, "true", 0, [], {}]) {
     assert.throws(() => parseNotificationConfig({ [name]: value }), new RegExp(`${name} must be a boolean`))
@@ -187,12 +187,13 @@ test("zero-delay success requires its explicit fact, not countdown or request di
   await settle(); assert.equal(f.messages.length, 0)
   f.policy.snapshot([]); f.policy.approved(view().request, target); await settle()
   assert.equal(f.messages[0]?.title, "Reviewer approved a permission")
+  assert.equal(f.messages[0]?.sound, false)
   f.policy.approved(view().request, target); await settle(); assert.equal(f.messages.length, 1)
   f.policy.dispose()
 })
 
 test("positive countdown stays silent through submission and only confirmed success plays approval", async () => {
-  const f = fixture(true); f.add(view("a", "complete"))
+  const f = fixture(true, true, true, { notifications: { approved: { sound: true } } }); f.add(view("a", "complete"))
   f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 15 } }])
   await f.advance(1000)
   f.policy.snapshot([{ ...view("a", "complete"), autoApproval: { status: "countdown", seconds: 14 } }])
@@ -211,7 +212,7 @@ test("positive countdown stays silent through submission and only confirmed succ
 })
 
 test("every reviewer banner is delivered but its audio is rate limited without suppressing attention", async () => {
-  const f = fixture(true)
+  const f = fixture(true, true, true, { notifications: { approved: { sound: true } } })
   f.policy.pending(new Map([["root", { kind: "question", id: "q" }]]))
   for (const id of ["a", "b"]) f.policy.approved(view(id).request, target)
   f.policy.question("q", target, true); await settle()
@@ -252,6 +253,9 @@ test("notification controls reject malformed schemas and default omitted entries
   assert.deepEqual(config.notifications.unsafe, { banner: false, sound: true })
   assert.deepEqual(config.notifications.question, { banner: true, sound: false })
   assert.deepEqual(config.notifications.attention, { banner: true, sound: true })
+  assert.deepEqual(config.notifications.approved, { banner: true, sound: false })
+  assert.deepEqual(parseNotificationConfig({ notifications: { approved: { banner: false } } }).notifications.approved,
+    { banner: false, sound: false })
 })
 
 test("Unsafe is final-only, replaces an earlier fallback, and never follows a preliminary canceled-review alert", async () => {

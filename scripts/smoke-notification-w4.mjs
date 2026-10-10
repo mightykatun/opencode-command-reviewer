@@ -145,6 +145,7 @@ try {
     provider: { fixture: { npm: "@ai-sdk/openai-compatible", options: { baseURL: base + "/main", apiKey: "fixture" }, models: { fixture: { name: "Fixture", limit: { context: 32000, output: 16000 } } } } } }
   const tui = path.join(temp, "tui.json")
   await writeFile(tui, JSON.stringify({ plugin: [[plugin, { baseURL: base + "/review", model: "fixture", notify: true, notifySound: scenario === "capacity",
+    notifications: { approved: { sound: true } },
     staleReminderSeconds: 0, autoApprove: scenario !== "baseline", reviewBash: scenario !== "baseline", autoApproveDelaySeconds: 0, timeoutMs: 120000 }]] }))
   const env = { OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_CONFIG: "", OPENCODE_CONFIG_DIR: path.join(temp, "config"), OPENCODE_TUI_CONFIG: tui,
     OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_EXTERNAL_SKILLS: "1", OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1" }
@@ -162,15 +163,15 @@ try {
     await until(() => heldReviews.length === count)
     heldReviews.toSorted((a, b) => a.id < b.id ? -1 : 1)[0].release()
     await until(async () => sounds(await data()).length === 1)
-    // Deliberately cross the approval-sound rate interval before releasing the
-    // remaining reports, so two real player slots are occupied before saturation.
+    // Cross the approval-sound interval with a held player. Later sounds in
+    // this same conversation must still wait for its physical settlement.
     await sleep(2100)
     for (const review of heldReviews) review.release()
     await until(async () => (await data()).events.filter(e => e.type === "permission.replied").length === count, 150000)
     await until(async s => s.includes("W4 controlled question") && banners(await data()).some(b => b.args.at(-1) === "Agent has a question"))
     const before = await data()
     assert.equal(banners(before).filter(b => b.args.at(-1) === "Reviewer approved a permission").length, 16)
-    assert.equal(sounds(before).length, 2)
+    assert.equal(sounds(before).length, 1, "same-session notifications must not overlap")
     assert.ok(before.peak <= 24)
     assert.ok(!sounds(before).some(s => s.args.at(-1).endsWith("question.wav")))
     await writeFile(path.join(temp, "release"), "release")

@@ -16,6 +16,7 @@ const bundled = typeof __REVIEW_SOUNDS__ === "undefined" ? {} : __REVIEW_SOUNDS_
 export class NotificationAudio {
   private stopped = false
   private active = 0
+  private playingRoots = new Set<string>()
   private preparing = 0
   private temporary?: Promise<string>
   private prepared = new Map<NotificationKind, Promise<string | undefined>>()
@@ -112,6 +113,7 @@ export class NotificationAudio {
       const cancel = () => { if (this.plays.items.includes(job)) { this.plays.remove(job); finish() } }
       const job = { root, kind, attention: actionable(kind), cancel, run: () => {
         this.active++
+        this.playingRoots.add(root)
         const reservation = kind === "approved" ? this.approvalStarting = Symbol() : undefined
         const worker = this.playNow(kind, signal, root, () => {
           if (reservation && this.approvalStarting === reservation) {
@@ -120,7 +122,7 @@ export class NotificationAudio {
           dispatched()
         }).finally(() => {
           if (reservation && this.approvalStarting === reservation) this.approvalStarting = undefined
-          this.active--; finish(); this.playNext()
+          this.active--; this.playingRoots.delete(root); finish(); this.playNext()
         })
         this.transactions.add(worker)
         void worker.then(() => this.transactions.delete(worker), () => this.transactions.delete(worker))
@@ -133,9 +135,11 @@ export class NotificationAudio {
   private playNext() {
     if (this.stopped) return
     while (this.active < 2) {
-      const job = this.plays.take(value => value.kind !== "approved" || (!this.approvalStarting && performance.now() - this.lastApproval >= 2000))
+      const job = this.plays.take(value => !this.playingRoots.has(value.root)
+        && (value.kind !== "approved" || (!this.approvalStarting && performance.now() - this.lastApproval >= 2000)))
       if (!job) {
-        if (this.plays.items.length && !this.approvalStarting && !this.wake) this.wake = setTimeout(() => { this.wake = undefined; this.playNext() },
+        // Root ownership is released by actual player settlement, not a timer.
+        if (this.plays.items.some(value => !this.playingRoots.has(value.root)) && !this.approvalStarting && !this.wake) this.wake = setTimeout(() => { this.wake = undefined; this.playNext() },
           Math.max(1, 2000 - (performance.now() - this.lastApproval)))
         return
       }

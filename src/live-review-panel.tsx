@@ -200,6 +200,7 @@ export function LiveReviewPanel(props: LiveReviewPanelProps) {
     } catch { /* Fixture observations cannot change approval behavior. */ }
   }
   const visible = (frame = false) => {
+    if (!props.sidebarSession()) return
     if (!geometry.visible({ width: api.renderer.width, height: api.renderer.height, fast: config?.fastMode === true,
       panel, heading, rating: ratingRegion, report: scroll, footer }, frame) || select()?.request.id !== id) return
     // Fast mode needs the current native blocker physically visible,
@@ -260,7 +261,8 @@ export function LiveReviewPanel(props: LiveReviewPanelProps) {
   return (
     // The verified host's sidebar is 42 columns, including its padding.
     // The app slot lets this cover its title, sections, and footer while
-    // the original sidebar remains mounted beneath it.
+    // the original sidebar remains mounted beneath it on root routes. Child
+    // routes have no native sidebar, but use this same physical presentation.
     <box ref={(value: BoxRenderable) => { panel = value }} renderAfter={() => {
       const assessment = view().assessment
       if (assessment && paintedAssessment !== assessment && description && !description.isDestroyed

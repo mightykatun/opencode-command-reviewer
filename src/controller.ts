@@ -179,9 +179,9 @@ export class Controller {
       return
     }
     const seconds = this.options.autoApproveDelaySeconds ?? 15
-    // Hold the configured starting number for one extra second so the first
-    // rendered countdown value is observable. Zero remains an immediate attempt.
-    entry.deadline = this.time.now() + (seconds + (seconds > 0 ? 1 : 0)) * 1000
+    // A short initial grace makes the starting value observable without adding
+    // a full second. Zero remains an immediate attempt.
+    entry.deadline = this.time.now() + seconds * 1000 + (seconds > 0 ? 200 : 0)
     entry.view = { ...entry.view, autoApproval: { status: "countdown", seconds } }
     this.publish()
     // Even zero delay goes through the same cancellable single-flight path.
@@ -272,7 +272,10 @@ export class Controller {
   private schedule(entry: Entry) {
     if (!this.active(entry) || entry.view.autoApproval?.status !== "countdown") return
     const remaining = Math.max(0, entry.deadline! - this.time.now())
-    entry.cancelTimer = this.time.after(Math.min(1000, remaining), () => {
+    // Wake at the next displayed-second boundary, including the initial grace,
+    // rather than letting a fixed one-second polling cadence lag behind it.
+    const next = remaining > 0 ? remaining - (Math.ceil(remaining / 1000) - 1) * 1000 : 0
+    entry.cancelTimer = this.time.after(next, () => {
       entry.cancelTimer = undefined
       if (!this.active(entry) || entry.view.autoApproval?.status !== "countdown") return
       if (!this.eligible(entry)) { this.cancelAutoApproval(entry.view.request.id, "visibility"); return }
@@ -580,7 +583,8 @@ export class Controller {
   }
 }
 
-/** Mirrors the documented session scope; host source confirms direct children. */
+/** Select the conversation queue independently of its physical presentation.
+ * Root and direct-child routes share the root's native permission order. */
 export function visibleReview(
   views: readonly View[],
   sessionID: string | undefined,
@@ -588,7 +592,12 @@ export function visibleReview(
 ): View | undefined {
   if (!sessionID) return
   const session = getSession(sessionID)
-  if (!session || session.parentID) return
+  if (!session) return
+  if (session.parentID) {
+    const root = getSession(session.parentID)
+    if (!root || root.parentID) return
+    sessionID = root.id
+  }
   let first: View | undefined
   let retained: View | undefined
   for (const view of views) {

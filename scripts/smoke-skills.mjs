@@ -13,6 +13,7 @@ import { runtimeArguments } from "./runtime-inventory.mjs"
 import { readObservation } from "./smoke-observations.mjs"
 
 const { scenario } = runtimeArguments("smoke-skills.mjs")
+const subagent = scenario === "subagent" || scenario === "subagent-view"
 const root = path.resolve(import.meta.dirname, ".."), host = process.env.OPENCODE_BIN ?? "opencode"
 assert.equal(execFileSync(host, ["--version"], { encoding: "utf8" }).trim(), "1.18.35")
 const temp = await mkdtemp(path.join(tmpdir(), "reviewer-skills-")), project = path.join(temp, "project")
@@ -31,16 +32,25 @@ const bundle = path.join(temp, "bundle.mjs"), plugin = path.join(temp, "plugin.m
 await writeFile(recordFile, JSON.stringify({ asked: [], replies: [], children: [] }))
 await copyFile(path.join(root, "dist/tui.js"), bundle)
 await writeFile(plugin, `
-import plugin from ${JSON.stringify(pathToFileURL(bundle).href)};
+import plugin, { withHistoryObservations } from ${JSON.stringify(pathToFileURL(bundle).href)};
+import { createEffect } from 'solid-js';
 import { observationPublisher } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)};
 export default {id:'skill-fixture', tui:async (api, options) => {
-  const data = {asked:[], replies:[], children:[]};
+  const data = {asked:[], replies:[], children:[], renders:[]};
   const publisher = observationPublisher(${JSON.stringify(recordFile)});
   const save = () => publisher.publish(data);
   api.event.on('permission.asked', event => {data.asked.push(event.properties); void save();});
   api.event.on('permission.replied', event => {data.replies.push(event.properties); void save();});
-  api.event.on('session.created', event => {if(event.properties.info.parentID) {data.children.push(event.properties.info); void save();}});
-  await plugin.tui(api, options); void save(); api.lifecycle.onDispose(async () => {save(); await publisher.close();});
+  createEffect(() => { data.route = api.route.current.params?.sessionID; void save(); });
+  api.event.on('session.created', event => {if(event.properties.info.parentID) {
+    data.children.push(event.properties.info);
+    if (${scenario === "subagent-view"}) api.route.navigate('session', {sessionID:event.properties.info.id});
+    void save();
+  }});
+  const run = ${scenario === "subagent-view"} ? withHistoryObservations(event => {
+    if (event.stage === 'frame' && event.auto === 'countdown') {data.renders.push({...event, route:data.route}); void save();}
+  }) : plugin.tui;
+  await run(api, options); void save(); api.lifecycle.onDispose(async () => {save(); await publisher.close();});
 } };
 `)
 const userPrompt = "Inspect the fixture project using its fixture skill, and run marker.py when delegated."
@@ -62,7 +72,7 @@ const server = createServer(async (req, res) => {
     if (req.url === "/review/chat/completions") {
       const evidence = JSON.parse(body.messages[1].content); reviews.push(evidence)
       assert.equal(evidence.userPrompt, userPrompt)
-      if (scenario === "subagent") assert.equal(evidence.delegation.prompt, evidence.kind === "skill" ? firstPrompt : latestPrompt)
+      if (subagent) assert.equal(evidence.delegation.prompt, evidence.kind === "skill" ? firstPrompt : latestPrompt)
       else assert.equal(evidence.delegation, undefined)
       if (evidence.kind === "skill") {
         assert.equal(evidence.skill.name, "fixture-skill"); assert.equal(evidence.skill.content.trim(), skillText.trim())
@@ -85,7 +95,7 @@ const server = createServer(async (req, res) => {
     const latest = JSON.stringify(body.messages.filter(m => m.role === "user").at(-1)?.content)
     const tools = body.tools?.map(t => t.function.name) ?? []
     let tool, input
-    if (scenario === "subagent" && tools.length) {
+    if (subagent && tools.length) {
       if (latest.includes("DELEGATION FIRST")) {
         if (!skillSent) { skillSent = true; tool = "skill"; input = { name: "fixture-skill" } }
       } else if (latest.includes("DELEGATION LATEST")) {
@@ -95,7 +105,7 @@ const server = createServer(async (req, res) => {
         if (rootStep === 1) input.task_id = (await records()).children[0].id
         rootStep++; tool = "task"
       }
-    } else if (scenario !== "subagent" && tools.includes("skill") && !skillSent) {
+    } else if (!subagent && tools.includes("skill") && !skillSent) {
       skillSent = true; tool = "skill"; input = { name: "fixture-skill" }
     }
     stream(res, tool ? { role: "assistant", tool_calls: [{ index: 0, id: "call-" + tool + "-" + rootStep, type: "function", function: { name: tool, arguments: JSON.stringify(input) } }] }
@@ -124,12 +134,19 @@ try {
       models: { fixture: { name: "Fixture", limit: { context: 32000, output: 1500 } } } } } }
   const tui = path.join(temp, "tui.json")
   await writeFile(tui, JSON.stringify({ plugin: [[plugin, { baseURL: base + "/review", model: "fixture", notify: false,
-    autoApprove: true, autoApproveDelaySeconds: 0, fastMode: scenario === "fast", stream: scenario === "fast",
+    autoApprove: true, autoApproveDelaySeconds: scenario === "subagent-view" ? 2 : 0, fastMode: scenario === "fast", stream: scenario === "fast",
     ...(scenario === "disabled" ? { reviewSkills: false } : {}) }]] }))
   const env = { OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_CONFIG: "", OPENCODE_CONFIG_DIR: path.join(temp, "config"), OPENCODE_TUI_CONFIG: tui,
     OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_EXTERNAL_SKILLS: "1", OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1" }
-  await runtime.start("-d", "-s", "skills", "-x", "160", "-y", "40", "-c", project, "env",
+  await runtime.start("-d", "-s", "skills", "-x", scenario === "subagent-view" ? "80" : "160", "-y", "40", "-c", project, "env",
     ...Object.entries(env).map(([k, v]) => k + "=" + v), host, project, "--prompt", userPrompt)
+  if (scenario === "subagent-view") {
+    await until(async () => reviews.length === 1 && (await records()).route === (await records()).children[0]?.id, 90000)
+    await sleep(500)
+    assert.equal((await records()).replies.length, 0, "narrow child layout must not approve unseen reports")
+    assert.doesNotMatch(capture(), /Allowed in|Permission analysis/)
+    runtime.tmux("resize-window", "-t", "skills", "-x", "160", "-y", "40")
+  }
   if (scenario === "disabled") {
     await until(s => s.includes("Permission required"), 90000); await sleep(500)
     assert.equal(reviews.length, 0); assert.doesNotMatch(capture(), /Permission analysis/); assert.equal(loaded, false)
@@ -143,16 +160,23 @@ try {
       await until(s => loaded && held && s.includes("Auto-approved; finishing report"), 90000)
       assert.equal(history().length, 0); held()
     }
-    const count = scenario === "subagent" ? 2 : 1
+    const count = subagent ? 2 : 1
     await until(async () => (await records()).replies.length === count && loaded, 90000)
     await until(() => history().length === count)
     assert.deepEqual((await records()).replies.map(r => r.reply), Array(count).fill("once"))
     assert.ok(history().some(row => row.context.category === "skill"))
-    if (scenario === "subagent") {
+    if (subagent) {
       assert.deepEqual(reviews.map(r => r.kind), ["skill", "shell"])
       assert.equal(reviews[0].delegation.sessionID, reviews[1].delegation.sessionID)
       assert.notEqual(reviews[0].delegation.messageID, reviews[1].delegation.messageID)
       await until(async () => access(path.join(project, "delegated-executed")).then(() => true, () => false))
+      if (scenario === "subagent-view") {
+        const observed = await records(), child = observed.children[0].id
+        assert.equal(observed.route, child, "approval must finish without returning to the root")
+        assert.ok(observed.renders.some(r => r.route === child && r.physical && r.eligible && r.painted && r.seconds === 2),
+          "subagent view must paint the report and start its countdown")
+        assert.ok(observed.renders.some(r => r.route === child && r.seconds === 1), "countdown must advance in the child view")
+      }
     }
   }
   await assert.rejects(access(path.join(project, "support-executed")), "supporting scripts must never execute during skill review/load")

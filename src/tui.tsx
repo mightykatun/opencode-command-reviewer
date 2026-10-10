@@ -1,4 +1,5 @@
 import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js"
+import { CliRenderEvents } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { parseConfig, type Config } from "./config.js"
 import { loadRootMessages, type ContextReader } from "./context.js"
@@ -251,6 +252,10 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
         return null
       },
       app: () => {
+        const [width, setWidth] = createSignal(api.renderer.width)
+        const resized = () => setWidth(api.renderer.width)
+        api.renderer.on(CliRenderEvents.RESIZE, resized)
+        onCleanup(() => api.renderer.off(CliRenderEvents.RESIZE, resized))
         createEffect(() => {
           const route = api.route.current
           notifications?.routeChanged()
@@ -281,25 +286,34 @@ async function reviewTui(api: TuiPluginApi, options: Parameters<TuiPlugin>[1], f
           const route = api.route.current
           notifications?.visit(route.name === "session" ? route.params?.sessionID as string | undefined : undefined)
         })
-        const select = () => {
-          const mounted = sidebar()
+        const presentationSession = () => {
           const route = api.route.current
-          if (!mounted || api.ui.dialog.open || route.name !== "session" || route.params?.sessionID !== mounted.sessionID) return
-          return visibleReview(controller.views, mounted.sessionID, (id) => api.state.session.get(id))
+          if (api.ui.dialog.open || route.name !== "session") return
+          const id = route.params?.sessionID
+          if (typeof id !== "string") return
+          if (sidebar()?.sessionID === id) return id
+          // The native host omits its sidebar on subagent routes. Provide the
+          // same review panel there when the viewport has room for 42 columns.
+          if (id && api.state.session.get(id)?.parentID && width() >= 120 && api.renderer.width >= 120) return id
         }
-        const current = createMemo(() => { views(); return select() })
+        const select = () => {
+          const route = api.route.current
+          if (api.ui.dialog.open || route.name !== "session") return
+          const id = route.params?.sessionID
+          return visibleReview(controller.views, typeof id === "string" ? id : undefined, (id) => api.state.session.get(id))
+        }
+        const current = createMemo(() => { views(); return presentationSession() ? select() : undefined })
         // A stable slot root keeps the host's array normalization from replacing
         // the live sibling when the optional history sibling appears/disappears.
         return (<box position="absolute" top={0} right={0} bottom={0} width={42} zIndex={1}
-          visible={!!sidebar() && !api.ui.dialog.open && api.route.current.name === "session"
-            && api.route.current.params?.sessionID === sidebar()?.sessionID && (!!current() || historyState().open)}>
+          visible={!!presentationSession() && (!!current() || (!!sidebar() && historyState().open))}>
           <Show when={current()?.request.id} keyed>
             {(id) => {
               // Countdown publications must not remount Markdown/reset its scroll.
               const initial = current()!
               const view = () => views().find((item) => item.request.id === id) ?? initial
               return <LiveReviewPanel api={api} id={id} view={view} select={select} config={config}
-                sidebarSession={() => sidebar()?.sessionID} historyState={historyState} historyCover={historyCover} historyProbe={historyProbe}
+                sidebarSession={presentationSession} historyState={historyState} historyCover={historyCover} historyProbe={historyProbe}
                 traceFor={traces ? view => traces.get(view.request) : undefined} lifetimeText={lifetime.text}
                 onApprove={id => controller.approveNow(id)} onCancel={id => controller.cancelAutoApproval(id)}
                 onPresented={id => controller.presented(id)} registerPresentation={visible => {

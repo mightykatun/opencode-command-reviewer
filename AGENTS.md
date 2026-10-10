@@ -147,6 +147,9 @@
   live/history siblings; key the live panel by request ID. Changing fragments/view-object
   keys can remount Markdown and reset scrolling/countdowns. Reveal a hidden sidebar
   only for an explicit approval-notification click, using the public native command.
+  Direct-child routes share the root queue and render a live panel at widths >=120
+  without requiring a native sidebar mount. Keep physical presentation and queue
+  selection separate; narrow/covered child panels cannot approve unseen reports.
   Sanitize report text and streamed prefixes through `displayText`.
 - Production history is the only normal-plugin physical-cover exception for
   countdowns. Preserve `history-cover.ts`'s actual heading/footer hit-test proof;

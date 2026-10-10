@@ -93,7 +93,7 @@ test("approval playback spacing begins at actual player dispatch after cold prep
     open, mkdtemp: (async () => "/fixture") as never,
     writeFile: () => new Promise<void>(resolve => { release = resolve }), rm: async () => {},
   })
-  const first = audio.play("approved", new AbortController().signal), second = audio.play("approved", new AbortController().signal)
+  const first = audio.play("approved", new AbortController().signal, "first"), second = audio.play("approved", new AbortController().signal, "second")
   for (let i = 0; i < 20 && !release; i++) await settle()
   now = 1800; t.mock.timers.tick(1800); release(); await settle()
   assert.equal(f.calls.length, 1)
@@ -102,4 +102,29 @@ test("approval playback spacing begins at actual player dispatch after cold prep
   now = 3800; t.mock.timers.tick(1); await settle(); assert.equal(f.calls.length, 2)
   for (const call of f.calls) call.finish()
   await Promise.all([first, second]); await audio.dispose()
+})
+
+test("same-session sounds wait for physical player exit, while another session can play", async () => {
+  const f = transport(), pool = new NotificationProcessPool(f.raw)
+  const sound = { format: "wav" as const, data: fixtureWav().toString("base64") }
+  const audio = new NotificationAudio(pool, undefined, { approved: sound, unsafe: sound, question: sound })
+  const approval = new AbortController(), signal = new AbortController().signal
+  await Promise.all([audio.ready("approved", signal), audio.ready("unsafe", signal), audio.ready("question", signal)])
+  const first = audio.play("approved", approval.signal, "session")
+  await settle()
+  const next = audio.play("unsafe", signal, "session")
+  const other = audio.play("question", signal, "other")
+  const cancelled = new AbortController()
+  const stale = audio.play("question", cancelled.signal, "session")
+  cancelled.abort(); await stale; await settle()
+  assert.equal(f.calls.length, 2)
+  assert.ok(f.calls[0]!.args.at(-1)!.endsWith("approved.wav"))
+  assert.ok(f.calls[1]!.args.at(-1)!.endsWith("question.wav"))
+  approval.abort(); await settle()
+  assert.equal(f.calls.length, 2, "cancellation must not release a still-running player")
+  f.calls[0]!.finish(); await first; await settle()
+  assert.equal(f.calls.length, 3)
+  assert.ok(f.calls[2]!.args.at(-1)!.endsWith("unsafe.wav"))
+  f.calls[1]!.finish(); f.calls[2]!.finish()
+  await Promise.all([next, other]); await audio.dispose(); pool.dispose()
 })
