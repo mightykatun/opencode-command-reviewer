@@ -69,6 +69,32 @@ jobs:
             /scripts/smoke-stages.mjs
             /scripts/smoke-permissions.mjs
             /scripts/smoke.mjs
+            /scripts/runtime-inventory.mjs
+            /scripts/runtime-runner.mjs
+            /scripts/test-runtime.mjs
+            /scripts/smoke-scenarios.mjs
+            /scripts/smoke-observations.mjs
+            /scripts/smoke-ui.mjs
+            /scripts/smoke-approval-geometry.mjs
+            /scripts/smoke-evidence.mjs
+            /scripts/smoke-fast-mode.mjs
+            /scripts/smoke-history.mjs
+            /scripts/smoke-history-auto.mjs
+            /scripts/smoke-history-render.mjs
+            /scripts/smoke-history-phase0.mjs
+            /scripts/smoke-history-storage.mjs
+            /scripts/smoke-history-lifecycle.mjs
+            /scripts/smoke-history-maintenance.mjs
+            /scripts/smoke-statistics.mjs
+            /scripts/smoke-streaming.mjs
+            /scripts/smoke-session-mode.mjs
+            /scripts/smoke-skills.mjs
+            /scripts/smoke-notification-queue.mjs
+            /scripts/smoke-notification-events.mjs
+            /scripts/smoke-notification-w4.mjs
+            /scripts/smoke-notification-desktop.ts
+            /scripts/smoke-lifetime.mjs
+            /scripts/audit-usage-history.mjs
             /test/ci-workflow.test.mjs
             /test/publish-release.test.mjs
             /test/release-version.test.mjs
@@ -82,6 +108,9 @@ jobs:
             /test/release-fixture.mjs
             /test/smoke-measurements.test.mjs
             /test/smoke-stages.test.mjs
+            /test/runtime-inventory.test.mjs
+            /test/runtime-runner.test.mjs
+            /test/smoke-helpers.test.mjs
             /package.json
             /package-lock.json
             /README.md

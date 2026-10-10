@@ -7,6 +7,9 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { build } from "esbuild"
 import { DatabaseSync } from "node:sqlite"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+
+runtimeArguments("audit-usage-history.mjs")
 
 const root = path.resolve(import.meta.dirname, ".."), ref = "v0.7.0"
 const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" })

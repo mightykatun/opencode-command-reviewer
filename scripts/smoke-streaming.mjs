@@ -9,9 +9,11 @@ import { pathToFileURL } from "node:url"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime, smokeMetrics } from "./smoke-runtime.mjs"
 import { seedLifetime, readLifetime, assertLegacyUntouched } from "./smoke-lifetime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation } from "./smoke-observations.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
 
-const scenario = process.argv[2] ?? "complete"
-assert.ok(["complete", "retry", "truncated", "nonstream", "cancel", "manual", "disable", "hidden", "dialog", "narrow", "fullscreen", "error"].includes(scenario))
+const { scenario } = runtimeArguments("smoke-streaming.mjs")
 const streaming = scenario !== "nonstream"
 const maxOutputTokens = scenario === "truncated" ? 4096 : 2048
 const throwingObserver = process.argv.includes("--observer-throws")
@@ -34,21 +36,12 @@ await copyFile(path.join(root, "dist/tui.js"), bundle)
 // The observer owns this isolated, capped artifact. The production plugin owns no logger/store.
 await writeFile(plugin, `
 import plugin, { withDiagnostics } from ${JSON.stringify(pathToFileURL(bundle).href)}
-import { writeFile, rename } from "node:fs/promises"
+import { observationPublisher } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)}
 const file = ${JSON.stringify(diagnosticsFile)}
 const events = []
-let dropped = 0, dirty = false, writing
-function persist() {
-  dirty = true
-  if (!writing) writing = (async () => {
-    while (dirty) {
-      dirty = false
-      await writeFile(file + ".tmp", JSON.stringify({ version: 1, dropped, events }), { mode: 0o600 })
-      await rename(file + ".tmp", file)
-    }
-  })().finally(() => { writing = undefined; if (dirty) void persist().catch(() => {}) })
-  return writing
-}
+let dropped = 0
+const publisher = observationPublisher(file)
+const persist = () => publisher.publish({ version: 1, dropped, events })
 const tui = withDiagnostics((event) => {
   if (events.length < 512) events.push(event)
   else dropped++
@@ -58,7 +51,7 @@ const tui = withDiagnostics((event) => {
 })
 export default { id: plugin.id, tui: async (...args) => {
   await tui(...args)
-  args[0].lifecycle.onDispose(async () => { await writing })
+  args[0].lifecycle.onDispose(async () => { persist(); await publisher.close() })
 } }
 `)
 await writeFile(path.join(project, "fixture.py"), 'from pathlib import Path\nimport time\nPath("executed").write_text(str(time.time_ns() // 1000000))\n')
@@ -167,11 +160,11 @@ const pendingFor = async (ms, check = () => {}) => {
   } while (Date.now() < end)
 }
 const palette = async (title) => {
-  send("C-p")
-  await until((s) => s.includes("Commands"))
-  send("-l", title)
-  await until((s) => (s.match(new RegExp(title, "g")) ?? []).length >= 2)
-  send("Enter")
+  const postcondition = title === "Disable animations" ? s => s.includes("[⋯]")
+    : title === "Reviewer: Statistics" ? s => s.includes("Reviewer statistics")
+    : title.includes("Disable") ? s => s.includes("Reviewer disabled for this conversation.")
+    : s => s.includes("Reviewer enabled for this conversation.")
+  await activatePalette({ send, capture: () => tmux("capture-pane", "-p", "-e", "-t", "stream") }, title, postcondition)
 }
 const wheel = (button) => send("-l", `\x1b[<${button};140;20M`)
 const firstRow = (s) => sidebar(s).match(/STREAM ROW \d+/)?.[0]
@@ -179,7 +172,8 @@ const validateDiagnostics = async () => {
   const automated = !["cancel", "manual", "error"].includes(scenario)
   let record
   await until(async () => {
-    try { record = JSON.parse(await readFile(diagnosticsFile, "utf8")) } catch { return false }
+    record = await readObservation(diagnosticsFile, { optional: true })
+    if (!record) return false
     return automated ? record.events.some((event) => event.phase === "approval-reply") : record.events.some((event) => event.phase === "first-display")
   })
   assert.equal(record.version, 1)
@@ -277,7 +271,7 @@ try {
       assert.doesNotMatch(sidebar(s), /token:|lifetime:/)
     })
     await save("rating-only")
-    const ratingOnly = JSON.parse(await readFile(diagnosticsFile, "utf8"))
+    const ratingOnly = await readObservation(diagnosticsFile)
     assert.ok(ratingOnly.events.some((event) => event.phase === "first-display" && event.attempt === 0),
       "first-display must observe the rating frame before any description is sent")
     current.content('"desc":"' + encoded(prefix + longText))

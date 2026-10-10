@@ -8,6 +8,10 @@ import { pathToFileURL } from "node:url"
 import { setTimeout as sleep } from "node:timers/promises"
 import { inspectPackageArchive } from "./release-artifact.mjs"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation } from "./smoke-observations.mjs"
+
+runtimeArguments("smoke-history-storage.mjs")
 
 const root = path.resolve(import.meta.dirname, "..")
 const host = process.env.OPENCODE_BIN ?? "opencode"
@@ -28,7 +32,7 @@ await writeFile(bundle, files.get("dist/tui.js"))
 await writeFile(wrapper, `
 import { HistoryStore, historyWorkerSource } from ${JSON.stringify(pathToFileURL(bundle).href)}
 import { Worker } from 'node:worker_threads'
-import { writeFile } from 'node:fs/promises'
+import { publishObservation } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)}
 const context = { scope: '/synthetic', root: 'root', session: 'child', permission: 'permission', review: 'early', category: 'bash', configuredModel: 'configured', provider: 'https://example.com/v1' }
 export default { id: 'history-storage-proof', tui: async api => {
   const result = { packed: true, adapter: 'bun' }
@@ -69,7 +73,7 @@ export default { id: 'history-storage-proof', tui: async api => {
     try { result.reopened = await reopened.query({type:'totals'}) } finally { await reopened.dispose() }
   } catch(error) { result.error = String(error) }
   finally { await Promise.all(stores.map(s => s.dispose())) }
-  await writeFile(${JSON.stringify(record)}, JSON.stringify(result))
+  await publishObservation(${JSON.stringify(record)}, result)
 } }
 `)
 const runtime = await smokeRuntime(temp)
@@ -82,7 +86,7 @@ try {
   let proof
   const end = Date.now() + 60000
   while (Date.now() < end) {
-    proof = await readFile(record, "utf8").then(JSON.parse).catch(() => undefined)
+    proof = await readObservation(record, { optional: true })
     if (proof) break
     await sleep(100)
   }

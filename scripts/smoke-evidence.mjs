@@ -8,10 +8,10 @@ import { createServer } from "node:http"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime } from "./smoke-runtime.mjs"
 import { pathToFileURL } from "node:url"
+import { runtimeArguments } from "./runtime-inventory.mjs"
 
 const root = path.resolve(import.meta.dirname, ".."), host = process.env.OPENCODE_BIN ?? "opencode"
-const scenario = process.argv[2] ?? "capture"
-assert.ok(["capture", "prompt-symlink"].includes(scenario))
+const { scenario } = runtimeArguments("smoke-evidence.mjs")
 assert.equal(execFileSync(host, ["--version"], { encoding: "utf8" }).trim(), "1.18.35")
 const temp = await mkdtemp(path.join(tmpdir(), "reviewer-evidence-"))
 const project = `${temp}/project`, outside = `${temp}/outside`, skills = `${temp}/skills`, skill = `${skills}/evidence-fixture`

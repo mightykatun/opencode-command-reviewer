@@ -5,6 +5,9 @@ import { NotificationAudio } from "../src/notification-audio.js"
 import { LinuxNotifications } from "../src/notification-linux.js"
 import { OwnedNotificationProcesses, type NotificationProcesses } from "../src/notification-process.js"
 import { gnomeTerminalIdentity } from "../src/notification-terminal.js"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+
+runtimeArguments("smoke-notification-desktop.ts")
 
 const owned = new OwnedNotificationProcesses()
 const measurements: Promise<unknown>[] = []

@@ -41,11 +41,12 @@ Implementation starts from `0aaf9d6`. Checkboxes require passing evidence, not a
   - [x] Preserve pending release runs with bounded platform queuing and unchanged semantic channel policy.
   - [x] Verify the exact six-category sound mapping in emitted and packed bundles.
   - [x] Pass helper, reproducibility/archive, and npm 12.2.0 smoke checks without publishing; record outputs.
-  - [ ] Commit the verified W5 checkpoint.
+  - [x] Commit the verified W5 checkpoint: `b2c6e22`.
 - [ ] W6: maintainability, fixture reliability, and scoped maintenance (A18-A23, A26-A28)
-  - [ ] Inventory runtime entrypoints/scenarios and add a pinned-host CI selection with host-independent completeness checks.
-  - [ ] Share atomic serialized observation publication and selected-result/postcondition palette synchronization.
-  - [ ] Extract smoke scenario descriptors/families while preserving independent assertions and planning mode.
+  - [x] Inventory runtime entrypoints/scenarios and add a pinned-host CI selection with host-independent completeness checks.
+  - [x] Share atomic serialized observation publication and selected-result/postcondition palette synchronization.
+  - [x] Extract smoke scenario descriptors/families while preserving independent assertions and planning mode.
+  - [ ] Commit the verified W6a fixture-infrastructure checkpoint.
   - [ ] Replace positional reviewer/controller injection with named dependencies and a distinct historical replay adapter.
   - [ ] Extract the corrected live panel with explicit lifecycle ownership and stable request keying.
   - [ ] Align compatibility/docs, remove confirmed unused interfaces/output/legacy routes, and evaluate compatible dependency updates.
@@ -121,6 +122,18 @@ W4 evidence: `.runtime/notification-w4-{baseline,capacity,click}/results.json`, 
 **W5:** pre-fix release checks failed provenance adoption, queue retention, and absent new helpers. Final expanded release/sound/workflow suite passed **78 tests**; actual npm CLI suite passed **7**. `npm run check` passed typecheck, **981 source tests**, **91 helpers**, and build. `npm run check:package` passed two reproducible builds, all six sound mappings, and the exact five-file archive; combined artifact/npm CLI checks passed **9** (overlapping earlier counts). `node scripts/smoke-notification-events.mjs question --sound-only` passed on the pinned host with recorded processes (`.runtime/notification-question-sound-only.json`). No live OIDC, signing/log request, or publication was performed.
 
 W5 implementation: `release-provenance.mjs` constructs explicit source/archive/policy/validation/signing identities and signs through pinned npm 12.2.0/Sigstore 5.0.0 in a 120-second killable child. npm verifies `--provenance-file` before upload. Offline tests exercise actual npm subject/digest checks, OIDC option forwarding, attachment construction, and invalid-bundle rejection. Bundles stay outside the artifact directory; private XDG storage contains TUF state. `queue: max` preserves up to 100 pending releases. The actual production sound mapping is emitted as inspectable JSON and verified by key-to-byte association, including removed/swapped/decoy mutation tests. W5 verified bundle SHA-256: `9eff01083da6d8a977cc8313bd5a40139be3f2c51b100d4d62e06b671987a45e`; archive unpacked size 889,560 bytes.
+
+**W6a (A18-A20,A22):** actual old writer/palette snippets from `b2c6e22` failed the desired-behavior checks (two overlapping writes and premature Enter from query-only text). New helper regressions passed. `npm run check` passed typecheck, **981 source tests**, **111 helpers**, and build; final helper run included actual release-policy sparse checkout execution. Runtime cleanup passed **6/6**. The exact profile selections passed locally:
+
+```text
+node scripts/test-runtime.mjs --profile ci             PASS 7/7  .runtime/runtime-run-8hoI7E/
+node scripts/test-runtime.mjs --profile w6-affected    PASS 11/11 .runtime/runtime-run-bYvuna/
+node scripts/test-runtime.mjs --profile w6-extended    PASS 10/10 .runtime/runtime-run-V58o2f/
+```
+
+These are 28 distinct cases, not exhaustive flag combinations. Each runner directory contains `results.json` and numbered invocation logs. CI covers production lifecycle auto-shell, vertical resize, fast completion, held notification baseline, mixed streaming queue, history browse, and streaming completion/statistics. Affected/extended profiles cover maintenance/statistics, history notification/shared/visibility/disabled/storage/phase0/dialog, truncation, external/auto-external, correction/scroll/cancel/edit, directory-disabled held edit, session mode, skills, notification click, and capacity. Expected `auto-shell --fail-after-listen` cleanup passed in `.runtime/runtime-run-OaQEK5/`. The GitHub job is configured; its exact profile ran locally, not remotely.
+
+W6a inventory covers 21 entrypoints and 11 helpers with aliases, scenarios/flags, validity rules, prerequisites, classifications, and host budgets. Runner execution is serial under a repository lock; fixtures requiring two hosts retain that budget. Shared atomic publishers own failure/flush/close and shared-history hosts have distinct destinations. Palette helpers prove selected ANSI rendition plus postconditions. All 28 original smoke scenarios have descriptors and named family dispatch; substantial independent assertion bodies remain in the main driver intentionally. A maintenance startup timeout prompted bounded retry of only connection-refused/startup-timeout errors; other failures remain visible, and the whole affected profile subsequently passed.
 
 ## 1. Scope, provenance, and status
 

@@ -2,7 +2,7 @@
 // Dashboard actions perform no model calls or permission writes.
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { mkdtemp, mkdir, writeFile, readFile, copyFile } from "node:fs/promises"
+import { mkdtemp, mkdir, writeFile, copyFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -11,6 +11,11 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { DatabaseSync } from "node:sqlite"
 import { tsImport } from "tsx/esm/api"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation, publishObservation } from "./smoke-observations.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
+
+runtimeArguments("smoke-statistics.mjs")
 
 const root = path.resolve(import.meta.dirname, ".."), host = process.env.OPENCODE_BIN ?? "opencode"
 assert.equal(execFileSync(host, ["--version"], { encoding: "utf8" }).trim(), "1.18.35")
@@ -20,21 +25,17 @@ await mkdir(project); await mkdir(path.join(temp, "config")); await mkdir(artifa
 execFileSync("git", ["init", "--quiet", project])
 const bundle = path.join(temp, "bundle.mjs"), wrapper = path.join(temp, "wrapper.mjs"), info = path.join(temp, "sessions.json")
 const ancestryControl = path.join(temp, "ancestry-control.json"), ancestryProbe = path.join(temp, "ancestry.json")
-await writeFile(ancestryControl, JSON.stringify({ release: false }))
+await publishObservation(ancestryControl, { release: false })
 await copyFile(path.join(root, "dist/tui.js"), bundle)
 await writeFile(wrapper, `import plugin from ${JSON.stringify(pathToFileURL(bundle).href)};
-import { writeFile, readFile, rename } from 'node:fs/promises';
+import { observationPublisher, readObservation } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)};
+import { createEffect } from 'solid-js';
 export default { id: 'statistics-fixture', tui: async (api, options) => {
-  let ids = await readFile(${JSON.stringify(info)}, 'utf8').then(JSON.parse).catch(() => ({}));
+  let ids = await readObservation(${JSON.stringify(info)}, {optional:true}) ?? {};
   const facts = { reads: {}, active: 0, maximum: 0, aborted: 0 };
-  let publication = Promise.resolve();
-  const probe = () => {
-    const text = JSON.stringify(facts);
-    return publication = publication.then(async () => {
-      await writeFile(${JSON.stringify(ancestryProbe + ".tmp")}, text);
-      await rename(${JSON.stringify(ancestryProbe + ".tmp")}, ${JSON.stringify(ancestryProbe)});
-    });
-  };
+  const probePublisher = observationPublisher(${JSON.stringify(ancestryProbe)});
+  const publisher = observationPublisher(${JSON.stringify(info)});
+  const probe = () => probePublisher.publish(facts);
   const held = id => id && (id === ids.stalled || id === ids.historyStalled);
   const sessions = new Proxy(api.state.session, { get(target, key) {
     if (key === 'get') return id => held(id) ? undefined : target.get(id);
@@ -49,7 +50,7 @@ export default { id: 'statistics-fixture', tui: async (api, options) => {
       facts.active++; facts.maximum = Math.max(facts.maximum, facts.active); await probe();
       try {
         // Deliberately ignores abort until released, like a noncooperative host transport.
-        while (!(JSON.parse(await readFile(${JSON.stringify(ancestryControl)}, 'utf8'))).release)
+        while (!(await readObservation(${JSON.stringify(ancestryControl)})).release)
           await new Promise(resolve => setTimeout(resolve, 50));
         if (opts.signal.aborted) facts.aborted++;
         return { data: api.state.session.get(params.sessionID) };
@@ -61,7 +62,8 @@ export default { id: 'statistics-fixture', tui: async (api, options) => {
   await plugin.tui(adapted, options);
   let permissions = 0, replies = 0;
   api.event.on('permission.asked', () => permissions++); api.event.on('permission.replied', () => replies++);
-  const save = () => writeFile(${JSON.stringify(info)}, JSON.stringify({...ids, permissions, replies}));
+  const save = () => publisher.publish({...ids, permissions, replies, route:api.route.current.params?.sessionID});
+  createEffect(() => { api.route.current; void save(); });
   const off = api.keymap.registerLayer({ commands: [
     {name:'fixture.prepare', namespace:'palette', title:'Fixture: Prepare statistics', run:async () => {
       ids.root = api.route.current.params.sessionID;
@@ -74,7 +76,7 @@ export default { id: 'statistics-fixture', tui: async (api, options) => {
      ...['root','child','deep','other','stalled','latest','historyStalled','historyLatest'].map(name => ({name:'fixture.'+name, namespace:'palette', title:'Fixture: '+name,
       run:() => api.route.navigate('session', {sessionID:ids[name]})}))
   ]});
-   api.lifecycle.onDispose(async () => { off(); await save(); await publication; });
+   api.lifecycle.onDispose(async () => { off(); save(); probe(); await Promise.all([publisher.close(), probePublisher.close()]); });
 } };`)
 const { HistorySQL } = await tsImport("../src/history-schema.ts", import.meta.url)
 const { encodeEvent } = await tsImport("../src/history-records.ts", import.meta.url)
@@ -97,8 +99,12 @@ const until = async (check, timeout = 20000) => {
 }
 const save = name => writeFile(path.join(artifacts, `${name}.txt`), capture())
 const palette = async title => {
-  send("C-p"); await until(s => s.includes("Commands")); send("C-u"); send("-l", title)
-  await sleep(250); send("Enter"); await until(s => !s.includes("Commands"))
+  const postcondition = title === "Reviewer: Statistics" ? s => s.includes("Reviewer statistics") && s.includes("[Lifetime]")
+    : title === "Reviewer: Report history" ? s => s.includes("Analysis history")
+    : title === "Reviewer: Disable for conversation" ? s => s.includes("Reviewer disabled for this conversation.")
+    : title === "Fixture: Prepare statistics" ? async () => !!(await readObservation(info, { optional: true }))?.deep
+    : async () => (await readObservation(info)).route === ids[title.slice("Fixture: ".length)]
+  await activatePalette({ send, capture: () => runtime.tmux("capture-pane", "-p", "-e", "-t", "statistics") }, title, postcondition)
 }
 const open = async () => { await palette("Reviewer: Statistics"); await until(s => s.includes("Reviewer statistics") && s.includes("[Lifetime]")) }
 const close = async () => { send("Escape"); await until(s => !s.includes("Reviewer statistics")) }
@@ -136,7 +142,7 @@ try {
   await until(s => s.includes("Statistics fixture ready.") && s.includes("tab agents"), 90000)
   await until(() => calls >= 2); await sleep(500)
   await palette("Fixture: Prepare statistics")
-  await until(async () => { try { ids = JSON.parse(await readFile(info, "utf8")); return !!ids.deep } catch { return false } })
+  await until(async () => { ids = await readObservation(info, { optional: true }); return !!ids?.deep })
   privateDatabase(file); sql = new HistorySQL(new DatabaseSync(file))
   seed(ids.root, ids.root, 100, true); seed(ids.child, ids.root, 200, false); seed(ids.deep, ids.root, 300, true)
   seed(ids.other, ids.other, 1000, true)
@@ -171,18 +177,13 @@ try {
   sql = new HistorySQL(new DatabaseSync(file))
   assert.deepEqual(sql.query({ type: "totals" }), persisted)
   assert.equal(calls, modelCalls, "statistics browsing and resume do not invoke models")
-  const facts = JSON.parse(await readFile(info, "utf8"))
+  const facts = await readObservation(info)
   assert.equal(facts.permissions, 0); assert.equal(facts.replies, 0)
   // Actual production controller -> coordinator -> SessionModes composition,
   // driven through public UI commands while its host metadata read ignores abort.
   seed(ids.latest, ids.latest, 777, false)
-  const ancestry = async () => JSON.parse(await readFile(ancestryProbe, "utf8"))
-  const releaseAncestry = async release => {
-    const temporary = ancestryControl + ".tmp"
-    await writeFile(temporary, JSON.stringify({ release }))
-    const { rename } = await import("node:fs/promises")
-    await rename(temporary, ancestryControl)
-  }
+  const ancestry = () => readObservation(ancestryProbe)
+  const releaseAncestry = release => publishObservation(ancestryControl, { release })
   await close(); await palette("Fixture: stalled")
   for (let n = 0; n < 4; n++) {
     await open(); send("Tab"); await until(s => s.includes("[Conversation]") && s.includes("Loading"))
@@ -224,6 +225,6 @@ try {
   await writeFile(path.join(artifacts, "failure.txt"), `${error.stack}\n${temp}`)
   throw error
 } finally {
-  await writeFile(ancestryControl, JSON.stringify({ release: true }))
+  await publishObservation(ancestryControl, { release: true })
   sql?.close(); await runtime.dispose(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve))
 }

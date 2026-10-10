@@ -7,6 +7,9 @@
   "test/release-provenance.test.mjs",
   "test/release-version.test.mjs",
   "test/release-workflow.test.mjs",
+  "test/runtime-inventory.test.mjs",
+  "test/runtime-runner.test.mjs",
+  "test/smoke-helpers.test.mjs",
   "test/smoke-measurements.test.mjs",
   "test/smoke-stages.test.mjs"
 ]

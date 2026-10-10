@@ -2,7 +2,7 @@
 // database edits. Fault injection is confined to this fixture's public get adapter.
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises"
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -11,6 +11,11 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { DatabaseSync } from "node:sqlite"
 import { tsImport } from "tsx/esm/api"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation, publishObservation } from "./smoke-observations.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
+
+runtimeArguments("smoke-history-maintenance.mjs")
 
 const root = path.resolve(import.meta.dirname, ".."), host = process.env.OPENCODE_BIN ?? "opencode"
 assert.equal(execFileSync(host, ["--version"], { encoding: "utf8" }).trim(), "1.18.35")
@@ -22,16 +27,17 @@ const packResult = JSON.parse(execFileSync("npm", ["pack", "--ignore-scripts", "
 const packed = Array.isArray(packResult) ? packResult[0] : packResult["opencode-reviewer"]
 const bundle = path.join(temp, "bundle.mjs"), wrapper = path.join(temp, "wrapper.mjs"), fault = path.join(temp, "fault.json"), observed = path.join(temp, "observed.json")
 await writeFile(bundle, execFileSync("tar", ["-xOf", path.join(temp, packed.filename), "package/dist/tui.js"]))
-await writeFile(fault, "{}")
+await publishObservation(fault, {})
 await writeFile(wrapper, `import plugin from ${JSON.stringify(pathToFileURL(bundle).href)};
-import { readFile, writeFile } from 'node:fs/promises';
+import { observationPublisher, readObservation } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)};
 export default { id: 'maintenance-fixture', tui: async (api, options) => {
+  const publisher = observationPublisher(${JSON.stringify(observed)});
   const original = api.client.session.get.bind(api.client.session);
   let blocked = 0, replies = 0, missing;
   const session = new Proxy(api.client.session, { get(target, key) {
     if (key !== 'get') return Reflect.get(target, key);
     return async (params, opts) => {
-      const control = JSON.parse(await readFile(${JSON.stringify(fault)}, 'utf8'));
+      const control = await readObservation(${JSON.stringify(fault)});
       if (control.id === params.sessionID) {
         blocked++;
         return { response: new Response('', { status: 403 }), error: { name: 'Forbidden', data: { message: 'fixture transient' } } };
@@ -45,8 +51,9 @@ export default { id: 'maintenance-fixture', tui: async (api, options) => {
   const adapted = new Proxy(api, { get(target, key) { return key === 'client' ? client : Reflect.get(target, key); } });
   api.event.on('permission.replied', () => replies++);
   await plugin.tui(adapted, options);
-  const timer = setInterval(() => { void writeFile(${JSON.stringify(observed)}, JSON.stringify({ blocked, replies, missing })); }, 100);
-  api.lifecycle.onDispose(() => clearInterval(timer));
+  const save = () => publisher.publish({ blocked, replies, missing });
+  const timer = setInterval(save, 100);
+  api.lifecycle.onDispose(async () => { clearInterval(timer); save(); await publisher.close(); });
 } };
 `)
 const { HistorySQL } = await tsImport("../src/history-schema.ts", import.meta.url)
@@ -64,12 +71,12 @@ const capture = () => runtime.tmux("capture-pane", "-p", "-t", "history")
 const send = (...keys) => runtime.tmux("send-keys", "-t", "history", ...keys)
 const until = async (check, timeout = 60000) => {
   const end = Date.now() + timeout
-  while (Date.now() < end) { try { if (await check()) return } catch {} await sleep(100) }
-  throw Error("Maintenance fixture wait timed out")
+  while (Date.now() < end) { if (await check()) return; await sleep(100) }
+  throw Error("Maintenance fixture wait timed out: " + capture())
 }
 const open = async () => {
-  send("C-p"); await until(() => capture().includes("Commands")); send("C-u"); send("-l", "Reviewer: Report history")
-  await sleep(300); send("Enter"); await until(() => capture().includes("Analysis history"))
+  await activatePalette({ send, capture: () => runtime.tmux("capture-pane", "-p", "-e", "-t", "history") },
+    "Reviewer: Report history", s => s.includes("Analysis history"))
 }
 const apply = event => sql.apply("maintenance-fixture", ++sequence, encodeEvent(event))
 const seed = (rootID, session, n, scope = project) => {
@@ -100,7 +107,15 @@ try {
       headers: { "Content-Type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}) })
     const data = await response.json(); return { status: response.status, data }
   }
-  await until(async () => (await request("GET", "/session")).status === 200)
+  let startupError
+  await until(async () => {
+    try { return (await request("GET", "/session")).status === 200 }
+    catch (error) {
+      if (error.cause?.code !== "ECONNREFUSED" && error.name !== "TimeoutError") throw error
+      startupError = error
+      return false
+    }
+  }).catch(cause => { throw new Error(`Public host API startup failed: ${startupError?.message ?? cause.message}`, { cause: startupError ?? cause }) })
   console.log("maintenance: public API ready")
   const create = async parentID => {
     const r = await request("POST", "/session", { title: "Maintenance scope fixture", ...(parentID ? { parentID } : {}) })
@@ -128,14 +143,14 @@ try {
   assert.equal(typeof absence.data.data.message, "string")
   assert.equal((await request("GET", "/session/" + descendant)).status, 404, "native root deletion cascades")
   runtime.tmux("kill-session", "-t", "api")
-  await writeFile(fault, JSON.stringify({ id: removedRoot }))
+  await publishObservation(fault, { id: removedRoot })
   await start("history", project, "--session", alive)
   await until(() => capture().includes("tab agents"), 90000)
-  await until(async () => JSON.parse(await readFile(observed, "utf8")).blocked >= 2)
+  await until(async () => (await readObservation(observed, { optional: true }))?.blocked >= 2)
   assert.equal(sql.query({ type: "history", scope: project, root: removedRoot }).total, 1, "403 never deletes")
   assert.deepEqual(sql.query({ type: "totals" }), totals)
   await writeFile(path.join(artifacts, "transient.txt"), capture())
-  await writeFile(fault, "{}")
+  await publishObservation(fault, {})
   await until(() => sql.query({ type: "history", scope: project, root: removedRoot }).deleted
     && sql.query({ type: "history", scope: project, root: alive }).total === 2)
   await open(); await until(() => capture().includes("2/2") && capture().includes("Stored maintenance report 3"))
@@ -144,7 +159,7 @@ try {
   assert.equal(sql.db.prepare("SELECT count(*) n FROM attempts").get().n, 3)
   assert.equal(sql.db.prepare("SELECT count(*) n FROM payloads").get().n, 3)
   assert.equal(calls, before, "maintenance and history make no model requests")
-  const facts = JSON.parse(await readFile(observed, "utf8"))
+  const facts = await readObservation(observed)
   assert.equal(facts.replies, 0); assert.equal(facts.missing.status, 404); assert.equal(facts.missing.error.name, "NotFoundError")
   await writeFile(path.join(artifacts, "after.txt"), capture())
   await writeFile(path.join(artifacts, "results.json"), JSON.stringify({ temp, packed: packed.filename, calls, totals, absence, facts }, null, 2))

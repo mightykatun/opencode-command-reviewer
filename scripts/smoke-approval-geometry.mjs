@@ -10,10 +10,10 @@ import path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 import { pathToFileURL } from "node:url"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation } from "./smoke-observations.mjs"
 
-const scenario = process.argv[2] ?? "resize"
-assert.ok(process.argv.length <= 3 && ["resize", "initially-short", "history-short"].includes(scenario),
-  "Usage: node scripts/smoke-approval-geometry.mjs resize|initially-short|history-short")
+const { scenario } = runtimeArguments("smoke-approval-geometry.mjs")
 const root = path.resolve(import.meta.dirname, "..")
 const host = process.env.OPENCODE_BIN ?? "opencode"
 const version = execFileSync(host, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
@@ -32,26 +32,12 @@ const observationFile = path.join(artifacts, "observations.json")
 const plugin = path.join(temp, "observer.mjs")
 await writeFile(plugin, `
 import { withHistoryObservations } from ${JSON.stringify(pathToFileURL(bundle).href)};
-import { writeFile, rename } from 'node:fs/promises';
+import { observationPublisher } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)};
 export default { id: 'approval-geometry-observer', tui: async (api, options) => {
   const records = { renders: [], diagnostics: [], asked: [], replies: [], commands: [], errors: [], dropped: 0 };
-  let writing, dirty = false;
+  const publisher = observationPublisher(${JSON.stringify(observationFile)});
   const previous = new Map();
-  // One writer, atomic rename, and consumed failures. Readers never see partial JSON.
-  const save = () => {
-    dirty = true;
-    if (!writing) writing = (async () => {
-      while (dirty) {
-        dirty = false;
-        await writeFile(${JSON.stringify(observationFile + ".tmp")}, JSON.stringify(records));
-        await rename(${JSON.stringify(observationFile + ".tmp")}, ${JSON.stringify(observationFile)});
-      }
-    })().catch(error => { records.errors.push(String(error)); }).finally(() => {
-      writing = undefined;
-      if (dirty) void save();
-    });
-    return writing;
-  };
+  const save = () => publisher.publish(records);
   const append = (key, value) => {
     if (records[key].length < 2048) records[key].push(value); else records.dropped++;
     return save();
@@ -83,7 +69,7 @@ export default { id: 'approval-geometry-observer', tui: async (api, options) => 
   } }] });
   await withHistoryObservations(observe, diagnostic)(api, options);
   await save();
-  api.lifecycle.onDispose(async () => { off(); while (writing) await writing; });
+  api.lifecycle.onDispose(async () => { off(); save(); await publisher.close(); });
 } };
 `)
 await writeFile(path.join(project, "fixture.py"), 'from pathlib import Path\nimport time\nwith Path("executions").open("a") as f:\n    f.write(str(time.time_ns() // 1000000) + "\\n")\n')
@@ -127,10 +113,7 @@ const server = createServer(async (req, res) => {
 const runtime = await smokeRuntime(temp)
 const capture = () => runtime.tmux("capture-pane", "-p", "-t", "geometry")
 const send = (...keys) => runtime.tmux("send-keys", "-t", "geometry", ...keys)
-const data = async () => {
-  try { return JSON.parse(await readFile(observationFile, "utf8")) }
-  catch (error) { if (error.code === "ENOENT") return { renders: [], diagnostics: [], asked: [], replies: [] }; throw error }
-}
+const data = async () => await readObservation(observationFile, { optional: true }) ?? { renders: [], diagnostics: [], asked: [], replies: [] }
 const executions = async () => {
   try { return (await readFile(path.join(project, "executions"), "utf8")).trim().split("\n").filter(Boolean).map(Number) }
   catch (error) { if (error.code === "ENOENT") return []; throw error }

@@ -11,11 +11,12 @@ import { smokeRuntime, smokeMetrics } from "./smoke-runtime.mjs"
 import { inspectPackageArchive } from "./release-artifact.mjs"
 import { DatabaseSync } from "node:sqlite"
 import { tsImport } from "tsx/esm/api"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation } from "./smoke-observations.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
 
-const scenario = process.argv[2] ?? "covered"
+const { scenario } = runtimeArguments("smoke-history-render.mjs")
 const production = process.argv.includes("--production-history")
-assert.ok(["covered", "countdown", "navigation", "notification", "dialog", "fullscreen", "hide", "narrow", "manual", "mode", "error", "zero"].includes(scenario))
-assert.ok(production || ["covered", "countdown", "dialog", "fullscreen"].includes(scenario))
 const negative = production && ["dialog", "fullscreen", "hide", "narrow", "manual", "mode"].includes(scenario)
 const root = path.resolve(import.meta.dirname, "..")
 const host = process.env.OPENCODE_BIN ?? "opencode"
@@ -38,7 +39,7 @@ const plugin = path.join(temp, "probe.mjs")
 await writeFile(plugin, `
 import { withHistoryRenderProbe, withHistoryObservations } from ${JSON.stringify(pathToFileURL(bundle).href)}
 import { BoxRenderable, TextRenderable } from '@opentui/core'
-import { writeFile, rename } from 'node:fs/promises'
+import { observationPublisher } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)}
 import { createEffect } from 'solid-js'
 const file = ${JSON.stringify(observations)}
 export default { id: 'history-render-probe', tui: async (api, options) => {
@@ -50,14 +51,8 @@ export default { id: 'history-render-probe', tui: async (api, options) => {
     records.clicks.push({ sessionID: approved.sessionID, history: approved.history })
     approvalClick(approved.sessionID, approved.history); void persist()
   }
-  let dirty = false, writing, last = new Map()
-  function persist() {
-    dirty = true
-    if (!writing) writing = (async () => {
-      while (dirty) { dirty = false; await writeFile(file + '.tmp', JSON.stringify(records)); await rename(file + '.tmp', file) }
-    })().finally(() => { writing = undefined; if (dirty) void persist() })
-    return writing
-  }
+  const last = new Map(), publisher = observationPublisher(file)
+  const persist = () => publisher.publish(records)
   createEffect(() => { records.gates.push({ at: performance.now(), dialog: api.ui.dialog.open }); void persist() })
   createEffect(() => { records.route = api.route.current.name === 'session' ? api.route.current.params.sessionID : undefined; void persist() })
   ${production ? "let opened = false;" : `const cover = new BoxRenderable(api.renderer, { id: 'history-proof-cover', position: 'absolute', top: 0, right: 0, width: 42, height: '100%', zIndex: 2,
@@ -99,7 +94,7 @@ export default { id: 'history-render-probe', tui: async (api, options) => {
     dispose: async () => {}
   } })` : "withHistoryRenderProbe({ cover: () => cover, observe }, diagnostic)"}(api, options)
   ${production ? "" : "api.slots.register({ slots: { app: () => cover } })"}
-  api.lifecycle.onDispose(async () => { off(); offClick(); ${production ? "" : "cover.destroyRecursively();"} await writing })
+  api.lifecycle.onDispose(async () => { off(); offClick(); ${production ? "" : "cover.destroyRecursively();"} persist(); await publisher.close() })
 } }
 `)
 await writeFile(path.join(project, "fixture.py"), 'from pathlib import Path\nimport time\nwith Path("executions").open("a") as f:\n    f.write(str(time.time_ns() // 1000000) + "\\n")\n')
@@ -147,7 +142,7 @@ const metrics = smokeMetrics(server, { pollIntervalMs: 80, hostVersion: "1.18.35
 const runtime = await smokeRuntime(temp)
 const capture = () => runtime.tmux("capture-pane", "-p", "-t", "render")
 const send = (...keys) => runtime.tmux("send-keys", "-t", "render", ...keys)
-const data = async () => JSON.parse(await readFile(observations, "utf8"))
+const data = () => readObservation(observations)
 const until = async (check, timeout = 20000) => {
   const end = Date.now() + timeout
   while (Date.now() < end) { if (await check(capture())) return; await sleep(80) }
@@ -247,9 +242,8 @@ try {
   if (negative) {
     const earlierAttention = record.notifications.filter(event => event.kind === "attention").length
     if (scenario === "dialog") {
-      send("C-p"); await until(s => s.includes("Commands"))
-      send("C-u"); send("-l", "Reviewer: Report history"); await until(s => s.includes("Reviewer: Report history"))
-      send("Enter"); await until(s => !s.includes("Commands"))
+      await activatePalette({ send, capture: () => runtime.tmux("capture-pane", "-p", "-e", "-t", "render") },
+        "Reviewer: Report history", s => s.includes("Analysis history"))
     }
     if (scenario === "fullscreen") { send("C-f"); await until(s => s.includes("minimize") && !s.includes("Analysis history")); await sleep(500); send("C-f") }
     if (scenario === "hide") { send("C-x", "b"); await until(s => !s.includes("Analysis history")); send("C-x", "b") }

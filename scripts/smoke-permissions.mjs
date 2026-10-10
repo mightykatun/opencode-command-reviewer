@@ -10,9 +10,11 @@ import { smokeMetrics, smokeRuntime } from "./smoke-runtime.mjs"
 import { reviewerAudit, sendReviewStream } from "./smoke-reviewer.mjs"
 import { permissionStagePlan, runPermissionStages } from "./smoke-stages.mjs"
 import { notificationRecorder, assertNotificationAudio } from "./smoke-notification-recorder.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
-const scenario = process.argv[2] ?? "mcp"
+const { scenario } = runtimeArguments("smoke-permissions.mjs")
 const flag = (name) => process.argv.includes(`--${name}`)
 const auto = flag("auto"), disabled = flag("disabled"), correction = flag("correction")
 const plan = permissionStagePlan(scenario, { auto, disabled, correction, held: flag("held"), cancel: flag("cancel"),
@@ -326,11 +328,8 @@ try {
     const recorded = flag("no-usage") || flag("error") ? 0 : [...perRequest.values()].reduce((sum, attempts) => sum + attempts - (flag("missing-usage") ? 1 : 0), 0)
     const rated = flag("error") ? 0 : perRequest.size
     const approved = auto && !flag("unsafe") && !flag("error") && !flag("cancel") ? plan.reviewKinds.length : 0
-    tmux("send-keys", "-t", "smoke", "C-p")
-    await until((s) => s.includes("Commands"), 5000)
-    tmux("send-keys", "-t", "smoke", "-l", "Reviewer: Statistics")
-    await until((s) => (s.match(/Reviewer: Statistics/g) ?? []).length >= 2, 5000)
-    tmux("send-keys", "-t", "smoke", "Enter")
+    await activatePalette({ send: (...keys) => tmux("send-keys", "-t", "smoke", ...keys),
+      capture: () => tmux("capture-pane", "-p", "-e", "-t", "smoke") }, "Reviewer: Statistics", s => s.includes("Reviewer statistics"))
     await until((s) => s.includes("Reviewer statistics") && s.includes(flag("storage-error") ? "Lifetime usage unavailable" : `Auto-approved: ${approved} (`), 5000)
     if (!flag("storage-error")) {
       // The SQL seed contributes one received POST and $0.01; legacy 999 seeds are excluded.

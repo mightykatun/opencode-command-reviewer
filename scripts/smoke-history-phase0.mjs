@@ -9,6 +9,11 @@ import { createServer } from "node:http"
 import { setTimeout as sleep } from "node:timers/promises"
 import { inspectPackageArchive } from "./release-artifact.mjs"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation } from "./smoke-observations.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
+
+runtimeArguments("smoke-history-phase0.mjs")
 
 const root = path.resolve(import.meta.dirname, "..")
 const host = process.env.OPENCODE_BIN ?? "opencode"
@@ -32,12 +37,13 @@ const wrapper = path.join(temp, "probe.mjs")
 await writeFile(wrapper, `
 import plugin, { historyWorkerProbeSource } from ${JSON.stringify(pathToFileURL(bundle).href)}
 import { Worker } from 'node:worker_threads'
-import { mkdir, writeFile, rename } from 'node:fs/promises'
+import { mkdir } from 'node:fs/promises'
+import { observationPublisher } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)}
 import { BoxRenderable, TextRenderable } from '@opentui/core'
 const file = ${JSON.stringify(record)}
 const result = { events: [], worker: {}, keys: [], dispatches: [] }
-let writing = Promise.resolve()
-function save() { const text = JSON.stringify(result); writing = writing.then(async () => { await writeFile(file+'.tmp', text); await rename(file+'.tmp', file) }); return writing }
+const publisher = observationPublisher(file)
+const save = () => publisher.publish(result)
 export default { id: 'reviewer-history-phase0', tui: async (api, options, meta) => {
   await plugin.tui(api, options, meta)
   const offDispatch = api.keymap.on('dispatch', event => {
@@ -83,6 +89,7 @@ export default { id: 'reviewer-history-phase0', tui: async (api, options, meta) 
     try { result.worker.disposeTerminationMs = await terminate(); result.worker.disposalMs = performance.now() - abortAt }
     catch (error) { result.error = String(error) }
     await save()
+    await publisher.flush()
   })
   try {
     const directory = api.state.path.state + '/phase0'
@@ -127,6 +134,7 @@ export default { id: 'reviewer-history-phase0', tui: async (api, options, meta) 
     result.deactivated = await api.plugins.deactivate('reviewer-history-phase0')
     result.worker.totalDisposalMs = performance.now() - abortAt
     await save()
+    await publisher.close()
   } }] })
 } }
 `)
@@ -143,14 +151,15 @@ const server = createServer(async (req, res) => {
 const runtime = await smokeRuntime(temp)
 const send = (...keys) => runtime.tmux('send-keys', '-t', 'proof', ...keys)
 const capture = () => runtime.tmux('capture-pane', '-p', '-t', 'proof')
-const data = async () => JSON.parse(await readFile(record, 'utf8'))
+const data = () => readObservation(record)
 const until = async (check, timeout = 20000) => {
   const end = Date.now() + timeout
   while (Date.now() < end) { if (await check(capture())) return; await sleep(100) }
   throw Error('Phase0 wait timed out')
 }
 const save = async name => { await writeFile(path.join(artifacts, name+'.txt'), capture()); await writeFile(path.join(artifacts, name+'.ansi'), runtime.tmux('capture-pane', '-p', '-e', '-t', 'proof')) }
-const palette = async title => { send('C-p'); await until(s => s.includes('Commands')); send('-l', title); await until(s => s.includes(title)); send('Enter') }
+const palette = title => activatePalette({ send, capture: () => runtime.tmux('capture-pane', '-p', '-e', '-t', 'proof') }, title,
+  title === 'Reviewer: Report history' ? s => s.includes('Analysis history') : async () => (await data()).deactivated === true)
 try {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const config = { model: 'fixture/fixture', small_model: 'fixture/fixture', autoupdate: false, provider: { fixture: { npm: '@ai-sdk/openai-compatible', options: { baseURL: 'http://127.0.0.1:'+server.address().port, apiKey: 'synthetic-only' }, models: { fixture: { name: 'Fixture', limit: { context: 32000, output: 1000 } } } } } }

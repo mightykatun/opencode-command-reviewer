@@ -9,43 +9,25 @@ import { pathToFileURL } from "node:url"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeMetrics, smokeRuntime } from "./smoke-runtime.mjs"
 import { reviewerAudit, assertReviewerReuse } from "./smoke-reviewer.mjs"
-import { reviewStagePlan } from "./smoke-stages.mjs"
+import { runPermissionStages } from "./smoke-stages.mjs"
+import { smokeScenario, runSmokeFamily } from "./smoke-scenarios.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
 import { notificationRecorder, assertNotificationAudio } from "./smoke-notification-recorder.mjs"
 
 const root = path.resolve(import.meta.dirname, "..")
 const hostBinary = process.env.OPENCODE_BIN ?? "opencode"
-const scenario = process.argv[2] ?? "correction"
+const { scenario } = runtimeArguments("smoke.mjs")
 const measureReuse = process.argv.includes("--measure-reuse")
 const notifications = process.argv.includes("--notifications")
 const reminders = process.argv.includes("--reminders")
-if (reminders) assert.ok(notifications && ["auto-shell", "auto-zero", "auto-unsafe", "auto-error", "auto-cancel"].includes(scenario), "reminder fixture requires a supported notification scenario")
 const networkRetry = process.argv.includes("--network-retry")
-if (networkRetry) assert.equal(scenario, "auto-shell", "network recovery uses the auto-shell fixture")
-if (measureReuse) assert.equal(scenario, "external", "reuse baseline uses the two-stage external fixture")
-assert.ok(["correction", "cancel", "error", "stalled-file", "external", "edit", "write", "patch", "edit-cancel", "edit-config-error", "edit-disabled", "bash-disabled", "external-disabled", "auto-shell", "auto-cancel", "auto-scroll", "auto-edit", "auto-external", "auto-immediate", "auto-zero", "auto-unsafe", "auto-error", "auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow", "auto-manual", "auto-initially-hidden"].includes(scenario))
-const auto = scenario.startsWith("auto-")
-const visibilityLoss = ["auto-hide", "auto-dialog", "auto-fullscreen", "auto-narrow"].includes(scenario)
-const autoDelay = scenario === "auto-zero" ? 0 : scenario === "auto-scroll" ? 25
-  : ["auto-immediate", "auto-manual"].includes(scenario) ? 15 : visibilityLoss ? 8 : 3
-const isEdit = ["edit", "write", "patch", "edit-cancel", "edit-config-error", "edit-disabled", "auto-edit"].includes(scenario)
-const isExternal = ["external", "external-disabled", "auto-external"].includes(scenario)
-const disabledReview = scenario.endsWith("-disabled")
-const heldReview = scenario === "cancel" || scenario === "edit-cancel"
-const correction = scenario === "correction" || scenario === "edit"
-const withUsage = ["correction", "edit", "write", "patch", "auto-shell", "auto-scroll"].includes(scenario)
-const knownPricing = withUsage && scenario !== "write"
-const configFailure = scenario === "edit-config-error"
-const plan = reviewStagePlan(isExternal ? [{ kind: "external-directory", permission: "external_directory" }, { kind: "shell", permission: "bash" }]
-  : [{ kind: isEdit ? "edit" : "shell", permission: isEdit ? "edit" : "bash" }], {
-  reviewBash: !["edit", "bash-disabled", "external-disabled", "edit-config-error"].includes(scenario),
-  reviewEdits: !["correction", "edit-disabled"].includes(scenario), reviewMcp: false, reviewCustomTools: false,
-  reviewExternalDirectories: scenario !== "external-disabled",
-}, { auto, held: heldReview, correction, unavailable: configFailure,
-  unsafe: scenario === "auto-unsafe", error: ["error", "auto-error"].includes(scenario), cancel: scenario === "auto-cancel" })
+const descriptor = smokeScenario(scenario)
+const { auto, visibilityLoss, autoDelay, isEdit, isExternal, disabledReview, heldReview, correction,
+  withUsage, knownPricing, configFailure, plan, initialWidth } = descriptor
 if (process.argv.includes("--plan")) { console.log(JSON.stringify(plan, null, 2)); process.exit(0) }
 const hostVersion = execFileSync(hostBinary, ["--version"], { encoding: "utf8", timeout: 10000 }).trim()
 const fixtureModel = scenario === "patch" ? "gpt-fixture" : "fixture"
-const initialWidth = scenario === "cancel" || scenario === "auto-initially-hidden" ? 80 : 160
 const formattedDescription = "Counts two fruit names.\n\n- **Output:** prints the count.\n- **File:** writes to `executed-marker`.\n- *Literal:* `\x1b[2J\u202e`.\n\n### Details\n\n[Documentation](https://example.com/review)"
 const finalLine = "FINAL ANALYSIS LINE"
 const longDescription = [formattedDescription, ...Array.from({ length: 60 }, (_, i) => `Analysis detail ${String(i + 1).padStart(2, "0")}.`), finalLine].join("\n\n")
@@ -155,7 +137,7 @@ export default { id: plugin.id, tui: withFileAccess({ realpath,
 }
 const editOriginals = { "note.txt": "before\n", "delete.txt": "DELETE-SENTINEL\n", "move.txt": "MOVE-SENTINEL\n" }
 if (isEdit) for (const [name, text] of Object.entries(editOriginals)) await writeFile(path.join(project, name), text)
-const toolName = scenario === "patch" ? "apply_patch" : scenario === "write" ? "write" : isEdit ? "edit" : "bash"
+const toolName = descriptor.tool
 const toolInput = scenario === "patch" ? { patchText: "*** Begin Patch\n*** Add File: added.txt\n+created\n*** Update File: note.txt\n@@\n-before\n+after\n*** Delete File: delete.txt\n*** Update File: move.txt\n*** Move to: moved.txt\n@@\n-MOVE-SENTINEL\n+relocated\n*** End Patch" }
   : scenario === "write" ? { filePath: path.join(project, "note.txt"), content: "after\n" }
   : isEdit ? { filePath: path.join(project, "note.txt"), oldString: "before", newString: "after" }
@@ -200,7 +182,7 @@ const handleRequest = async (req, res) => {
         await assert.rejects(access(path.join(commandDirectory, "executed-marker")), "review request must precede native execution")
         if (isEdit) await assertEditsUnchanged()
       }
-      if (scenario === "error" || scenario === "auto-error") { res.writeHead(401); res.end("fixture authentication failure"); record("review-error"); return }
+      if (descriptor.error) { res.writeHead(401); res.end("fixture authentication failure"); record("review-error"); return }
       if (networkRetry && reviewerCalls <= 2) {
         observation.transportRetry()
         res.writeHead(reviewerCalls === 1 ? 429 : 503, { "Retry-After": "1" })
@@ -212,7 +194,7 @@ const handleRequest = async (req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" })
         const content = correction && reviewerCalls === 1
           ? '{"safe":"yes","desc":"Incorrect boolean type."}'
-          : JSON.stringify({ safe: !["external", "patch", "auto-unsafe", "stalled-file"].includes(scenario), desc: scenario === "stalled-file" ? "Source contents unavailable after a bounded file-access timeout." : scenario === "auto-scroll" ? autoLongDescription : scenario === "correction" ? longDescription : isEdit ? "Proposed file changes. Partial coverage where diffs are omitted." : "Counts two fruit names, prints the count, and writes it to executed-marker." })
+          : JSON.stringify({ safe: !descriptor.unsafe, desc: descriptor.stalled ? "Source contents unavailable after a bounded file-access timeout." : descriptor.long ? auto ? autoLongDescription : longDescription : isEdit ? "Proposed file changes. Partial coverage where diffs are omitted." : "Counts two fruit names, prints the count, and writes it to executed-marker." })
         const usage = withUsage ? { prompt_tokens: 500, completion_tokens: 20 } : undefined
         observation.usage(usage)
         observation.response(content, correction && reviewerCalls === 1)
@@ -391,7 +373,7 @@ try {
     }
     await writeFile(path.join(root, `.runtime/${scenario}-usage.ansi`), ansi)
   }
-  if (auto) {
+  async function runApprovalFamily() {
     const save = async (name) => {
       screen = capture()
       assert.doesNotMatch(screen, /HIDDEN-REASONING-SENTINEL/)
@@ -449,8 +431,8 @@ try {
       mouse(0, x, row + 1, true)
       record(`clicked-${label}`)
     }
-    const canceled = ["auto-cancel", "auto-scroll"].includes(scenario) || visibilityLoss
-    const manualResult = ["auto-unsafe", "auto-error"].includes(scenario)
+    const canceled = descriptor.cancel || visibilityLoss
+    const manualResult = descriptor.unsafe || descriptor.error
     let started
     if (scenario === "auto-zero") {
       // Allow normal host startup; a zero-second footer may pass between captures.
@@ -479,25 +461,38 @@ try {
       let stage = await countdown()
       started = stage.started
       if (scenario === "auto-external") {
-        const directory = JSON.parse(reviews()[0].body.messages[1].content)
-        assert.equal(directory.permission.type, "external_directory")
-        assert.deepEqual(directory.permission.metadata.directories, [commandDirectory])
-        assert.deepEqual(directory.permission.patterns, [`${commandDirectory}/*`])
-        assert.deepEqual(directory.permission.always, [`${commandDirectory}/*`])
-        await pendingFor(Math.max(0, started + autoDelay * 1000 - 250 - Date.now()), (s) => assert.match(s, /Allowed in \d+s/))
-        await until((s) => reviewerCalls === 2 && s.includes("Shell command") && s.includes(`Allowed in ${autoDelay}s`), 10000)
-        const secondRequested = events.find((event) => event.event === "review-request-2").at
-        assert.ok(secondRequested - started >= autoDelay * 1000 - 250, "directory approval must wait a full countdown")
-        await unchanged() // Directory approval alone must never execute the command.
-        stage = await countdown("bash-pending")
-        started = stage.started
-        const bash = JSON.parse(reviews()[1].body.messages[1].content)
-        assert.equal(bash.permission.type, "bash")
-        assert.notEqual(bash.permission.id, directory.permission.id)
-        assert.equal(bash.permission.tool.callID, directory.permission.tool.callID)
-        assert.deepEqual(bash.permission.patterns, ["python3 fruits.py"])
-        assert.equal(bash.cwd, commandDirectory)
-        assert.equal(bash.files[0].contents, source)
+        let directory
+        await runPermissionStages(plan, {
+          pending: async (_, index) => {
+            if (!index) return
+            await until(s => reviewerCalls === 2 && s.includes("Shell command") && s.includes(`Allowed in ${autoDelay}s`), 10000)
+            const secondRequested = events.find(event => event.event === "review-request-2").at
+            assert.ok(secondRequested - started >= autoDelay * 1000 - 250, "directory approval must wait a full countdown")
+            await unchanged() // Directory approval alone must never execute the command.
+          },
+          assessment: async (_, index) => {
+            if (!index) {
+              directory = JSON.parse(reviews()[0].body.messages[1].content)
+              assert.equal(directory.permission.type, "external_directory")
+              assert.deepEqual(directory.permission.metadata.directories, [commandDirectory])
+              assert.deepEqual(directory.permission.patterns, [`${commandDirectory}/*`])
+              assert.deepEqual(directory.permission.always, [`${commandDirectory}/*`])
+            } else {
+              const bash = JSON.parse(reviews()[1].body.messages[1].content)
+              assert.equal(bash.permission.type, "bash")
+              assert.notEqual(bash.permission.id, directory.permission.id)
+              assert.equal(bash.permission.tool.callID, directory.permission.tool.callID)
+              assert.deepEqual(bash.permission.patterns, ["python3 fruits.py"])
+              assert.equal(bash.cwd, commandDirectory)
+              assert.equal(bash.files[0].contents, source)
+            }
+          },
+          capture: async () => {},
+          countdown: async (_, index) => {
+            if (!index) await pendingFor(Math.max(0, started + autoDelay * 1000 - 250 - Date.now()), s => assert.match(s, /Allowed in \d+s/))
+            else { stage = await countdown("bash-pending"); started = stage.started }
+          },
+        })
       }
       const { footerRow } = stage
       if (scenario === "auto-scroll") {
@@ -672,7 +667,8 @@ try {
     await writeFile(path.join(root, `.runtime/${scenario}-requests.json`), JSON.stringify(calls, null, 2))
     await writeFile(path.join(root, `.runtime/${scenario}-events.json`), JSON.stringify(events, null, 2))
     console.log(`PASS ${scenario}: ${manualResult ? "bold themed manual result; no footer/execution across delay" : canceled ? "permanent cancellation; native pending beyond deadline" : "native once-only side effect and reviewer-before-execution"}; ${reviewerCalls} review(s), extra-careful prompt, unchanged generating-agent input, clean panel removal. Isolated files: ${temp}`)
-  } else {
+  }
+  async function runAdvisoryFamily() {
     const assertReviewLayout = (screen, width) => {
       if (disabledReview) {
         assert.ok(!hasPanel(screen), "disabled reviews must remain hidden")
@@ -930,11 +926,8 @@ try {
         const color = styleAt(loadingLine, match[0], match.index).fg?.split(",")
         assert.ok(color?.length === 3 && color[0] === color[1] && color[1] === color[2], "scanner cells should be gray")
       }
-      tmux("send-keys", "-t", "smoke", "C-p")
-      await until((s) => s.includes("Commands") && !hasPanel(s), 10000)
-      tmux("send-keys", "-t", "smoke", "-l", "animations")
-      await until((s) => s.includes("Disable animations"), 10000)
-      tmux("send-keys", "-t", "smoke", "Enter")
+      await activatePalette({ send: (...keys) => tmux("send-keys", "-t", "smoke", ...keys),
+        capture: () => tmux("capture-pane", "-p", "-e", "-t", "smoke") }, "Disable animations", s => s.includes("[⋯]"))
       await until((s) => s.includes("Permission analysis") && s.includes("[⋯]"), 10000)
       assert.ok(!spinnerFrame(screen), "disabled animations should use a static indicator")
       assert.doesNotMatch(screen, /Analyzing/)
@@ -977,11 +970,8 @@ try {
     if (scenario === "edit") {
       let originalAverages
       const showLifetime = async () => {
-        tmux("send-keys", "-t", "smoke", "C-p")
-        await until((s) => s.includes("Commands"), 10000)
-        tmux("send-keys", "-t", "smoke", "-l", "Reviewer: Statistics")
-        await until((s) => (s.match(/Reviewer: Statistics/g) ?? []).length >= 2, 10000)
-        tmux("send-keys", "-t", "smoke", "Enter")
+        await activatePalette({ send: (...keys) => tmux("send-keys", "-t", "smoke", ...keys),
+          capture: () => tmux("capture-pane", "-p", "-e", "-t", "smoke") }, "Reviewer: Statistics", s => s.includes("Reviewer statistics"))
         await until((s) => s.includes("Reviewer statistics") && s.includes("Reviews: 1") && s.includes("Average time to rating:"), 10000)
         assert.match(screen, /Cost: \$0\.0011/)
         assert.match(screen, /Tokens: 1000 in 40 out/)
@@ -1011,6 +1001,12 @@ try {
     await writeFile(path.join(root, `.runtime/${scenario}-requests.json`), JSON.stringify(calls, null, 2))
     console.log(`PASS ${scenario}: native approval, exact evidence, advisory behavior, panel cleanup${scenario === "cancel" ? ", >6s held response, observed HTTP cancellation, released late response and clean sidebar remount at 80x24" : scenario === "correction" ? ", long-analysis wheel/drag, live scrollbar theme and native fullscreen layering" : ""}. Isolated files: ${temp}`)
   }
+  async function runRenderingFamily() {
+    // Rendering scenarios retain their native advisory/approval lifecycle and
+    // independently assert colors, highlighting, scrolling, and remount identity.
+    return auto ? runApprovalFamily() : runAdvisoryFamily()
+  }
+  await runSmokeFamily(descriptor, { approval: runApprovalFamily, advisory: runAdvisoryFamily, rendering: runRenderingFamily })
   audit.verify(plan.reviewKinds, plan.attemptsPerReview + (networkRetry ? 2 : 0))
   assert.equal(metrics.snapshot().counts.byRole.reviewer.requests, audit.snapshot().posts)
   if (measureReuse) assertReviewerReuse(metrics.snapshot())

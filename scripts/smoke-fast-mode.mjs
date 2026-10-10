@@ -10,9 +10,10 @@ import { createServer } from "node:http"
 import { setTimeout as sleep } from "node:timers/promises"
 import { DatabaseSync } from "node:sqlite"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation } from "./smoke-observations.mjs"
 
-const scenario = process.argv[2] ?? "complete"
-assert.ok(["complete", "retry", "error", "nonstream", "hidden", "dialog"].includes(scenario))
+const { scenario } = runtimeArguments("smoke-fast-mode.mjs")
 const streaming = scenario !== "nonstream"
 const root = path.resolve(import.meta.dirname, ".."), host = process.env.OPENCODE_BIN ?? "opencode"
 assert.equal(execFileSync(host, ["--version"], { encoding: "utf8" }).trim(), "1.18.35")
@@ -24,14 +25,13 @@ const bundle = path.join(temp, "bundle.mjs"), plugin = path.join(temp, "plugin.m
 await copyFile(path.join(root, "dist/tui.js"), bundle)
 await writeFile(plugin, `
 import { withNotifications } from ${JSON.stringify(pathToFileURL(bundle).href)};
-import { writeFile, rename } from 'node:fs/promises';
+import { observationPublisher } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)};
 import { createEffect } from 'solid-js';
 export default { id: 'fast-mode-fixture', tui: async (api, options) => {
   const data = { asked: [], replies: [], notifications: [], clicks: 0 };
-  let click, writing, dirty = false;
-  const save = () => { dirty = true; if (!writing) writing = (async () => {
-    while (dirty) { dirty = false; await writeFile(${JSON.stringify(records + ".tmp")}, JSON.stringify(data)); await rename(${JSON.stringify(records + ".tmp")}, ${JSON.stringify(records)}); }
-  })().finally(() => { writing = undefined; if (dirty) void save(); }); return writing; };
+  let click;
+  const publisher = observationPublisher(${JSON.stringify(records)});
+  const save = () => publisher.publish(data);
   const activate = () => { const event = data.notifications.find(e => e.kind === 'approved');
     if (event) { data.clicks++; click(event.sessionID, event.history); void save(); } };
   createEffect(() => { data.route = api.route.current.name === 'session' ? api.route.current.params.sessionID : undefined; void save(); });
@@ -48,7 +48,7 @@ export default { id: 'fast-mode-fixture', tui: async (api, options) => {
     {key:'f9', cmd:activate}
   ]});
   const offModal = api.keymap.registerLayer({priority:200, mode:'modal', bindings:[{key:'f9', cmd:activate}]});
-  api.lifecycle.onDispose(async () => {off(); offModal(); await writing;});
+  api.lifecycle.onDispose(async () => {off(); offModal(); save(); await publisher.close();});
 } };
 `)
 await writeFile(path.join(project, "fixture.py"), 'from pathlib import Path\nimport sys\nwith Path("executions").open("a") as f:\n    f.write(sys.argv[1] + "\\n")\n')
@@ -100,7 +100,7 @@ const server = createServer(async (req, res) => {
 const runtime = await smokeRuntime(temp)
 const capture = () => runtime.tmux("capture-pane", "-p", "-t", "fast")
 const send = (...keys) => runtime.tmux("send-keys", "-t", "fast", ...keys)
-const data = async () => JSON.parse(await readFile(records, "utf8"))
+const data = () => readObservation(records)
 const executed = async () => (await readFile(path.join(project, "executions"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean)
 const saved = () => {
   db ??= new DatabaseSync(path.join(temp, "state/opencode/opencode-reviewer/history-v1.sqlite"), { readOnly: true })

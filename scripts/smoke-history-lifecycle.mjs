@@ -5,8 +5,9 @@ import { execFileSync } from "node:child_process"
 import { mkdir, writeFile } from "node:fs/promises"
 import { DatabaseSync } from "node:sqlite"
 import path from "node:path"
+import { runtimeArguments } from "./runtime-inventory.mjs"
 
-const scenario = process.argv[2] ?? "auto-shell"
+const { scenario } = runtimeArguments("smoke-history-lifecycle.mjs")
 const expected = { "auto-shell": "auto", "auto-immediate": "manual", "auto-manual": undefined, "auto-cancel": "rejected" }
 assert.ok(Object.hasOwn(expected, scenario))
 const root = path.resolve(import.meta.dirname, "..")

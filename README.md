@@ -383,6 +383,12 @@ Disable overlapping notification plugins to avoid duplicate alerts.
 Use Node.js 24.15.0+ within 24.x, or 22.22.2+ within 22.x, and npm.
 Run `npm ci --ignore-scripts`, then `npm run check` for typechecking, source tests,
 pure-helper tests and the build. `npm run test:helpers` runs the helper checks
-without building or starting OpenCode. Pull-request CI checks both Node versions.
+without building or starting OpenCode. Pull-request CI checks both Node versions
+and runs a separate representative Linux OpenCode 1.18.35 fixture profile.
+After building, run `node scripts/test-runtime.mjs --profile ci` for that same
+profile. Use `node scripts/test-runtime.mjs --list` for the complete runtime
+inventory or `node scripts/test-runtime.mjs --plan --profile ci` for a
+host-independent plan. Profiles select documented scenario/flag combinations;
+interactive desktop checks and historical replays have separate prerequisites.
 See [AGENTS.md](https://github.com/mightykatun/opencode-reviewer/blob/main/AGENTS.md)
 for runtime tests and the tag-driven release process.

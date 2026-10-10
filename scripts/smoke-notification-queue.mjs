@@ -9,9 +9,9 @@ import { execFileSync } from "node:child_process"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime } from "./smoke-runtime.mjs"
 import { notificationRecorder } from "./smoke-notification-recorder.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
 
-const scenario = process.argv[2] ?? "main"
-assert.ok(["main", "children", "mixed", "advisory", "disabled"].includes(scenario))
+const { scenario } = runtimeArguments("smoke-notification-queue.mjs")
 const streaming = process.argv.includes("--stream")
 const label = `${scenario}${streaming ? "-stream" : ""}`
 // Exceed the bounded two-second cold audio preparation so a reminder cannot

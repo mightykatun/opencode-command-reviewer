@@ -3,15 +3,16 @@
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
 import { execFileSync } from "node:child_process"
-import { mkdtemp, mkdir, copyFile, writeFile, readFile } from "node:fs/promises"
+import { mkdtemp, mkdir, copyFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation } from "./smoke-observations.mjs"
 
-const scenario = process.argv[2]
-assert.ok(["baseline", "capacity", "click"].includes(scenario))
+const { scenario } = runtimeArguments("smoke-notification-w4.mjs")
 const root = path.resolve(import.meta.dirname, ".."), host = process.env.OPENCODE_BIN ?? "opencode"
 assert.equal(execFileSync(host, ["--version"], { encoding: "utf8" }).trim(), "1.18.35")
 const temp = await mkdtemp(path.join(tmpdir(), "reviewer-notification-w4-")), project = path.join(temp, "project")
@@ -23,16 +24,15 @@ await writeFile(records, JSON.stringify({ events: [], starts: [], actions: [], p
 await copyFile(path.join(root, "dist/tui.js"), bundle)
 await writeFile(plugin, `
 import { withNotificationProcesses } from ${JSON.stringify(pathToFileURL(bundle).href)};
-import { writeFile, rename } from 'node:fs/promises';
+import { observationPublisher } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)};
 import { existsSync } from 'node:fs';
 import { createEffect } from 'solid-js';
 export default { id: 'notification-w4', tui: async (api, options) => {
   const scenario = ${JSON.stringify(scenario)};
   const data = { events: [], starts: [], actions: [], peak: 0, released: false };
-  let writing, dirty = false, releaseBaseline, sequence = 0;
-  const save = () => { dirty = true; if (!writing) writing = (async () => {
-    while (dirty) { dirty = false; await writeFile(${JSON.stringify(records + ".tmp")}, JSON.stringify(data)); await rename(${JSON.stringify(records + ".tmp")}, ${JSON.stringify(records)}); }
-  })().finally(() => { writing = undefined; if (dirty) void save(); }); return writing; };
+  let releaseBaseline, sequence = 0;
+  const publisher = observationPublisher(${JSON.stringify(records)});
+  const save = () => publisher.publish(data);
   const baseline = new Promise(resolve => { releaseBaseline = resolve });
   const children = new Set(), banners = [];
   // A deterministic fake terminal identity enables the real activation pipeline
@@ -85,7 +85,7 @@ export default { id: 'notification-w4', tui: async (api, options) => {
     {key:'f9', cmd:() => { banners.find(b => b.args.at(-1) === 'Reviewer approved a permission').finish(); data.actions.push('old-eof'); void save(); }}
   ]});
   const offModal = api.keymap.registerLayer({priority:200, mode:'modal', bindings:[{key:'f6',cmd:release}]});
-  api.lifecycle.onDispose(async () => {off(); offModal(); clearInterval(control); releaseBaseline(); await writing;});
+  api.lifecycle.onDispose(async () => {off(); offModal(); clearInterval(control); releaseBaseline(); save(); await publisher.close();});
 } };
 `)
 let sent = false, reviewCount = 0, questionSent = false
@@ -125,7 +125,7 @@ const server = createServer(async (req, res) => {
 })
 const runtime = await smokeRuntime(temp)
 let screen = ""
-const data = async () => JSON.parse(await readFile(records, "utf8"))
+const data = () => readObservation(records)
 const send = (...keys) => runtime.tmux("send-keys", "-t", "w4", ...keys)
 const until = async (check, timeout = 90000) => {
   const end = Date.now() + timeout

@@ -1,0 +1,113 @@
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import { mkdtemp, rm, writeFile, rename } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { setImmediate as turn } from "node:timers/promises"
+import { observationPublisher, readObservation } from "../scripts/smoke-observations.mjs"
+import { selectedPaletteResult, activatePalette } from "../scripts/smoke-ui.mjs"
+
+async function fixture(t) {
+  const directory = await mkdtemp(path.join(tmpdir(), "smoke-publisher-"))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  return path.join(directory, "observations.json")
+}
+
+test("observation publication serializes, coalesces, snapshots inputs, and flushes the newest update", async t => {
+  const file = await fixture(t), releases = [], paths = []
+  let active = 0, peak = 0
+  const publisher = observationPublisher(file, { io: { writeFile: async (...args) => {
+    paths.push(args[0]); peak = Math.max(peak, ++active)
+    await new Promise(resolve => releases.push(resolve))
+    await writeFile(...args); active--
+  }, rename, rm } })
+  publisher.publish({ revision: 1 })
+  await turn()
+  assert.equal(await readObservation(file, { optional: true }), undefined)
+  const snapshot = { revision: 2 }
+  publisher.publish(snapshot); snapshot.revision = 999
+  publisher.publish({ revision: 3 })
+  assert.throws(() => publisher.publish(undefined), /must be JSON/)
+  const closing = publisher.close()
+  releases.shift()(); await turn()
+  while (!releases.length) await turn()
+  assert.deepEqual(await readObservation(file), { revision: 1 })
+  releases.shift()(); await closing
+  assert.deepEqual(await readObservation(file), { revision: 3 })
+  assert.equal(peak, 1); assert.equal(paths.length, 2)
+  assert.notEqual(paths[0], paths[1]); assert.ok(paths.every(p => path.dirname(p) === path.dirname(file)))
+  await publisher.close()
+  assert.throws(() => publisher.publish({ revision: 4 }), /closed/)
+})
+
+test("a queued snapshot is immutable and rapid readers never see partial JSON", async t => {
+  const file = await fixture(t), publisher = observationPublisher(file)
+  const value = { revision: 1, text: "x".repeat(100000) }
+  publisher.publish(value); value.revision = 200
+  await publisher.flush()
+  assert.equal((await readObservation(file)).revision, 1)
+  for (let n = 2; n <= 30; n++) {
+    publisher.publish({ revision: n, text: value.text })
+    assert.ok((await readObservation(file)).revision <= n)
+  }
+  await publisher.close()
+  assert.equal((await readObservation(file)).revision, 30)
+})
+
+for (const operation of ["writeFile", "rename"]) test(`${operation} failures are owned immediately and surfaced to driver and disposal`, async t => {
+  const file = await fixture(t)
+  const publisher = observationPublisher(file, { io: { writeFile, rename, rm,
+    [operation]: async () => { throw new Error("simulated ENOSPC") } } })
+  publisher.publish({ revision: 1 }) // Deliberately unawaited, as host event callbacks are.
+  await assert.rejects(publisher.close(), /simulated ENOSPC/)
+  await assert.rejects(readObservation(file, { optional: true }), /simulated ENOSPC/)
+  await assert.rejects(publisher.flush(), /simulated ENOSPC/)
+})
+
+test("only explicit initial absence is optional; corrupt observations retain their path and cause", async t => {
+  const file = await fixture(t)
+  await assert.rejects(readObservation(file), /observations.json/)
+  assert.equal(await readObservation(file, { optional: true }), undefined)
+  await writeFile(file, "{broken")
+  await assert.rejects(readObservation(file, { optional: true }), /Invalid JSON.*observations.json/)
+})
+
+const title = "Reviewer: Statistics"
+const palette = (selected = "Previous command", target = true) =>
+  `\x1b[48;2;20;20;20mCommands\n ${title} \n` +
+  `\x1b[48;2;100;100;200m ${selected} \x1b[48;2;20;20;20m\n` +
+  (target && selected !== title ? ` ${title} \n` : "")
+
+test("palette readiness rejects input echoes and unselected results, accepts the selected exact row", () => {
+  assert.equal(selectedPaletteResult(palette(), title), false)
+  assert.equal(selectedPaletteResult(palette("Previous command", false), title), false)
+  assert.equal(selectedPaletteResult(palette(title), title), true)
+  assert.equal(selectedPaletteResult(palette(title + " extra"), title), false)
+})
+
+test("delayed palette filtering cannot send Enter early; activation waits for its postcondition", async () => {
+  const sent = []
+  let polls = 0, activated = false, ready = false
+  await activatePalette({ send: (...keys) => { sent.push(keys); if (keys[0] === "Enter") {
+    assert.ok(polls >= 4); activated = true
+  } }, capture: () => {
+    if (activated) { ready = ++polls >= 7; return ready ? "Reviewer statistics" : "Loading" }
+    return palette(++polls >= 4 ? title : "Previous command")
+  }, intervalMs: 0 }, title, s => s.includes("Reviewer statistics"))
+  assert.equal(ready, true)
+  assert.deepEqual(sent, [["C-p"], ["C-u"], ["-l", title], ["Enter"]])
+})
+
+test("wrong selection times out with the command and capture, without Enter", async () => {
+  const sent = []
+  await assert.rejects(activatePalette({ send: (...keys) => sent.push(keys), capture: () => palette(), timeoutMs: 15, intervalMs: 1 },
+    title, () => false), /Reviewer: Statistics[\s\S]*Previous command/)
+  assert.ok(!sent.some(keys => keys[0] === "Enter"))
+})
+
+test("palette disappearance is not proof the command's required postcondition happened", async () => {
+  let activated = false
+  await assert.rejects(activatePalette({ send: key => { if (key === "Enter") activated = true },
+    capture: () => activated ? "Wrong view" : palette(title), timeoutMs: 15, intervalMs: 1 }, title,
+  s => s.includes("Reviewer statistics")), /postcondition[\s\S]*Wrong view/)
+})

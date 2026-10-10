@@ -1,7 +1,7 @@
 // Native skill loading and real task/resume delegation against the built plugin.
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { mkdtemp, mkdir, writeFile, readFile, copyFile, access } from "node:fs/promises"
+import { mkdtemp, mkdir, writeFile, copyFile, access } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -9,9 +9,10 @@ import { createServer } from "node:http"
 import { setTimeout as sleep } from "node:timers/promises"
 import { DatabaseSync } from "node:sqlite"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation } from "./smoke-observations.mjs"
 
-const scenario = process.argv[2] ?? "root"
-assert.ok(["root", "subagent", "disabled", "unsafe", "fast"].includes(scenario))
+const { scenario } = runtimeArguments("smoke-skills.mjs")
 const root = path.resolve(import.meta.dirname, ".."), host = process.env.OPENCODE_BIN ?? "opencode"
 assert.equal(execFileSync(host, ["--version"], { encoding: "utf8" }).trim(), "1.18.35")
 const temp = await mkdtemp(path.join(tmpdir(), "reviewer-skills-")), project = path.join(temp, "project")
@@ -31,16 +32,15 @@ await writeFile(recordFile, JSON.stringify({ asked: [], replies: [], children: [
 await copyFile(path.join(root, "dist/tui.js"), bundle)
 await writeFile(plugin, `
 import plugin from ${JSON.stringify(pathToFileURL(bundle).href)};
-import {writeFile, rename} from 'node:fs/promises';
+import { observationPublisher } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)};
 export default {id:'skill-fixture', tui:async (api, options) => {
-  const data = {asked:[], replies:[], children:[]}; let dirty=false, writing;
-  const save=() => {dirty=true; if (!writing) writing=(async () => {while(dirty) {dirty=false;
-    await writeFile(${JSON.stringify(recordFile + ".tmp")}, JSON.stringify(data)); await rename(${JSON.stringify(recordFile + ".tmp")}, ${JSON.stringify(recordFile)});
-  }})().finally(() => {writing=undefined; if(dirty) void save();}); return writing;};
+  const data = {asked:[], replies:[], children:[]};
+  const publisher = observationPublisher(${JSON.stringify(recordFile)});
+  const save = () => publisher.publish(data);
   api.event.on('permission.asked', event => {data.asked.push(event.properties); void save();});
   api.event.on('permission.replied', event => {data.replies.push(event.properties); void save();});
   api.event.on('session.created', event => {if(event.properties.info.parentID) {data.children.push(event.properties.info); void save();}});
-  await plugin.tui(api, options); void save(); api.lifecycle.onDispose(() => writing);
+  await plugin.tui(api, options); void save(); api.lifecycle.onDispose(async () => {save(); await publisher.close();});
 } };
 `)
 const userPrompt = "Inspect the fixture project using its fixture skill, and run marker.py when delegated."
@@ -48,7 +48,7 @@ const firstPrompt = "DELEGATION FIRST: Load fixture-skill for the fixture projec
 const latestPrompt = "DELEGATION LATEST: Run python3 marker.py to inspect the fixture output."
 const calls = [], reviews = [], errors = []
 let rootStep = 0, skillSent = false, bashSent = false, loaded = false, held, db
-const records = async () => JSON.parse(await readFile(recordFile, "utf8"))
+const records = () => readObservation(recordFile)
 const stream = (res, message, toolCall = false) => {
   res.writeHead(200, { "Content-Type": "text/event-stream" })
   for (const [delta, finish_reason] of [[message, null], [{}, toolCall ? "tool_calls" : "stop"]])

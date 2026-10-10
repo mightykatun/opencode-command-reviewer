@@ -1,7 +1,7 @@
 // Actual bundle and native host controls. Only resolved SQL events are seeded.
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { mkdtemp, mkdir, writeFile, readFile, copyFile } from "node:fs/promises"
+import { mkdtemp, mkdir, writeFile, copyFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -10,9 +10,11 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { DatabaseSync } from "node:sqlite"
 import { tsImport } from "tsx/esm/api"
 import { smokeRuntime } from "./smoke-runtime.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { readObservation } from "./smoke-observations.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
 
-const scenario = process.argv[2] ?? "browse"
-assert.ok(["browse", "scroll", "empty-error", "resume", "shared", "delete", "visibility", "disabled-invalid"].includes(scenario))
+const { scenario } = runtimeArguments("smoke-history.mjs")
 const root = path.resolve(import.meta.dirname, ".."), host = process.env.OPENCODE_BIN ?? "opencode"
 assert.equal(execFileSync(host, ["--version"], { encoding: "utf8" }).trim(), "1.18.35")
 const temp = await mkdtemp(path.join(tmpdir(), "reviewer-history-"))
@@ -25,10 +27,23 @@ const bundle = path.join(temp, "bundle.mjs"), wrapper = path.join(temp, "wrapper
 await copyFile(path.join(root, "dist/tui.js"), bundle)
 // Public metadata observation, not an injected history UI or controller state.
 await writeFile(wrapper, `import plugin from ${JSON.stringify(pathToFileURL(bundle).href)};
-import { writeFile } from 'node:fs/promises';
+import { observationPublisher } from ${JSON.stringify(new URL("./smoke-observations.mjs", import.meta.url).href)};
 export default { id: 'history-fixture', tui: async (api, options) => {
-  await plugin.tui(api, options);
-  let permissions = 0, replies = 0;
+  const publisher = observationPublisher(${JSON.stringify(info)} + '.' + process.env.SMOKE_TARGET);
+  let permissions = 0, replies = 0, historyCommands = 0;
+  const save = () => { const route = api.route.current;
+    publisher.publish({session:route.name === 'session' ? route.params.sessionID : null, permissions, replies, historyCommands});
+  };
+  // Observe execution of the public production command even when the sidebar is
+  // intentionally hidden. The original callback and its synchronous result stay intact.
+  const keymap = new Proxy(api.keymap, {get(target, key) {
+    if (key !== 'registerLayer') return Reflect.get(target, key);
+    return layer => target.registerLayer({...layer, ...(layer.commands ? {commands:layer.commands.map(command =>
+      command.name !== 'opencode-reviewer.history' ? command : {...command, run:(...args) => {
+        const result = command.run(...args); historyCommands++; save(); return result;
+      }})} : {})});
+  }});
+  await plugin.tui(new Proxy(api, {get(target,key) { return key === 'keymap' ? keymap : Reflect.get(target,key); }}), options);
   api.event.on('permission.asked', () => permissions++);
   api.event.on('permission.replied', () => replies++);
   const off = api.keymap.registerLayer({ commands: [
@@ -40,10 +55,8 @@ export default { id: 'history-fixture', tui: async (api, options) => {
     { name: 'fixture.delete', namespace: 'palette', title: 'Fixture: Delete root', run: async () => {
       await api.client.session.delete({ directory: api.state.path.directory, sessionID: api.route.current.params.sessionID }); } }
   ] });
-  const timer = setInterval(() => { const route = api.route.current;
-    if (route.name === 'session') void writeFile(${JSON.stringify(info)}, JSON.stringify({session:route.params.sessionID, permissions, replies}));
-  }, 100);
-  api.lifecycle.onDispose(() => { clearInterval(timer); off(); });
+  const timer = setInterval(save, 100);
+  api.lifecycle.onDispose(async () => { clearInterval(timer); off(); save(); await publisher.close(); });
 } };
 `)
 const { HistorySQL } = await tsImport("../src/history-schema.ts", import.meta.url)
@@ -70,9 +83,17 @@ const until = async (check, timeout = 20000) => {
   throw Error("History wait timed out")
 }
 const save = async name => writeFile(path.join(artifacts, name + ".txt"), capture())
+const facts = () => readObservation(info + "." + target)
 const palette = async title => {
-  send("C-p"); await until(s => s.includes("Commands")); send("C-u"); send("-l", title)
-  await sleep(300); await until(s => s.includes(title)); send("Enter"); await until(s => !s.includes("Commands"))
+  await until(async () => !!(await readObservation(info + "." + target, { optional: true }))?.session)
+  const before = await facts()
+  const hidden = !/Context|Analysis history/.test(capture())
+  const postcondition = title === "Reviewer: Report history" ? async s => (await facts()).historyCommands > before.historyCommands
+      && (hidden ? !s.includes("Analysis history") : s.includes("Analysis history"))
+    : title === "Reviewer: Disable for conversation" ? s => s.includes("Reviewer disabled for this conversation.")
+    : title === "New session" || title === "Fixture: Delete root" ? s => s.includes("Ask anything")
+    : async () => (await facts()).session !== before.session
+  await activatePalette({ send, capture: () => runtime.tmux("capture-pane", "-p", "-e", "-t", target) }, title, postcondition)
 }
 const open = async () => { await palette("Reviewer: Report history"); await until(s => s.includes("Analysis history")) }
 const apply = event => sql.apply("history-fixture", ++sequence, encodeEvent(event))
@@ -94,11 +115,12 @@ try {
   const env = { OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_CONFIG: "", OPENCODE_CONFIG_DIR: path.join(temp, "config"), OPENCODE_TUI_CONFIG: tui,
     OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_DEFAULT_PLUGINS: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_EXTERNAL_SKILLS: "1", OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1" }
   const start = (...args) => runtime.start("-d", "-s", target, "-x", "160", "-y", "40", "-c", project, "env",
-    ...Object.entries(env).map(([k, v]) => k + "=" + v), host, project, ...args)
+    ...Object.entries(env).map(([k, v]) => k + "=" + v), "SMOKE_TARGET=" + target, host, project, ...args)
   await start("--prompt", "Say ready.")
   await until(s => s.includes("History fixture ready.") && s.includes("tab agents"), 90000)
   await until(() => calls >= 2); await sleep(500)
-  session = JSON.parse(await readFile(info, "utf8")).session
+  await until(async () => !!(await readObservation(info + "." + target, { optional: true }))?.session)
+  session = (await facts()).session
   privateDatabase(file); sql = new HistorySQL(new DatabaseSync(file))
   const before = calls
   if (scenario === "empty-error") {
@@ -201,8 +223,8 @@ try {
     }
   }
   assert.equal(calls, before, "history interaction makes no model requests")
-  const facts = JSON.parse(await readFile(info, "utf8"))
-  assert.equal(facts.permissions, 0); assert.equal(facts.replies, 0, "history never submits an approval")
+  const observed = await facts()
+  assert.equal(observed.permissions, 0); assert.equal(observed.replies, 0, "history never submits an approval")
   await save("final")
   await writeFile(path.join(artifacts, "results.json"), JSON.stringify({ scenario, calls, temp, session }, null, 2))
   console.log(`PASS history ${scenario}: production SQL and rendered host, ${calls} model calls unchanged`)

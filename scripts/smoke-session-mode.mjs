@@ -8,6 +8,10 @@ import { tmpdir } from "node:os"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime } from "./smoke-runtime.mjs"
 import { notificationRecorder, assertNotificationAudio } from "./smoke-notification-recorder.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
+
+runtimeArguments("smoke-session-mode.mjs")
 
 const root = path.resolve(import.meta.dirname, "..")
 const host = process.env.OPENCODE_BIN ?? "opencode"
@@ -82,13 +86,9 @@ const until = async (condition, timeout = 20000) => {
 const send = (...keys) => tmux("send-keys", "-t", "mode", ...keys)
 const save = async (name) => writeFile(path.join(root, `.runtime/session-mode-${name}.txt`), capture())
 const palette = async (enabled) => {
-  send("C-p")
-  await until((s) => s.includes("Commands"))
   const title = `Reviewer: ${enabled ? "Enable" : "Disable"} for conversation`
-  send("-l", title)
-  await until((s) => (s.match(new RegExp(title, "g")) ?? []).length >= 2)
-  send("Enter")
-  await until((s) => s.includes(`Reviewer ${enabled ? "enabled" : "disabled"} for this conversation.`) && !s.includes("Commands"))
+  await activatePalette({ send, capture: () => tmux("capture-pane", "-p", "-e", "-t", "mode") }, title,
+    s => s.includes(`Reviewer ${enabled ? "enabled" : "disabled"} for this conversation.`))
 }
 const unchanged = async () => assert.rejects(access(path.join(project, "executed")))
 try {

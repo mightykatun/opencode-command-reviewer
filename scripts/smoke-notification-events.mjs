@@ -8,17 +8,15 @@ import { pathToFileURL } from "node:url"
 import { setTimeout as sleep } from "node:timers/promises"
 import { smokeRuntime } from "./smoke-runtime.mjs"
 import { notificationRecorder, assertNotificationAudio } from "./smoke-notification-recorder.mjs"
+import { runtimeArguments } from "./runtime-inventory.mjs"
+import { activatePalette } from "./smoke-ui.mjs"
 
-const scenario = process.argv[2] ?? "question"
+const { scenario } = runtimeArguments("smoke-notification-events.mjs")
 const reminders = process.argv.includes("--reminders"), queue = process.argv.includes("--queue")
 const bannerOnly = process.argv.includes("--banner-only"), soundOnly = process.argv.includes("--sound-only")
 const dismiss = process.argv.includes("--dismiss")
-assert.ok(!(bannerOnly && soundOnly))
-if (reminders || queue || bannerOnly || soundOnly || dismiss) assert.equal(scenario, "question")
-if (queue) assert.ok(reminders, "queue verification requires --reminders")
 const interval = 3
 const label = [scenario, ...process.argv.slice(3).map(flag => flag.replace(/^--/, ""))].join("-")
-assert.ok(["question", "error", "ended", "cancel", "click"].includes(scenario))
 const root = path.resolve(import.meta.dirname, "..")
 const temp = await mkdtemp(path.join(tmpdir(), "reviewer-notification-events-"))
 const project = path.join(temp, "project")
@@ -173,11 +171,9 @@ try {
     await sleep(500)
   } else if (scenario === "click") {
     await until(async () => (await records()).some(r => r.event === "notification"))
-    runtime.tmux("send-keys", "-t", "smoke", "C-p")
-    await until(s => s.includes("Commands"))
-    runtime.tmux("send-keys", "-t", "smoke", "-l", "Fixture: Check notification click")
-    await until(s => (s.match(/Fixture: Check notification click/g) ?? []).length >= 2)
-    runtime.tmux("send-keys", "-t", "smoke", "Enter")
+    await activatePalette({ send: (...keys) => runtime.tmux("send-keys", "-t", "smoke", ...keys),
+      capture: () => runtime.tmux("capture-pane", "-p", "-e", "-t", "smoke") }, "Fixture: Check notification click",
+    async () => (await records()).some(r => r.event === "click-root-selected" || r.event === "click-failure"))
     await until(async () => (await records()).some(r => r.event === "click-root-selected" || r.event === "click-failure"))
     assert.ok((await records()).some(r => r.event === "click-dialog-preserved"))
     assert.equal((await records()).filter(r => r.event === "click-failure").length, 0)

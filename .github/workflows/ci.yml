@@ -34,3 +34,27 @@ jobs:
       - run: node --test test/npm-cli-smoke.test.mjs
       - run: sudo apt-get update && sudo apt-get install --yes tmux
       - run: npm run test:runtime-cleanup
+
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.15.0
+      - run: npm ci --ignore-scripts
+      - run: sudo apt-get update && sudo apt-get install --yes tmux git python3
+      - run: npm install --global opencode-ai@1.18.35
+      - run: npm run build
+      - run: node scripts/test-runtime.mjs --profile ci
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: pinned-host-runtime
+          path: .runtime/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7

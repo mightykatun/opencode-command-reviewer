@@ -18,8 +18,10 @@
   `npm test` covers only `test/*.test.ts`. Add pure `.mjs` tests to
   `scripts/helper-tests.json`; host and built-package checks stay separate.
 - Runtime/UI and host-integration changes need a relevant real-TUI fixture after
-  `npm run build`. `npm run test:runtime` and `npm run test:runtime-permissions`
-  do **not** build and do not include all standalone fixtures below.
+  `npm run build`. `node scripts/test-runtime.mjs --profile ci` runs the same
+  representative pinned-host cases as PR CI. `npm run test:runtime` and
+  `npm run test:runtime-permissions` retain their original family subsets.
+  All runtime commands require a prior build; none implicitly rebuilds.
   Documentation-only changes need reference/format review, not runtime tests.
 - Host fixtures require Linux, Git, Python 3, tmux and `opencode` on PATH;
   `OPENCODE_BIN` selects another binary. Limit concurrent hosts to two to avoid
@@ -28,6 +30,31 @@
   Create/restart tmux sessions through `scripts/smoke-runtime.mjs`'s supervisor;
   never kill shared/default tmux servers or clean up by broad process-name matching.
   `npm run test:runtime-cleanup` checks interruption/isolation without a build or model.
+- `node scripts/test-runtime.mjs --list` lists all runtime entrypoints, scenarios,
+  flags, valid-combination rules, prerequisites, and classifications.
+  `node scripts/test-runtime.mjs --plan --profile ci` plans without OpenCode,
+  tmux, a bundle, or fixture creation. Select one case with
+  `node scripts/test-runtime.mjs smoke-streaming.mjs complete --stats`.
+  The runner executes serially and reserves a repository-local runner lock;
+  some fixtures themselves use two hosts. Do not run another host alongside it.
+  An interrupted runner removes its lock; after SIGKILL, verify the recorded owner
+  and its supervised hosts have exited before removing a stale runner lock.
+- `scripts/runtime-inventory.mjs` is the authoritative CLI inventory. New fixture
+  entrypoints/scenarios/flags must be registered and consume `runtimeArguments`.
+  Normal helper checks enforce discovery and flag completeness. Profiles select
+  exact combinations, not the Cartesian product of flags. Synthetic host probes,
+  interactive desktop checks, historical replays, and helpers are separately
+  classified. `audit-usage-history.mjs` requires the actual local `v0.7.0` tag.
+- Use `smoke-observations.mjs` for fixture snapshot/control JSON: one serialized,
+  coalesced atomic publisher per destination, explicit final flush/close, and
+  `readObservation` for useful cross-process errors. Give concurrent hosts distinct
+  observation destinations. Use `smoke-ui.mjs` for palette activation: selected
+  result rendition must be painted and the caller must supply a postcondition.
+  Preserve negative-observation windows that prove no execution or notification.
+- Pure-helper additions must also be present with their transitive inputs in the
+  release workflow's active-policy sparse checkout. Runtime results and exact
+  invocation logs are under `.runtime/runtime-run-*/`; fixture captures stay in
+  their documented `.runtime/` locations. PR CI uploads those synthetic artifacts.
 
 ### Focused host checks (build first)
 
