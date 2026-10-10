@@ -52,10 +52,10 @@ Implementation starts from `0aaf9d6`. Checkboxes require passing evidence, not a
   - [x] Commit the verified W6b interface/panel checkpoint: `dd3c41a`.
   - [x] Align compatibility/docs, remove confirmed unused interfaces/output/legacy routes, and evaluate compatible dependency updates.
   - [x] Pass aggregate/package/helper and representative real-host checks for changed surfaces; record outputs.
-  - [ ] Commit the verified W6c cleanup/dependency checkpoint.
-- [ ] Final integration
-  - [ ] Reconcile every A01-A28 item with implemented changes or an evidence-backed disposition.
-  - [ ] Run final required checks, inspect diff/status, verify plan marks and commit history, and report exact remaining limitations.
+  - [x] Commit the verified W6c cleanup/dependency checkpoint: `377d0d8`.
+- [x] Final integration
+  - [x] Reconcile every A01-A28 item with implemented changes or an evidence-backed disposition.
+  - [x] Run final required checks, inspect diff/status, verify plan marks and commit history, and report exact remaining limitations.
 
 ### Execution notes and resolved plan mismatches
 
@@ -156,6 +156,43 @@ node scripts/test-runtime.mjs smoke-evidence.mjs prompt-symlink PASS .runtime/ru
 
 These final ten host cases ran serially through the runner against OpenCode 1.18.35. Phase-specific runs above additionally verify geometry restoration/history cover, notification saturation/latest click/sound-only, migration/maintenance/ancestry, and retained-history selection. Physical sound/GNOME focus, live external signing/registry publication, remote GitHub CI execution, and untested newer host versions remain outside the verification claims.
 
+### Per-finding completion record
+
+All required implementation work is complete. The original audit sections below describe the baseline defects, not the current implementation. This table is the authoritative disposition; verification details are in the phase ledger above.
+
+| ID | Disposition | Checkpoint / implementation evidence |
+| --- | --- | --- |
+| A01 | Fixed | `e1ab1f1`: final deferred-callback guard, actual dispatch facts, seven microtask interleavings in both modes |
+| A02 | Fixed | `e1ab1f1`: painted geometry proof; resize, initial-short recovery, and short history-cover host regressions |
+| A03 | Fixed | `e03426e`: host lexical launch cwd; actual/decoy native fixture |
+| A04 | Fixed | `e1ab1f1`: bounded sequential stale-read recovery, no false attention or uncertainty tombstone |
+| A05 | Fixed | `e03426e`: physical flag ordering, trap/time invalidation, explicit unresolved evidence |
+| A06 | Fixed | `e03426e`: literal references, whole-link omission, canonical main identity, Bun physical traversal |
+| A07 | Fixed | `92e0bd5`: derived serialized bounds and real legacy/FIFO composition tests |
+| A08 | Fixed | `92e0bd5`: separate publication/scan revisions; 210 lookups including final confirming pass |
+| A09 | Fixed | `92e0bd5`: actual ancestry settlement/coalescing; source and native reopen-storm recovery |
+| A10 | Fixed | `6a48c88`: immediate worker rejection ownership and late cleanup tests |
+| A11 | Fixed | `6a48c88`: bounded prioritized/cancelable audio and actual-dispatch spacing |
+| A12 | Fixed | `6a48c88`: event-born admission recovery through metadata/lookup-capacity reconciliation |
+| A13 | Fixed | `6a48c88`: explicit permission baseline health and atomic notification reconciliation |
+| A14 | Fixed | `6a48c88`: action-time lease and superseded activation/save/reveal cancellation |
+| A15 | Fixed with explicit bounded overflow policy | `6a48c88`: delivery/process queues, reserved capacity, 70-approval host stress; README describes routine overflow |
+| A16 | Fixed; live external signing not exercised | `b2c6e22`: explicit archive/source/policy provenance, actual npm offline verification/adoption |
+| A17 | Fixed configuration; remote scheduler not exercised | `b2c6e22`: `queue: max`, unchanged serialization and SemVer protection |
+| A18 | Implemented; exact CI profile verified locally | `3b5001c`: complete CLI inventory, runner, pinned host job, sparse-policy completeness |
+| A19 | Fixed | `3b5001c`: shared serialized/coalesced atomic observations, error channel, flush/close, separate host destinations |
+| A20 | Fixed | `3b5001c`: selected painted result plus explicit postcondition, no readiness sleeps |
+| A21 | Refactored and host-verified | `dd3c41a`: named live-panel owner; entrypoint reduced from 616 to 353 lines |
+| A22 | Refactored incrementally and verified | `3b5001c`: 28 scenario descriptors, named family dispatch, shared stage transitions; independent assertion bodies retained |
+| A23 | Refactored and replay-verified | `dd3c41a`: named dependencies and separate immutable-tag replay adapter |
+| A24 | Fixed | `e03426e`: atomic `O_NOFOLLOW`; valid links and pre-open swap rejected |
+| A25 | Fixed | `b2c6e22`: all six production-consumed mappings verified in bundle/archive, including swapped/decoy mutations |
+| A26 | Corrected | `377d0d8`: verified-target wording and current layout-contract comment |
+| A27 | Cleaned up | `377d0d8`: unused type/re-export/output and obsolete helper route removed; production directory composition retained |
+| A28 | Compatibility evaluation completed; compatible update applied | `377d0d8`: TypeScript 5.9.3; host-bound Solid/OpenTUI/preset pins retained based on exact peer constraints; zero audit advisories |
+
+Final integration inspected `git diff 0aaf9d6..HEAD --check`, status, and all eight implementation commits with a clean code worktree before this documentation closure. No release/tag/push was performed. Restart OpenCode after installing the rebuilt plugin; existing sessions retain their previously loaded bundle.
+
 ## 1. Scope, provenance, and status
 
 - **Audited commit:** `0aaf9d6184f7de5f705e46bbf1881987657d0fbe`, package version `1.0.0`.
@@ -163,7 +200,7 @@ These final ten host cases ran serially through the runner against OpenCode 1.18
 - **Verified host target:** Linux OpenCode **1.18.35**. Development verification used Node.js **24.21.0** and npm **12.2.0**.
 - **Sources:** the entire 726-line [NOTIFICATION-AUDIT.md](NOTIFICATION-AUDIT.md), the whole-codebase review in this session, and the underlying specialist review results and reproductions from that session.
 - **Scope:** approval/controller/UI lifecycle, evidence and filesystem boundaries, model transport, history/statistics, notification ordering/delivery/audio/navigation, build/publication, dependencies, documentation, source tests, and fixture infrastructure.
-- **Implementation status:** execution in progress. Tracking above records verified completion; unchecked findings remain open. Original audit evidence is retained as the baseline.
+- **Implementation status:** complete. All A01-A28 items have an implementation or evidence-backed maintenance disposition in the completion record above. Original audit evidence below is retained as the baseline.
 - **Reference stability:** source line numbers refer to the audited commit. Follow the named symbols when edits move the code.
 - **Deduplication:** the desktop-click race was independently found by both reviews and appears once as A14. Audio saturation and banner/process saturation remain separate because their admission points, consequences, and required fixes differ. Related shell and skill failures are grouped with explicit subcases.
 
@@ -969,14 +1006,14 @@ Local `.runtime` and `/tmp` artifacts are supplementary and may not exist in a f
 
 ## Appendix D. Final handoff checklist
 
-- [ ] Each addressed ID has an explicit implementation and regression or a documented product-contract decision.
-- [ ] A01/A02/A03 P1 defects are fixed before relying on unattended approval.
-- [ ] A04 recovery distinguishes stale pre-dispatch reads from actual cancellation and dispatched uncertainty.
-- [ ] Shared cancellation/ownership rules hold across controller, ancestry, audio, banners, and click activation.
-- [ ] Original source findings are traceable through Appendix A; no duplicate click bug or missing shell/skill subcase.
-- [ ] Source tests assert independently expected behavior; native fixtures exercise the newly identified boundaries.
-- [ ] Existing strong parser, transport, filesystem, history, and publication invariants remain covered.
-- [ ] Runtime/UI fixes were rebuilt and checked against the pinned host; fixture results are reported precisely.
-- [ ] Publication changes were verified without a real upload; immutable archive and privilege boundaries remain intact.
-- [ ] Documentation reflects implemented behavior, with no unsupported compatibility claim or unconditional delivery promise.
-- [ ] Cleanup does not remove real fixture/embedding seams or overwrite unrelated user work.
+- [x] Each addressed ID has an explicit implementation and regression or a documented product-contract decision.
+- [x] A01/A02/A03 P1 defects are fixed before relying on unattended approval.
+- [x] A04 recovery distinguishes stale pre-dispatch reads from actual cancellation and dispatched uncertainty.
+- [x] Shared cancellation/ownership rules hold across controller, ancestry, audio, banners, and click activation.
+- [x] Original source findings are traceable through Appendix A; no duplicate click bug or missing shell/skill subcase.
+- [x] Source tests assert independently expected behavior; native fixtures exercise the newly identified boundaries.
+- [x] Existing strong parser, transport, filesystem, history, and publication invariants remain covered.
+- [x] Runtime/UI fixes were rebuilt and checked against the pinned host; fixture results are reported precisely.
+- [x] Publication changes were verified without a real upload; immutable archive and privilege boundaries remain intact.
+- [x] Documentation reflects implemented behavior, with no unsupported compatibility claim or unconditional delivery promise.
+- [x] Cleanup does not remove real fixture/embedding seams or overwrite unrelated user work.
