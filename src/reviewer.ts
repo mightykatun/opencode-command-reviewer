@@ -183,19 +183,24 @@ async function streamedAssessment(response: Response, signal: AbortSignal, accou
   return assessment
 }
 
+export interface ReviewerDependencies {
+  fetcher?: typeof fetch
+  environment?: NodeJS.ProcessEnv
+  prompts?: PromptSet
+  pricing?: PricingLookup
+  onUsage?: (usage: Usage) => void
+  onProgress?: (progress: ReviewProgress) => void
+  onDiagnostics?: DiagnosticObserver
+  onRetry?: () => unknown
+  observation?: ReviewObservation
+}
+
 export async function review(
   evidence: ReviewEvidence,
   config: Config,
   signal: AbortSignal,
-  fetcher: typeof fetch = fetch,
-  environment: NodeJS.ProcessEnv = process.env,
-  prompts: PromptSet = BUILTIN_PROMPTS,
-  pricing?: PricingLookup,
-  onUsage?: (usage: Usage) => void,
-  onProgress?: (progress: ReviewProgress) => void,
-  onDiagnostics?: DiagnosticObserver,
-  onRetry?: () => unknown,
-  observation: ReviewObservation = { review: randomUUID() },
+  { fetcher = fetch, environment = process.env, prompts = BUILTIN_PROMPTS,
+    pricing, onUsage, onProgress, onDiagnostics, onRetry, observation = { review: randomUUID() } }: ReviewerDependencies = {},
 ): Promise<ReviewResult> {
   // Production already shares a deadline with evidence collection. Direct
   // callers get the same bound, including all internal backoff and POSTs.
@@ -203,7 +208,7 @@ export async function review(
     let worker: Promise<ReviewResult> | undefined
     try {
       return await withDeadline(signal, config.timeoutMs, (bounded) =>
-        worker = review(evidence, config, bounded, fetcher, environment, prompts, pricing, onUsage, onProgress, onDiagnostics, onRetry, observation))
+        worker = review(evidence, config, bounded, { fetcher, environment, prompts, pricing, onUsage, onProgress, onDiagnostics, onRetry, observation }))
     } finally { await worker?.catch(() => {}) }
   }
   const key = config.apiKey ?? (config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined)

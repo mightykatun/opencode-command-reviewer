@@ -375,7 +375,7 @@ for (const session of ["root", "child"]) test(`permission baseline integration: 
   const f = fixture(undefined, { staleReminderSeconds: 10 })
   const controller = new Controller(async () => null, () => {
     if (!controller.reconciling) f.host.snapshot(controller.pendingViews)
-  }, { reviewBash: false, reviewEdits: false })
+  }, { reviewOptions: { reviewBash: false, reviewEdits: false } })
   let resolve!: (requests: PermissionRequest[]) => void, reject!: (error: Error) => void
   const refresh = new PendingRefresh(controller, () => new Promise((yes, no) => { resolve = yes; reject = no }), new AbortController().signal,
     healthy => f.host.snapshot(controller.pendingViews, healthy))
@@ -401,7 +401,7 @@ test("reconciliation notification batching cannot expose a question between perm
   const f = fixture()
   const controller = new Controller(async () => null, () => {
     if (!controller.reconciling) f.host.snapshot(controller.pendingViews)
-  }, { reviewBash: false, reviewEdits: false })
+  }, { reviewOptions: { reviewBash: false, reviewEdits: false } })
   t.after(async () => { await controller.dispose(); await f.host.dispose() })
   controller.reconcile([request("old")], controller.revision)
   f.host.snapshot(controller.pendingViews, true); f.host.visit("root"); await settle()

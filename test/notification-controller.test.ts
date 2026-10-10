@@ -14,11 +14,11 @@ test("confirmation fact survives native resolution before HTTP acknowledgement a
   const facts: ApprovalFact[] = []
   let callback: (() => void) | undefined
   const controller = new Controller(async () => ({ safe: true, desc: "fixture" }), () => {},
-    { reviewBash: true, reviewEdits: true, autoApprove: true, autoApproveDelaySeconds: 0 }, {
+    { reviewOptions: { reviewBash: true, reviewEdits: true, autoApprove: true, autoApproveDelaySeconds: 0 }, approval: {
       visibleID: () => "p", list: async () => [request],
       once: async () => { controller.replied("p") },
-    }, { now: () => 0, after: (_ms, cb) => { callback = cb; return () => { callback = undefined } } }, undefined,
-    fact => { facts.push(fact) })
+    }, clock: { now: () => 0, after: (_ms, cb) => { callback = cb; return () => { callback = undefined } } },
+    onApproval: fact => { facts.push(fact) } })
   controller.asked(request); await settle(); controller.presented("p"); callback!(); await settle()
   assert.deepEqual(facts.map(f => [f.type, f.automatic]), [["dispatched", true], ["confirmed", true], ["settled", true]])
   assert.equal(controller.views.length, 0); await controller.dispose()
@@ -42,11 +42,11 @@ for (const scope of ["root", "children"] as const) {
       policy.snapshot(views)
       policy.pending(notificationBlockers(new Set(["root"]), views.map(v => ({ ...v.request, kind: "permission" as const })),
         id => ({ id, ...(id === "root" ? {} : { parentID: "root" }) })))
-    }, { reviewBash: true, reviewEdits: true, autoApprove: true, autoApproveDelaySeconds: 3 }, {
+    }, { reviewOptions: { reviewBash: true, reviewEdits: true, autoApprove: true, autoApproveDelaySeconds: 3 }, approval: {
       visibleID: () => presented,
       list: async () => controller.views.map(v => v.request),
       once: async permission => { approved.push(permission.id); controller.replied(permission.id) },
-    }, clock)
+    }, clock })
     t.after(async () => { await controller.dispose(); await policy.dispose() })
     for (const id of ["a", "b"]) {
       const permission = { ...request, id, sessionID: scope === "root" ? "root" : `child-${id}` }
@@ -81,10 +81,10 @@ test("disabling review during an approval write preserves uncertain outcome unti
   })
   const blockers = new Map([["root", { kind: "permission" as const, id: "p" }]])
   const controller: Controller = new Controller(async () => ({ safe: true, desc: "fixture" }),
-    views => policy.snapshot(views, blockers), { reviewBash: true, reviewEdits: true, autoApprove: true }, {
+    views => policy.snapshot(views, blockers), { reviewOptions: { reviewBash: true, reviewEdits: true, autoApprove: true }, approval: {
       visibleID: () => "p", list: async () => [request],
       once: () => { writes++; return new Promise(resolve => { finish = resolve }) },
-    }, undefined, { root: async () => "root", load: async () => {}, enabled: () => enabled })
+    }, modes: { root: async () => "root", load: async () => {}, enabled: () => enabled } })
   t.after(async () => { finish?.(); await controller.dispose(); await policy.dispose() })
   controller.asked(request)
   policy.permission(request, { root: "root", sessionID: "root", title: "Fixture" }, true)
@@ -104,10 +104,10 @@ test("disabling review during an approval write preserves uncertain outcome unti
 test("failed approval confirms pending state only through successful reconciliation; observer failures are isolated", async () => {
   let reads = 0, writes = 0
   const controller = new Controller(async () => ({ safe: true, desc: "fixture" }), () => {},
-    { reviewBash: true, reviewEdits: true, autoApprove: true, autoApproveDelaySeconds: 15 }, {
+    { reviewOptions: { reviewBash: true, reviewEdits: true, autoApprove: true, autoApproveDelaySeconds: 15 }, approval: {
       visibleID: () => "p", list: async () => { reads++; return [request] },
       once: async () => { writes++; throw new Error("uncertain") },
-    }, undefined, undefined, () => Promise.reject(new Error("observer")))
+    }, onApproval: () => Promise.reject(new Error("observer")) })
   controller.asked(request); await settle(); controller.presented("p"); await controller.approveNow("p")
   assert.equal(reads, 2); assert.equal(writes, 1)
   assert.equal(controller.views[0]?.autoApproval?.status, "failed")
@@ -119,10 +119,10 @@ test("manual footer confirmation is tagged manual, and a rejected acknowledgemen
   for (const failure of [false, true]) {
     const facts: ApprovalFact[] = []
     const controller = new Controller(async () => ({ safe: true, desc: "fixture" }), () => {},
-      { reviewBash: true, reviewEdits: true, autoApprove: true }, {
+      { reviewOptions: { reviewBash: true, reviewEdits: true, autoApprove: true }, approval: {
         visibleID: () => "p", list: async () => [request],
         once: async () => { if (failure) throw new Error("no acknowledgement") },
-      }, undefined, undefined, fact => { facts.push(fact) })
+      }, onApproval: fact => { facts.push(fact) } })
     controller.asked(request); await settle(); controller.presented("p"); await controller.approveNow("p")
     assert.deepEqual(facts.map(f => f.type), failure ? ["dispatched", "settled"] : ["dispatched", "confirmed", "settled"])
     assert.ok(facts.every(f => f.automatic === false)); await controller.dispose()
@@ -140,14 +140,14 @@ for (const fastMode of [false, true]) for (const event of ["unrelated root", "la
     const pending = [request]
     const controller = new Controller(async () => ({ safe: true, desc: "fixture" }),
       views => policy.snapshot(views, new Map([["root", { kind: "permission", id: "p" }]])),
-      { reviewBash: true, reviewEdits: true, autoApprove: true, fastMode }, {
+      { reviewOptions: { reviewBash: true, reviewEdits: true, autoApprove: true, fastMode }, approval: {
         visibleID: () => "p",
         list: () => ++reads === 1 ? new Promise(resolve => { release = resolve }) : Promise.resolve([...pending]),
         once: async () => { writes++ },
-      }, undefined, undefined, fact => {
+      }, onApproval: fact => {
         facts.push(fact)
         if (fact.type === "confirmed") policy.approved(fact.request, target)
-      })
+      } })
     t.after(async () => { await controller.dispose(); await policy.dispose() })
     controller.asked(request); policy.permission(request, target, true)
     await settle(); controller.presented("p")
@@ -172,11 +172,11 @@ for (const fastMode of [false, true]) test(`${fastMode ? "fast" : "normal"} sust
   })
   const controller = new Controller(async () => ({ safe: true, desc: "fixture" }),
     views => policy.snapshot(views, new Map([["root", { kind: "permission", id: "p" }]])),
-    { reviewBash: true, reviewEdits: true, autoApprove: true, fastMode }, {
+    { reviewOptions: { reviewBash: true, reviewEdits: true, autoApprove: true, fastMode }, approval: {
       visibleID: () => "p",
       list: async () => { reads++; if (churn) controller.replied("unrelated"); return [request] },
       once: async () => { writes++ },
-    }, { now: () => 0, after: () => () => {} })
+    }, clock: { now: () => 0, after: () => () => {} } })
   t.after(async () => { await controller.dispose(); await policy.dispose() })
   controller.asked(request)
   policy.permission(request, { root: "root", sessionID: "root", title: "Fixture" }, true)

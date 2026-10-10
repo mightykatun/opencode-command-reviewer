@@ -88,8 +88,8 @@ test("transient HTTP failures recover with byte-identical POSTs and independent 
   })
   const progress: ReviewProgress[] = []
   let retries = 0
-  const result = await review(evidence, config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, undefined, p => { progress.push(p) }, undefined,
-    () => { retries++ })
+  const result = await review(evidence, config, signal(), { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS,
+    onProgress: p => { progress.push(p) }, onRetry: () => { retries++ } })
   assert.deepEqual(result, { safe: true, desc: "Recovered." })
   assert.equal(requests.length, 4)
   assert.equal(retries, 3, "count both transport retries and format corrections at dispatch")
@@ -125,23 +125,23 @@ test("real connection resets before headers recover without changing evidence or
 test("format correction cannot replenish the transport retry budget", async () => {
   let calls = 0
   const config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture", formatRetries: 10 })
-  await assert.rejects(review(evidence, config, signal(), async () => {
+  await assert.rejects(review(evidence, config, signal(), { fetcher: async () => {
     if (++calls === 2) return new Response(envelope('{"safe":"yes","desc":"Invalid."}'))
     return new Response(null, { status: 503 })
-  }), /HTTP 503/)
+  } }), /HTTP 503/)
   assert.equal(calls, 4, "one format correction plus two total transport retries")
 })
 
 for (const failure of ["throw", "reject"] as const) test(`retry metric observer ${failure} cannot affect the review`, async () => {
   let calls = 0, retries = 0
   const config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture" })
-  const result = await review(evidence, config, signal(), async () => ++calls === 1
+  const result = await review(evidence, config, signal(), { fetcher: async () => ++calls === 1
     ? new Response(null, { status: 503 }) : new Response(envelope('{"safe":true,"desc":"Recovered."}')),
-  {}, BUILTIN_PROMPTS, undefined, undefined, undefined, undefined, () => {
+  environment: {}, prompts: BUILTIN_PROMPTS, onRetry: () => {
     retries++
     if (failure === "throw") throw new Error("metric unavailable")
     return Promise.reject(new Error("metric unavailable"))
-  })
+  } })
   assert.equal(result.safe, true)
   assert.equal(calls, 2); assert.equal(retries, 1)
 })
@@ -150,14 +150,14 @@ test("a disconnected non-streaming body restarts the exact POST rather than join
   let calls = 0, reads = 0
   const bodies: string[] = []
   const config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture" })
-  const result = await review(evidence, config, signal(), async (_, init) => {
+  const result = await review(evidence, config, signal(), { fetcher: async (_, init) => {
     bodies.push(init!.body as string)
     if (++calls > 1) return new Response(envelope('{"safe":false,"desc":"Fresh response."}'))
     return new Response(new ReadableStream({ pull(writer) {
       if (reads++ === 0) writer.enqueue(Buffer.from('{"choices":['))
       else writer.error(Object.assign(new Error("PRIVATE"), { code: "UND_ERR_SOCKET" }))
     } }))
-  })
+  } })
   assert.deepEqual(result, { safe: false, desc: "Fresh response." })
   assert.equal(calls, 2)
   assert.equal(bodies[0], bodies[1])
@@ -168,13 +168,13 @@ test("retry attempts have distinct diagnostic ordinals and cannot outlive the or
   const dispatches: number[] = []
   let calls = 0, secondAborted = false
   const start = performance.now()
-  await assert.rejects(review(evidence, config, abort.signal, async (_, init) => {
+  await assert.rejects(review(evidence, config, abort.signal, { fetcher: async (_, init) => {
     if (++calls === 1) return new Response(null, { status: 503 })
     init!.signal!.addEventListener("abort", () => { secondAborted = true }, { once: true })
     return new Promise<Response>(() => {})
-  }, {}, BUILTIN_PROMPTS, undefined, undefined, undefined, e => {
+  }, environment: {}, prompts: BUILTIN_PROMPTS, onDiagnostics: e => {
     if (e.phase === "dispatch") dispatches.push(e.attempt!)
-  }), /timed out/)
+  } }), /timed out/)
   assert.equal(calls, 2)
   assert.equal(secondAborted, true)
   assert.deepEqual(dispatches, [0, 1])
@@ -186,14 +186,14 @@ test("backoff cancellation and insufficient review time never dispatch another P
   let calls = 0, retries = 0
   const fetcher: typeof fetch = async () => { calls++; return new Response(null, { status: 503 }) }
   const config = parseConfig({ baseURL: "https://fixture.invalid/v1", model: "fixture" })
-  const pending = review(evidence, config, abort.signal, fetcher, {}, BUILTIN_PROMPTS, undefined, undefined, undefined, undefined, () => { retries++ })
+  const pending = review(evidence, config, abort.signal, { fetcher, environment: {}, prompts: BUILTIN_PROMPTS, onRetry: () => { retries++ } })
   await sleep(10)
   abort.abort(reason)
   await assert.rejects(pending, error => error === reason)
   assert.equal(calls, 1)
   assert.equal(retries, 0, "canceled backoff is not a dispatched retry")
   calls = 0
-  await assert.rejects(review(evidence, { ...config, timeoutMs: 200 }, signal(), fetcher), /HTTP 503/)
+  await assert.rejects(review(evidence, { ...config, timeoutMs: 200 }, signal(), { fetcher }), /HTTP 503/)
   assert.equal(calls, 1)
   const { config: real, requests } = await endpoint(t, (_, res) => {
     res.writeHead(429, { "Retry-After": "5" }); res.end("PRIVATE")
@@ -221,16 +221,16 @@ test("failed POSTs finalize received-only usage before backoff without inventing
     return streamText(event(chunk('{"safe":true,"desc":"Recovered."}', "stop"))
       + event({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 2, cost: 0.02 } }) + done)
   }
-  const result = await review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined, u => { observed.push(u) })
+  const result = await review(evidence, config, signal(), { fetcher, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: u => { observed.push(u) } })
   assert.deepEqual(result.usage, { cost: 0.03 }, "only cost covers both POSTs")
   assert.deepEqual(requests[0], requests[1])
   assert.equal(observed.length, 2)
 
   let calls = 0
-  const recovered = await review(evidence, { ...config, stream: false }, signal(), async () => {
+  const recovered = await review(evidence, { ...config, stream: false }, signal(), { fetcher: async () => {
     if (++calls === 1) return new Response(null, { status: 503 })
     return Response.json({ choices: [{ message: { content: '{"safe":true,"desc":"Recovered."}' } }], usage: { cost: 0.02 } })
-  }, {}, BUILTIN_PROMPTS, undefined, u => { observed.push(u) })
+  }, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: u => { observed.push(u) } })
   assert.equal(recovered.usage, undefined, "an unreported failed attempt is not free")
   assert.equal(observed.length, 3, "the successful POST still contributes to lifetime")
 })
@@ -239,13 +239,13 @@ test("streamed assessment content prevents transport retries even before a compl
   for (const text of ['{"safe":', '{"safe":true,', '{"desc":"partial']) {
     let calls = 0, read = 0
     const previews: ReviewProgress[] = []
-    await assert.rejects(review(evidence, streamConfig(), signal(), async () => {
+    await assert.rejects(review(evidence, streamConfig(), signal(), { fetcher: async () => {
       calls++
       return new Response(new ReadableStream({ pull(writer) {
         if (read++ === 0) writer.enqueue(Buffer.from(event(chunk(text))))
         else writer.error(Object.assign(new Error("PRIVATE"), { code: "ECONNRESET" }))
       } }), { headers: { "Content-Type": "text/event-stream" } })
-    }, {}, BUILTIN_PROMPTS, undefined, undefined, p => { previews.push(p) }), { message: "Reviewer response read failed" })
+    }, environment: {}, prompts: BUILTIN_PROMPTS, onProgress: p => { previews.push(p) } }), { message: "Reviewer response read failed" })
     assert.equal(calls, 1)
     assert.ok(previews.every(p => p.attempt === 0))
   }
@@ -287,7 +287,7 @@ test("numeric settings default only on omission and enforce integer boundaries b
       for (const value of [null, min - 1, max + 1, min + 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "fixture-secret", false]) {
         await assert.rejects(async () => {
           const cfg = parseConfig({ ...options, [name]: value })
-          await review(evidence, cfg, signal(), fetcher)
+          await review(evidence, cfg, signal(), { fetcher })
         }, { message: `${name} must be an integer between ${min} and ${max}` })
         assert.equal(fetchCalls, 0)
         assert.equal(requests.length, 0)
@@ -411,8 +411,8 @@ test("choice-level errors reject even Safe content without correction and retain
         return new Response(JSON.stringify({ usage: { cost: 0.01, prompt_tokens: 10, completion_tokens: 2 },
           choices: [{ index: 0, finish_reason: "stop", error, message: { role: "assistant", content } }] }))
       }
-      await assert.rejects(review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined,
-        (usage) => observed.push(usage)), { message: "Reviewer API did not return a text assessment" })
+      await assert.rejects(review(evidence, config, signal(), { fetcher, environment: {}, prompts: BUILTIN_PROMPTS,
+        onUsage: (usage) => observed.push(usage) }), { message: "Reviewer API did not return a text assessment" })
       assert.equal(calls, 1)
       assert.deepEqual(observed, [{ input: 10, output: 2, cost: 0.01 }])
     }
@@ -439,7 +439,7 @@ test("sends textual source, genuine user prompt, fixed schema and optional beare
   t.after(() => rm(config.instructions!, { recursive: true, force: true }))
   await writeFile(path.join(config.instructions, "PERMISSION-REVIEW-PROMPT.md"), "Custom risk guidance")
   const prompts = await loadPrompts(config.instructions, signal())
-  assert.deepEqual(await review(evidence, config, signal(), fetch, { TEST_REVIEW_KEY: "fixture-secret" }, prompts), { safe: true, desc: "Counts fruits." })
+  assert.deepEqual(await review(evidence, config, signal(), { fetcher: fetch, environment: { TEST_REVIEW_KEY: "fixture-secret" }, prompts }), { safe: true, desc: "Counts fruits." })
   const body = requests[0]!.body
   assert.equal(requests[0]!.authorization, "Bearer fixture-secret")
   assert.deepEqual(JSON.parse(body.messages[1].content), evidence)
@@ -456,7 +456,7 @@ test("sends textual source, genuine user prompt, fixed schema and optional beare
 test("inline API key authenticates requests and corrections without entering model evidence", async (t) => {
   const { config, requests } = await endpoint(t, (index, res) => res.end(envelope(index ? '{"safe":true,"desc":"Counts fruits."}' : "bad format")))
   const cfg = parseConfig({ ...config, apiKey: "  inline-fixture-key  " })
-  assert.deepEqual(await review(evidence, cfg, signal(), fetch, {}), { safe: true, desc: "Counts fruits." })
+  assert.deepEqual(await review(evidence, cfg, signal(), { fetcher: fetch, environment: {} }), { safe: true, desc: "Counts fruits." })
   assert.equal(requests.length, 2)
   for (const request of requests) {
     assert.equal(request.authorization, "Bearer inline-fixture-key")
@@ -470,7 +470,7 @@ test("environment API keys match inline normalization on requests and correction
   const padded = " \t\n fixture-environment-key \r\n\u00a0"
   for (const options of [{ apiKey: padded }, { apiKeyEnv: "TEST_REVIEW_KEY" }]) {
     const cfg = parseConfig({ ...config, ...options })
-    assert.deepEqual(await review(evidence, cfg, signal(), fetch, { TEST_REVIEW_KEY: padded }), { safe: true, desc: "Counts fruits." })
+    assert.deepEqual(await review(evidence, cfg, signal(), { fetcher: fetch, environment: { TEST_REVIEW_KEY: padded } }), { safe: true, desc: "Counts fruits." })
   }
   assert.deepEqual(requests.map((request) => request.target), Array(4).fill("/v1/chat/completions"))
   for (const request of requests) {
@@ -484,7 +484,7 @@ test("inline API key takes precedence over set, blank or missing environment key
   const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Counts fruits."}')))
   const cfg = parseConfig({ ...config, apiKey: "inline-fixture-key", apiKeyEnv: "TEST_REVIEW_KEY" })
   for (const environment of [{ TEST_REVIEW_KEY: "environment-fixture-key" }, { TEST_REVIEW_KEY: " \t\r\n" }, {}]) {
-    await review(evidence, cfg, signal(), fetch, environment)
+    await review(evidence, cfg, signal(), { fetcher: fetch, environment })
   }
   assert.equal(requests.length, 3)
   for (const request of requests) assert.equal(request.authorization, "Bearer inline-fixture-key")
@@ -492,7 +492,7 @@ test("inline API key takes precedence over set, blank or missing environment key
 
 test("omitting both API-key options sends no authorization header", async (t) => {
   const { config, requests } = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Counts fruits."}')))
-  await review(evidence, config, signal(), fetch, { TEST_REVIEW_KEY: "unused-fixture-key" })
+  await review(evidence, config, signal(), { fetcher: fetch, environment: { TEST_REVIEW_KEY: "unused-fixture-key" } })
   assert.equal(requests.length, 1)
   assert.equal(requests[0]!.authorization, undefined)
 })
@@ -569,7 +569,7 @@ test("missing and blank environment API keys fail before transport with value-fr
   let fetchCalls = 0
   const fetcher: typeof fetch = (...args) => { fetchCalls++; return fetch(...args) }
   for (const value of [undefined, "", " ", " \t\r\n", "\u00a0\uFEFF"]) {
-    await assert.rejects(review(evidence, cfg, signal(), fetcher, { TEST_REVIEW_KEY: value }), {
+    await assert.rejects(review(evidence, cfg, signal(), { fetcher, environment: { TEST_REVIEW_KEY: value } }), {
       message: "API key environment variable TEST_REVIEW_KEY is unset or empty",
     })
     assert.equal(fetchCalls, 0)
@@ -582,12 +582,12 @@ test("environment API keys are excluded from HTTP and network error messages", a
   const environment = { TEST_REVIEW_KEY: `  ${secret}  ` }
   const { config, requests } = await endpoint(t, (_, res) => { res.statusCode = 401; res.end(`Rejected ${secret}`) })
   const cfg = parseConfig({ ...config, apiKeyEnv: "TEST_REVIEW_KEY" })
-  await assert.rejects(review(evidence, cfg, signal(), fetch, environment), { message: "Reviewer HTTP 401" })
+  await assert.rejects(review(evidence, cfg, signal(), { fetcher: fetch, environment }), { message: "Reviewer HTTP 401" })
   assert.deepEqual(requests.map((request) => request.target), ["/v1/chat/completions"])
   assert.equal(requests[0]!.authorization, `Bearer ${secret}`)
   let fetchCalls = 0
   const fetcher: typeof fetch = async () => { fetchCalls++; throw new Error(`Transport rejected ${secret}`) }
-  await assert.rejects(review(evidence, cfg, signal(), fetcher, environment), { message: "Reviewer network request failed" })
+  await assert.rejects(review(evidence, cfg, signal(), { fetcher, environment }), { message: "Reviewer network request failed" })
   assert.equal(fetchCalls, 1)
 })
 
@@ -630,7 +630,7 @@ test("edit evidence uses its own assessment and fixed correction, retaining part
   const custom = await loadPrompts(customDir, signal())
   for (const prompts of [BUILTIN_PROMPTS, custom]) {
     const index = requests.length
-    const result = await review(edit, config, signal(), fetch, {}, prompts)
+    const result = await review(edit, config, signal(), { fetcher: fetch, environment: {}, prompts })
     assert.equal(result.safe, false)
     assert.equal(requests[index]!.body.messages[0].content, `${prompts.edit.instructions}\n\n${CONTRACT}`)
     assert.deepEqual(JSON.parse(requests[index]!.body.messages[1].content), edit)
@@ -661,7 +661,7 @@ test("extra-careful guidance defaults on and can be omitted from native auto rev
     const prompts = { ...BUILTIN_PROMPTS, extraCareful: "CUSTOM EXTRA CARE: check the supplied evidence carefully." }
     const start = requests.length
     const settings = parseConfig({ ...config, autoApprove, extraCareful, stream, autoApproveDelaySeconds: 17 })
-    await review(input, settings, signal(), fetch, {}, prompts)
+    await review(input, settings, signal(), { fetcher: fetch, environment: {}, prompts })
     const kind = input.kind === "edit" ? "edit" : "shell"
     for (const request of requests.slice(start)) {
       assert.equal(request.body.messages[0].content, [prompts[kind].instructions, ...(autoApprove && extraCareful !== false ? [prompts.extraCareful] : []), CONTRACT].join("\n\n"))
@@ -701,7 +701,7 @@ test("configured output limit reaches both transports, network retries and forma
 test("truncated assessment stream clears its rating, drains usage, and retries the exact configured request", async () => {
   const requests: string[] = [], progress: ReviewProgress[] = [], observed: Usage[] = []
   let retries = 0
-  const result = await review(evidence, { ...streamConfig(), maxOutputTokens: 4096 }, signal(), async (_, init) => {
+  const result = await review(evidence, { ...streamConfig(), maxOutputTokens: 4096 }, signal(), { fetcher: async (_, init) => {
     requests.push(init!.body as string)
     if (requests.length === 1) return streamText(event(chunk('{"safe":true,"desc":"Old preview"}'))
       + event(chunk("", "length")) + event({ choices: [], usage: { cost: 0.01 } }) + done)
@@ -709,7 +709,7 @@ test("truncated assessment stream clears its rating, drains usage, and retries t
     assert.deepEqual(progress.at(-1), { attempt: 1, phase: "retrying" })
     return streamText(event(chunk('{"safe":false,"desc":"Fresh report"}', "stop"))
       + event({ choices: [], usage: { cost: 0.02 } }) + done)
-  }, {}, BUILTIN_PROMPTS, undefined, usage => { observed.push(usage) }, value => { progress.push(value) }, undefined, () => { retries++ })
+  }, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: usage => { observed.push(usage) }, onProgress: value => { progress.push(value) }, onRetry: () => { retries++ } })
   assert.deepEqual(result, { safe: false, desc: "Fresh report", usage: { cost: 0.03 } })
   assert.equal(retries, 1)
   assert.equal(requests.length, 2)
@@ -725,11 +725,11 @@ test("assessment-stream retries share the transport budget and surface token-lim
   for (const httpFirst of [false, true]) {
     let calls = 0, retries = 0
     const observed: Usage[] = []
-    await assert.rejects(review(evidence, { ...streamConfig(), formatRetries: 0 }, signal(), async () => {
+    await assert.rejects(review(evidence, { ...streamConfig(), formatRetries: 0 }, signal(), { fetcher: async () => {
       if (++calls === 1 && httpFirst) return new Response(null, { status: 503 })
       return streamText(event(chunk('{"safe":true,')) + event(chunk("", "length"))
         + event({ choices: [], usage: { cost: 0.01 } }) + done)
-    }, {}, BUILTIN_PROMPTS, undefined, usage => { observed.push(usage) }, undefined, undefined, () => { retries++ }),
+    }, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: usage => { observed.push(usage) }, onRetry: () => { retries++ } }),
     /output token limit reached; increase maxOutputTokens/)
     assert.equal(calls, 3); assert.equal(retries, 2)
     assert.equal(observed.length, httpFirst ? 2 : 3)
@@ -740,13 +740,13 @@ test("canceling a rejected-stream retry clears the preview and dispatches no new
   const abort = new AbortController(), reason = new Error("conversation disabled")
   const progress: ReviewProgress[] = []
   let calls = 0, retries = 0
-  await assert.rejects(review(evidence, streamConfig(), abort.signal, async () => {
+  await assert.rejects(review(evidence, streamConfig(), abort.signal, { fetcher: async () => {
     calls++
     return streamText(event(chunk('{"safe":true,"desc":"Discard"}')) + event(chunk("", "length")) + done)
-  }, {}, BUILTIN_PROMPTS, undefined, undefined, value => {
+  }, environment: {}, prompts: BUILTIN_PROMPTS, onProgress: value => {
     progress.push(value)
     if (value.phase === "retrying") abort.abort(reason)
-  }, undefined, () => { retries++ }), error => error === reason)
+  }, onRetry: () => { retries++ } }), error => error === reason)
   assert.equal(calls, 1); assert.equal(retries, 0)
   assert.deepEqual(progress.at(-1), { attempt: 1, phase: "retrying" })
 })
@@ -785,8 +785,8 @@ test("review usage sums correction requests outside assessment JSON and evidence
     model: "fixture", usage: { prompt_tokens: 100 + index, completion_tokens: 10 },
     choices: [{ message: { content: index ? '{"safe":true,"desc":"Visible effects."}' : "bad format" } }],
   })))
-  const result = await review(evidence, config, signal(), fetch, {}, BUILTIN_PROMPTS,
-    () => ({ input: 1, output: 2, cache: { read: 0, write: 0 } }))
+  const result = await review(evidence, config, signal(), { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS,
+    pricing: () => ({ input: 1, output: 2, cache: { read: 0, write: 0 } }) })
   assert.deepEqual(result, { safe: true, desc: "Visible effects.", usage: { input: 201, output: 20, cost: 0.000241 } })
   assert.equal(requests.length, 2)
   for (const request of requests) assert.deepEqual(JSON.parse(request.body.messages[1].content), evidence)
@@ -808,25 +808,25 @@ test("lifetime observer receives each completed attempt even when the final asse
     usage: { prompt_tokens: 100, completion_tokens: 10 }, choices: [{ message: { content: "bad format" } }],
   })))
   const observed: Usage[] = []
-  await assert.rejects(review(evidence, config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, (usage) => observed.push(usage)), /format invalid/)
+  await assert.rejects(review(evidence, config, signal(), { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: (usage) => observed.push(usage) }), /format invalid/)
   assert.deepEqual(observed, [{ input: 100, output: 10 }, { input: 100, output: 10 }])
 })
 
 test("completed invalid envelopes retain reported usage; accounting failures cannot break reviews", async (t) => {
   const observed: Usage[] = []
   const invalid = await endpoint(t, (_, res) => res.end(JSON.stringify({ usage: { prompt_tokens: 100, completion_tokens: 10 } })))
-  await assert.rejects(review(evidence, invalid.config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, (usage) => observed.push(usage)), /one completion/)
+  await assert.rejects(review(evidence, invalid.config, signal(), { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: (usage) => observed.push(usage) }), /one completion/)
   assert.equal(observed.length, 1)
   const valid = await endpoint(t, (_, res) => res.end(JSON.stringify({
     usage: { prompt_tokens: 100, completion_tokens: 10 }, choices: [{ message: { content: '{"safe":true,"desc":"Bounded effects."}' } }],
   })))
-  const result = await review(evidence, valid.config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, (usage) => {
+  const result = await review(evidence, valid.config, signal(), { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: (usage) => {
     usage.input = 999
     throw new Error("storage failure")
-  })
+  } })
   assert.deepEqual(result, { safe: true, desc: "Bounded effects.", usage: { input: 100, output: 10 } })
-  const unpriced = await review(evidence, valid.config, signal(), fetch, {}, BUILTIN_PROMPTS,
-    () => { throw new Error("catalog unavailable") }, (usage) => observed.push(usage))
+  const unpriced = await review(evidence, valid.config, signal(), { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS,
+    pricing: () => { throw new Error("catalog unavailable") }, onUsage: (usage) => observed.push(usage) })
   assert.deepEqual(unpriced, result)
   assert.deepEqual(observed.at(-1), { input: 100, output: 10 })
 })
@@ -835,11 +835,11 @@ test("missing usage, HTTP errors, and cancellation before usage produce no lifet
   let observations = 0
   const observe = () => { observations++ }
   const missing = await endpoint(t, (_, res) => res.end(envelope('{"safe":true,"desc":"Bounded effects."}')))
-  await review(evidence, missing.config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, observe)
+  await review(evidence, missing.config, signal(), { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: observe })
   const error = await endpoint(t, (_, res) => { res.writeHead(503); res.end("Unavailable") })
-  await assert.rejects(review(evidence, error.config, signal(), fetch, {}, BUILTIN_PROMPTS, undefined, observe), /HTTP 503/)
+  await assert.rejects(review(evidence, error.config, signal(), { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: observe }), /HTTP 503/)
   const held = await endpoint(t, () => {})
-  await assert.rejects(withDeadline(signal(), 100, (s) => review(evidence, held.config, s, fetch, {}, BUILTIN_PROMPTS, undefined, observe)), /timed out/)
+  await assert.rejects(withDeadline(signal(), 100, (s) => review(evidence, held.config, s, { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: observe })), /timed out/)
   assert.equal(observations, 0)
 })
 
@@ -857,8 +857,8 @@ test("OpenRouter cost-only corrections accumulate report cost and finalize each 
       choices: [{ message: { content: index ? '{"safe":true,"desc":"Bounded effects."}' : "bad format" } }],
     }))
   }
-  const result = await review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS,
-    () => { assert.fail("reported cost must bypass catalog pricing") }, (usage) => observed.push(usage))
+  const result = await review(evidence, config, signal(), { fetcher, environment: {}, prompts: BUILTIN_PROMPTS,
+    pricing: () => { assert.fail("reported cost must bypass catalog pricing") }, onUsage: (usage) => observed.push(usage) })
   assert.deepEqual(result, { safe: true, desc: "Bounded effects.", usage: { cost: 0.03 } })
   assert.deepEqual(observed, [{ cost: 0.01 }, { input: 10, output: 2, cost: 0.02 }])
   assert.equal(calls, 2)
@@ -876,8 +876,8 @@ test("OpenRouter incomplete report components do not suppress known lifetime con
         choices: [{ message: { content: index ? '{"safe":true,"desc":"Bounded effects."}' : "bad format" } }],
       }))
     }
-    const result = await review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS,
-      () => { assert.fail("missing reported cost must not trigger estimation") }, (usage) => observed.push(usage))
+    const result = await review(evidence, config, signal(), { fetcher, environment: {}, prompts: BUILTIN_PROMPTS,
+      pricing: () => { assert.fail("missing reported cost must not trigger estimation") }, onUsage: (usage) => observed.push(usage) })
     assert.deepEqual(result, { safe: true, desc: "Bounded effects.", ...(tokens ? { usage: { input: 20, output: 4 } } : {}) })
     assert.equal(calls, 2)
     assert.equal(observed.length, tokens ? 2 : 1)
@@ -898,7 +898,7 @@ test("decoded cost-only usage survives invalid envelopes, refusals and exhausted
       calls++
       return new Response(JSON.stringify({ usage: { cost: 0.01, prompt_tokens: "bad", completion_tokens: 3 }, choices }))
     }
-    await assert.rejects(review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined, (usage) => observed.push(usage)), message)
+    await assert.rejects(review(evidence, config, signal(), { fetcher, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: (usage) => observed.push(usage) }), message)
     assert.equal(calls, attempts)
     assert.deepEqual(observed, Array.from({ length: attempts }, () => ({ cost: 0.01 })))
   }
@@ -914,9 +914,9 @@ test("cancellation after decoded usage finalizes accounting but cannot return or
     return new Response(JSON.stringify({ usage: { prompt_tokens: 10, completion_tokens: 2 },
       choices: [{ message: { content: '{"safe":true,"desc":"Bounded effects."}' } }] }))
   }
-  await assert.rejects(review(evidence, config, controller.signal, fetcher, {}, BUILTIN_PROMPTS,
-    () => { controller.abort(); return { input: 1, output: 2, cache: { read: 0, write: 0 } } },
-    (usage) => observed.push(usage)), { name: "AbortError" })
+  await assert.rejects(review(evidence, config, controller.signal, { fetcher, environment: {}, prompts: BUILTIN_PROMPTS,
+    pricing: () => { controller.abort(); return { input: 1, output: 2, cache: { read: 0, write: 0 } } },
+    onUsage: (usage) => observed.push(usage) }), { name: "AbortError" })
   assert.equal(calls, 1)
   assert.deepEqual(observed, [{ input: 10, output: 2, cost: 0.000014 }])
 })
@@ -929,7 +929,7 @@ test("correction transport failure retains prior reported cost without an extra 
     if (calls++) throw new Error("disconnected")
     return new Response(JSON.stringify({ usage: { cost: 0.01 }, choices: [{ message: { content: "bad format" } }] }))
   }
-  await assert.rejects(review(evidence, config, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined, (usage) => observed.push(usage)), /network request failed/)
+  await assert.rejects(review(evidence, config, signal(), { fetcher, environment: {}, prompts: BUILTIN_PROMPTS, onUsage: (usage) => observed.push(usage) }), /network request failed/)
   assert.equal(calls, 2)
   assert.deepEqual(observed, [{ cost: 0.01 }])
 })
@@ -969,13 +969,13 @@ test("SSE review survives every byte split, including UTF-8 and escaped assessme
       assert.equal(request.response_format, undefined)
       return streamingResponse([wire.subarray(0, split), wire.subarray(split)])
     }
-    assert.deepEqual(await review(evidence, streamConfig(), signal(), fetcher, {}, BUILTIN_PROMPTS, undefined,
-      (usage) => observed.push(usage)), { safe: false, desc, usage: { cost: 0 } })
+    assert.deepEqual(await review(evidence, streamConfig(), signal(), { fetcher, environment: {}, prompts: BUILTIN_PROMPTS,
+      onUsage: (usage) => observed.push(usage) }), { safe: false, desc, usage: { cost: 0 } })
     assert.equal(calls, 1)
     assert.deepEqual(observed, [{ cost: 0 }])
   }
   const fetcher: typeof fetch = async () => streamingResponse(Array.from(wire, (byte) => Uint8Array.of(byte)))
-  assert.equal((await review(evidence, streamConfig(), signal(), fetcher)).desc, desc)
+  assert.equal((await review(evidence, streamConfig(), signal(), { fetcher })).desc, desc)
 })
 
 test("a rejected stream is drained only under the original deadline", async () => {
@@ -984,7 +984,7 @@ test("a rejected stream is drained only under the original deadline", async () =
     start(value) { writer = value }, cancel() { canceled = true },
   }), { headers: { "Content-Type": "text/event-stream" } })
   writer.enqueue(Buffer.from(event(chunk('{"safe":true,"desc":"old"}')) + event(chunk("", "length"))))
-  await assert.rejects(review(evidence, { ...streamConfig(), timeoutMs: 30 }, signal(), async () => { calls++; return response }), /timed out/)
+  await assert.rejects(review(evidence, { ...streamConfig(), timeoutMs: 30 }, signal(), { fetcher: async () => { calls++; return response } }), /timed out/)
   assert.equal(calls, 1); assert.equal(canceled, true)
   assert.equal(response.body!.locked, false)
 })
@@ -995,10 +995,10 @@ test("draining rejected metadata never turns refusals or resource failures into 
     Buffer.from(event({ choices: [{ index: 0, delta: { refusal: "PRIVATE" }, finish_reason: "stop" }] })),
     Buffer.from([0xff]), Buffer.from(":" + "x".repeat(65536))]) {
     let calls = 0
-    await assert.rejects(review(evidence, streamConfig(), signal(), async () => {
+    await assert.rejects(review(evidence, streamConfig(), signal(), { fetcher: async () => {
       calls++
       return streamingResponse([prefix, suffix])
-    }), error => error instanceof Error && !error.message.includes("PRIVATE"))
+    } }), error => error instanceof Error && !error.message.includes("PRIVATE"))
     assert.equal(calls, 1)
   }
 })
@@ -1009,8 +1009,8 @@ test("previews precede completion while stop, final cumulative usage, DONE and E
   const response = new Response(body, { headers: { "Content-Type": "text/event-stream" } })
   const previews: ReviewProgress[] = [], observed: Usage[] = []
   let completed = false
-  const promise = review(evidence, streamConfig(), signal(), async () => response, {}, BUILTIN_PROMPTS, undefined,
-    (usage) => observed.push(usage), (progress) => previews.push(progress)).then((result) => { completed = true; return result })
+  const promise = review(evidence, streamConfig(), signal(), { fetcher: async () => response, environment: {}, prompts: BUILTIN_PROMPTS,
+    onUsage: (usage) => observed.push(usage), onProgress: (progress) => previews.push(progress) }).then((result) => { completed = true; return result })
   writer.enqueue(Buffer.from(event({ ...chunk(), choices: [{ index: 0, delta: { role: "assistant", reasoning: "PRIVATE REASONING", reasoning_content: "PRIVATE" }, finish_reason: null }] })
     + event(chunk('{"safe":true'))))
   await sleep(0)
@@ -1053,8 +1053,8 @@ test("only final assessment-format errors correct, with reset progress and fresh
       return stream ? streamText(event(chunk(content.slice(0, 25))) + event(chunk(content.slice(25), "stop")) + event({ choices: [], usage: { cost: 0.01 } }) + done)
         : new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { cost: 0.01 } }))
     }
-    const result = await review(evidence, { ...streamConfig(), stream }, signal(), fetcher, {}, BUILTIN_PROMPTS, undefined,
-      (usage) => observed.push(usage), (value) => progress.push(value))
+    const result = await review(evidence, { ...streamConfig(), stream }, signal(), { fetcher, environment: {}, prompts: BUILTIN_PROMPTS,
+      onUsage: (usage) => observed.push(usage), onProgress: (value) => progress.push(value) })
     assert.deepEqual(result, { safe: false, desc: "Corrected.", usage: { cost: 0.02 } })
     assert.equal(calls, 2)
     assert.deepEqual(observed, [{ cost: 0.01 }, { cost: 0.01 }])
@@ -1102,13 +1102,13 @@ test("rejected SSE metadata retries boundedly; refusals, tool calls and API erro
     const observed: Usage[] = []
     let calls = 0
     const responses: Response[] = []
-    await assert.rejects(review(evidence, streamConfig(), signal(), async () => {
+    await assert.rejects(review(evidence, streamConfig(), signal(), { fetcher: async () => {
       calls++
       const response = streamText(event({ choices: [], usage: { cost: 0.01 } }) + text + done)
       responses.push(response)
       return response
-    }, {}, BUILTIN_PROMPTS,
-      undefined, (usage) => observed.push(usage)), (error: unknown) => {
+    }, environment: {}, prompts: BUILTIN_PROMPTS,
+      onUsage: (usage) => observed.push(usage) }), (error: unknown) => {
       assert.ok(error instanceof Error)
       assert.doesNotMatch(error.message, /PRIVATE|format invalid/)
       return true
@@ -1129,7 +1129,7 @@ test("missing completion markers retry while incomplete SSE framing remains term
   ]
   for (const [index, text] of cases.entries()) {
     let calls = 0
-    await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return streamText(text) }), /ended/)
+    await assert.rejects(review(evidence, streamConfig(), signal(), { fetcher: async () => { calls++; return streamText(text) } }), /ended/)
     assert.equal(calls, [0, 1, 4].includes(index) ? 3 : 1, "unfinished records cannot be treated as completed assessment frames")
   }
 })
@@ -1147,8 +1147,8 @@ test("decoded usage survives later UTF-8, API JSON, assessment-limit and framing
     const observed: Usage[] = []
     let calls = 0
     const response = streamingResponse([Buffer.concat([usage, bytes])])
-    await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return response }, {}, BUILTIN_PROMPTS,
-      undefined, (value) => observed.push(value)))
+    await assert.rejects(review(evidence, streamConfig(), signal(), { fetcher: async () => { calls++; return response }, environment: {}, prompts: BUILTIN_PROMPTS,
+      onUsage: (value) => observed.push(value) }))
     assert.equal(calls, 1)
     assert.deepEqual(observed, [{ cost: 0.01 }])
     assert.equal(response.body!.locked, false)
@@ -1158,12 +1158,12 @@ test("decoded usage survives later UTF-8, API JSON, assessment-limit and framing
 test("stream progress observer mutations and exceptions cannot change assessment or accounting", async () => {
   const text = event(chunk('{"safe":false,"desc":"Visible."}', "stop")) + event({ choices: [], usage: { cost: 0.01 } }) + done
   let progressCalls = 0
-  const result = await review(evidence, streamConfig(), signal(), async () => streamText(text), {}, BUILTIN_PROMPTS, undefined,
-    () => { throw new Error("accounting observer") }, (value) => {
+  const result = await review(evidence, streamConfig(), signal(), { fetcher: async () => streamText(text), environment: {}, prompts: BUILTIN_PROMPTS,
+    onUsage: () => { throw new Error("accounting observer") }, onProgress: (value) => {
       progressCalls++
       if (value.preview) { value.preview.safe = true; value.preview.desc = "mutated" }
       throw new Error("progress observer")
-    })
+    } })
   assert.deepEqual(result, { safe: false, desc: "Visible.", usage: { cost: 0.01 } })
   assert.ok(progressCalls >= 2)
 })
@@ -1174,9 +1174,9 @@ test("asynchronous progress and usage rejections cannot escape review", async ()
     const response = stream ? streamText(event(chunk(content, "stop")) + event({ choices: [], usage: { cost: 0.01 } }) + done)
       : new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { cost: 0.01 } }))
     let usageCalls = 0, progressCalls = 0
-    const result = await review(evidence, { ...streamConfig(), stream }, signal(), async () => response, {}, BUILTIN_PROMPTS, undefined,
-      async () => { usageCalls++; await sleep(0); throw new Error("accounting observer") },
-      async () => { progressCalls++; await sleep(0); throw new Error("progress observer") })
+    const result = await review(evidence, { ...streamConfig(), stream }, signal(), { fetcher: async () => response, environment: {}, prompts: BUILTIN_PROMPTS,
+      onUsage: async () => { usageCalls++; await sleep(0); throw new Error("accounting observer") },
+      onProgress: async () => { progressCalls++; await sleep(0); throw new Error("progress observer") } })
     assert.deepEqual(result, { safe: false, desc: "Visible.", usage: { cost: 0.01 } })
     await sleep(10) // Let late observer rejection surface to node:test if not owned.
     assert.equal(usageCalls, 1)
@@ -1202,8 +1202,8 @@ test("aborting pending reads ignores fetcher signal cooperation and hanging canc
       cancel() { cancelCalls++; return new Promise(() => {}) },
     }, { highWaterMark: 0 }) // Pull only when the dispatched request's reader asks for data.
     const response = new Response(body, { headers: { "Content-Type": stream ? "text/event-stream" : "application/json" } })
-    const promise = review(evidence, { ...streamConfig(), stream }, controller.signal, async () => { calls++; return response }, {}, BUILTIN_PROMPTS,
-      undefined, (usage) => observed.push(usage))
+    const promise = review(evidence, { ...streamConfig(), stream }, controller.signal, { fetcher: async () => { calls++; return response }, environment: {}, prompts: BUILTIN_PROMPTS,
+      onUsage: (usage) => observed.push(usage) })
     // Start the rejection observer before inducing abort (or awaiting a pull that aborts at EOF).
     const rejected = assert.rejects(promise, { name: "AbortError" })
     await reading
@@ -1222,10 +1222,10 @@ test("aborting noncooperative fetch cancels its late response and never emits la
   let dispatched!: () => void
   const started = new Promise<void>((resolve) => { dispatched = resolve })
   const progress: ReviewProgress[] = []
-  const promise = review(evidence, streamConfig(), controller.signal, () => {
+  const promise = review(evidence, streamConfig(), controller.signal, { fetcher: () => {
     dispatched()
     return new Promise((resolve) => { deliver = resolve })
-  }, {}, BUILTIN_PROMPTS, undefined, undefined, (value) => progress.push(value))
+  }, environment: {}, prompts: BUILTIN_PROMPTS, onProgress: (value) => progress.push(value) })
   const rejected = assert.rejects(promise, { name: "AbortError" })
   await started
   controller.abort()
@@ -1249,8 +1249,8 @@ test("stream corrections and keepalives share the original deadline on a real HT
     }
   })
   const progress: ReviewProgress[] = []
-  await assert.rejects(withDeadline(signal(), 150, (s) => review(evidence, { ...config, stream: true }, s, fetch, {}, BUILTIN_PROMPTS,
-    undefined, undefined, (value) => progress.push(value))), /timed out/)
+  await assert.rejects(withDeadline(signal(), 150, (s) => review(evidence, { ...config, stream: true }, s, { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS,
+    onProgress: (value) => progress.push(value) })), /timed out/)
   assert.equal(requests.length, 2)
   assert.deepEqual(progress.filter((value) => value.phase !== "streaming"), [{ attempt: 0, phase: "evaluating" }, { attempt: 1, phase: "retrying" }])
   for (const request of requests) assert.equal(request.body.stream, true)
@@ -1264,8 +1264,8 @@ test("stream disconnection preserves decoded usage, sanitizes errors and never r
     else writer.error(new Error("PRIVATE TRANSPORT ERROR"))
   } })
   const response = new Response(body, { headers: { "Content-Type": "text/event-stream" } })
-  await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return response }, {}, BUILTIN_PROMPTS, undefined,
-    (usage) => observed.push(usage)), { message: "Reviewer response read failed" })
+  await assert.rejects(review(evidence, streamConfig(), signal(), { fetcher: async () => { calls++; return response }, environment: {}, prompts: BUILTIN_PROMPTS,
+    onUsage: (usage) => observed.push(usage) }), { message: "Reviewer response read failed" })
   assert.equal(calls, 1)
   assert.deepEqual(observed, [{ cost: 0.01 }])
   assert.equal(body.locked, false)
@@ -1282,8 +1282,8 @@ test("abort at EOF after decoded terminal usage finalizes once and never returns
     else { writer.close(); controller.abort() }
   } }, { highWaterMark: 0 })
   const response = new Response(body, { headers: { "Content-Type": "text/event-stream" } })
-  await assert.rejects(review(evidence, streamConfig(), controller.signal, async () => response, {}, BUILTIN_PROMPTS, undefined,
-    (usage) => observed.push(usage), (value) => progress.push(value)), { name: "AbortError" })
+  await assert.rejects(review(evidence, streamConfig(), controller.signal, { fetcher: async () => response, environment: {}, prompts: BUILTIN_PROMPTS,
+    onUsage: (usage) => observed.push(usage), onProgress: (value) => progress.push(value) }), { name: "AbortError" })
   assert.deepEqual(observed, [{ cost: 0.01 }])
   assert.equal(body.locked, false)
   assert.equal(progress.filter((value) => value.preview?.desc === "x").length, 1, "only a provisional report was emitted")
@@ -1294,7 +1294,7 @@ test("stream MIME mismatch and terminal HTTP errors cancel without waiting for c
     let canceled = false, calls = 0
     const body = new ReadableStream({ cancel() { canceled = true; return new Promise(() => {}) } })
     const response = new Response(body, { status, headers: { "Content-Type": contentType } })
-    await assert.rejects(review(evidence, streamConfig(), signal(), async () => { calls++; return response }), expected)
+    await assert.rejects(review(evidence, streamConfig(), signal(), { fetcher: async () => { calls++; return response } }), expected)
     assert.equal(canceled, true)
     assert.equal(calls, 1)
     assert.equal(body.locked, false)
@@ -1314,8 +1314,8 @@ test("real HTTP streaming retains the response model for generic usage-only pric
       prompt_tokens_details: { cached_tokens: 600, cache_write_tokens: 100 } } }) + done)
   })
   const observed: Usage[] = [], models: string[] = []
-  const result = await review(evidence, { ...config, model: "requested-alias", stream: true }, signal(), fetch, {}, BUILTIN_PROMPTS,
-    (model) => { models.push(model); return { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } } }, (usage) => observed.push(usage))
+  const result = await review(evidence, { ...config, model: "requested-alias", stream: true }, signal(), { fetcher: fetch, environment: {}, prompts: BUILTIN_PROMPTS,
+    pricing: (model) => { models.push(model); return { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } } }, onUsage: (usage) => observed.push(usage) })
   assert.equal(result.desc, desc)
   assert.equal(result.safe, true)
   assert.ok(Math.abs(result.usage!.cost! - 0.002955) < 1e-12)
@@ -1337,15 +1337,15 @@ test("complete SSE reviews discard stale estimates from report and lifetime but 
       + event({ choices: [], usage: latest }) + event({ choices: [], usage: latest }) + done
     let calls = 0
     const config = { ...streamConfig(), baseURL: reported ? "https://openrouter.ai/api/v1" : "https://generic.test/v1" }
-    const result = await review(evidence, config, signal(), async () => { calls++; return streamText(wire) }, {}, BUILTIN_PROMPTS,
-      () => ({ input: 1, output: 2, cache: { read: 0, write: 0 } }), (usage) => {
+    const result = await review(evidence, config, signal(), { fetcher: async () => { calls++; return streamText(wire) }, environment: {}, prompts: BUILTIN_PROMPTS,
+      pricing: () => ({ input: 1, output: 2, cache: { read: 0, write: 0 } }), onUsage: (usage) => {
         observed.push(usage)
-      }, undefined, undefined, undefined, { review: "00000000-0000-4000-8000-000000000001", observe: event => {
+      }, observation: { review: "00000000-0000-4000-8000-000000000001", observe: event => {
         if (event.type !== "finalized") return
         store.apply("writer", 1, encodeEvent({ type: "attemptFinalized", at: 1, attempt: event.attempt, usage: event.usage,
           context: { scope: "/fixture", root: "root", session: "root", permission: "permission", review: event.review,
             category: "bash", configuredModel: config.model, provider: config.baseURL } }))
-      } })
+      } } })
     const expected = { input: 100, output, ...(reported ? { cost: 0.000102 } : {}) }
     assert.deepEqual(result, { safe: true, desc: "Bounded effects.", usage: expected })
     assert.equal(usageText(result.usage!), `token: 100 in ${output} out${reported ? "\ncost: $0.0001" : ""}`)

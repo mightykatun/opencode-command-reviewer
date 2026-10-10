@@ -1,5 +1,6 @@
 // Local, deterministic provider-response replay against the actual v0.7.0 tag
 // and current source. No provider calls, user stores, reset or repair operations.
+// Run: node scripts/audit-usage-history.mjs (requires the local refs/tags/v0.7.0).
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises"
@@ -13,7 +14,8 @@ runtimeArguments("audit-usage-history.mjs")
 
 const root = path.resolve(import.meta.dirname, ".."), ref = "v0.7.0"
 const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" })
-const commit = git("rev-parse", `${ref}^{commit}`).trim()
+const commit = git("rev-parse", "--verify", `refs/tags/${ref}^{commit}`).trim()
+assert.match(commit, /^[a-f0-9]{40}$/)
 const prompts = Object.fromEntries(["shell", "edit", "mcp", "custom", "external-directory", "extraCareful", "contract", "correction"].map(key => [key, "Fixture review {{validationError}}"] ))
 async function load(historical) {
   const contents = `export { review } from './src/reviewer.js'; export { parseConfig } from './src/config.js';
@@ -28,16 +30,28 @@ async function load(historical) {
         return { path: file, namespace: "historical" }
       })
       builder.onLoad({ filter: /.*/, namespace: "historical" }, args => ({
-        contents: git("show", `${ref}:${args.path}`), loader: args.path.endsWith(".json") ? "json" : "ts",
+        contents: git("show", `${commit}:${args.path}`), loader: args.path.endsWith(".json") ? "json" : "ts",
       }))
     } }] : [] })
   return import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString("base64")}`)
+}
+
+// One replay interface, with the historical positional contract confined here.
+function currentReplay(module) {
+  return { review: (evidence, config, signal, dependencies) => module.review(evidence, config, signal, dependencies) }
+}
+function taggedReplay(module) {
+  return { review: (evidence, config, signal, { fetcher, environment, prompts, pricing, onUsage, onProgress, onDiagnostics, onRetry, observation }) => {
+    assert.equal(observation, undefined, "v0.7.0 has no per-POST identity observer")
+    return module.review(evidence, config, signal, fetcher, environment, prompts, pricing, onUsage, onProgress, onDiagnostics, onRetry)
+  } }
 }
 const directory = await mkdtemp(path.join(tmpdir(), "reviewer-usage-audit-"))
 const observations = []
 try {
   for (const historical of [true, false]) {
     const module = await load(historical), name = historical ? ref : "current"
+    const replay = historical ? taggedReplay(module) : currentReplay(module)
     const local = path.join(directory, name); await mkdir(local)
     const legacy = historical ? new module.LifetimeUsage(path.join(local, "usage-v4"), path.join(local, "usage-v1")) : undefined
     const sql = historical ? undefined : new module.HistorySQL(new DatabaseSync(path.join(local, "history.sqlite")))
@@ -59,19 +73,19 @@ try {
     const usage = (input, output, cost) => ({ prompt_tokens: input, completion_tokens: output, cost,
       prompt_tokens_details: { cached_tokens: input / 2, cache_write_tokens: input / 10 } })
     const evidence = { kind: "shell", command: "printf fixture", files: [] }
-    const result = await module.review(evidence, config, new AbortController().signal, async (_url, request) => {
+    const result = await replay.review(evidence, config, new AbortController().signal, { fetcher: async (_url, request) => {
       bodies.push(JSON.parse(request.body)); posts++
       return posts === 1 ? completion('{"safe":"invalid","desc":"format correction fixture"}',
         [usage(1000, 10, 0.01), usage(1200, 30, 0.012), usage(1200, 30, 0.012)])
         : completion('{"safe":true,"desc":"Final validated report"}', [usage(1500, 40, 0.015), usage(1500, 40, 0.015)])
-    }, {}, undefined, undefined, persist, undefined, undefined,
-    () => { if (legacy) writes.push(legacy.recordRetry()) },
-    { review: "r", observe: event => {
+    }, environment: {}, onUsage: persist,
+    onRetry: () => { if (legacy) writes.push(legacy.recordRetry()) },
+    observation: historical ? undefined : { review: "r", observe: event => {
       dispatched.push(event)
       sql.apply("audit", ++sequence, JSON.stringify(event.type === "dispatched"
         ? { type: "attemptDispatched", context, at: sequence, attempt: event.attempt, retry: event.retry }
         : { type: "attemptFinalized", context, at: sequence, attempt: event.attempt, usage: event.usage }))
-    } })
+    } } })
     assert.equal(posts, 2); assert.equal(received.length, 2)
     assert.deepEqual(result.usage, { input: 2700, output: 70, cost: 0.027 })
     assert.deepEqual(received.map(u => [u.input, u.output]), [[1200, 30], [1500, 40]])
@@ -107,16 +121,16 @@ try {
     assert.ok(Math.abs(cached.cost - 0.00059) < 1e-12)
     assert.match(module.lifetimeReport(totals), /Tokens: 2700 in 70 out/)
     const failed = [], interrupted = []
-    await assert.rejects(module.review(evidence, { ...config, stream: false, formatRetries: 0 }, new AbortController().signal,
-      async () => new Response(JSON.stringify({ usage: usage(320, 11, 0.0032), error: { message: "synthetic terminal error" } })),
-      {}, undefined, undefined, value => failed.push(value)))
+    await assert.rejects(replay.review(evidence, { ...config, stream: false, formatRetries: 0 }, new AbortController().signal, {
+      fetcher: async () => new Response(JSON.stringify({ usage: usage(320, 11, 0.0032), error: { message: "synthetic terminal error" } })),
+      environment: {}, onUsage: value => failed.push(value) }))
     assert.deepEqual(failed, [{ input: 320, output: 11, cost: 0.0032 }])
     const abort = new AbortController()
-    await assert.rejects(module.review(evidence, config, abort.signal, async () => new Response([
+    await assert.rejects(replay.review(evidence, config, abort.signal, { fetcher: async () => new Response([
       frame({ choices: [], usage: usage(400, 9, 0.004) }),
       frame({ choices: [{ index: 0, delta: { content: '{"safe":true,' }, finish_reason: null }] }),
-    ].join(""), { headers: { "content-type": "text/event-stream" } }), {}, undefined, undefined,
-    value => interrupted.push(value), progress => { if (progress.preview) abort.abort() }))
+    ].join(""), { headers: { "content-type": "text/event-stream" } }), environment: {},
+    onUsage: value => interrupted.push(value), onProgress: progress => { if (progress.preview) abort.abort() } }))
     assert.deepEqual(interrupted, [{ input: 400, output: 9, cost: 0.004 }])
     observations.push({ version: name, commit: historical ? commit : undefined, posts, received: received.length,
       input: totals.input, output: totals.output, retries: totals.activity.retries, reviews: totals.activity.reviews,

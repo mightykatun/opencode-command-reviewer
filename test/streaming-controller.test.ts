@@ -34,9 +34,9 @@ async function fixture(options: { stream?: boolean; identify?: boolean; modes?: 
   const controller = new Controller((_, signal, identify, progress) => new Promise((finish, fail) => {
     workers.push({ progress, identify, signal, finish, fail })
     if (options.identify !== false) identify()
-  }), () => { publications++ }, { reviewBash: true, reviewEdits: true, autoApprove: true, stream: options.stream ?? true }, {
+  }), () => { publications++ }, { reviewOptions: { reviewBash: true, reviewEdits: true, autoApprove: true, stream: options.stream ?? true }, approval: {
     visibleID: () => "a", list: async () => { reads++; return [request] }, once: async () => { writes++ },
-  }, clock, options.modes)
+  }, clock, modes: options.modes })
   controller.asked(request)
   await settle()
   const view = () => controller.views[0]

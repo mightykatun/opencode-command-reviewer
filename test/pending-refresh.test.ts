@@ -112,7 +112,7 @@ test("an elapsed deadline rejects a result before reconciliation even before tim
 for (const event of ["ask", "reply", "delete", "mode"] as const) test(`${event} revision invalidates an outstanding snapshot before controller reconciliation`, async (t) => {
   let evaluations = 0
   const modes = new SessionModes({ read: async () => true, write: async () => {}, flush: async () => {} }, async (id) => ({ id }))
-  const controller = new Controller(async () => { evaluations++; return safe }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new Controller(async () => { evaluations++; return safe }, () => {}, { modes })
   t.after(() => controller.dispose())
   controller.asked(request("b"))
   await settle()
@@ -136,7 +136,7 @@ for (const event of ["ask", "reply", "delete", "mode"] as const) test(`${event} 
 test("queued mode refresh takes a post-switch revision and recovers only the fresh pending request", async (t) => {
   const evaluated: string[] = []
   const modes = new SessionModes({ read: async () => false, write: async () => {}, flush: async () => {} }, async (id) => ({ id }))
-  const controller = new Controller(async (req) => { evaluated.push(req.id); return safe }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new Controller(async (req) => { evaluated.push(req.id); return safe }, () => {}, { modes })
   t.after(() => controller.dispose())
   controller.asked(request("old"))
   await settle()

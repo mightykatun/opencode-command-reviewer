@@ -39,9 +39,9 @@ for (const stream of [false, true]) test(`${stream ? "streaming" : "non-streamin
       { headers: { "Content-Type": "text/event-stream", "x-private": "PRIVATE_HEADER" } }) : response(JSON.stringify(safe))
   }
   const trace = new DiagnosticTrace((event) => { events.push(event) }, 17)
-  const args = [evidence, config(stream), new AbortController().signal, fetcher] as const
-  const measuredResult = await review(...args, {}, undefined, undefined, undefined, undefined, trace.forward)
-  const plainResult = await review(...args)
+  const args = [evidence, config(stream), new AbortController().signal] as const
+  const measuredResult = await review(...args, { fetcher, environment: {}, onDiagnostics: trace.forward })
+  const plainResult = await review(...args, { fetcher })
   const { metadata: measuredMetadata, ...measuredAssessment } = measuredResult
   const { metadata: plainMetadata, ...plainAssessment } = plainResult
   assert.deepEqual(measuredAssessment, safe)
@@ -59,9 +59,9 @@ for (const stream of [false, true]) test(`${stream ? "streaming" : "non-streamin
 test("first content/rating are observed before terminal validation, once per attempt", async () => {
   let writer!: ReadableStreamDefaultController<Uint8Array>
   const encoder = new TextEncoder(), events: DiagnosticEvent[] = []
-  const run = review(evidence, config(true), new AbortController().signal, async () => new Response(new ReadableStream({
+  const run = review(evidence, config(true), new AbortController().signal, { fetcher: async () => new Response(new ReadableStream({
     start(controller) { writer = controller },
-  }), { headers: { "Content-Type": "text/event-stream" } }), {}, undefined, undefined, undefined, undefined, (event) => { events.push(event) })
+  }), { headers: { "Content-Type": "text/event-stream" } }), environment: {}, onDiagnostics: (event) => { events.push(event) } })
   await settle()
   const send = (text: string) => writer.enqueue(encoder.encode(text))
   send(": keepalive\n\n")
@@ -85,10 +85,10 @@ test("correction attempts retain one numeric review ID and separate dispatch-rel
   const events: DiagnosticEvent[] = []
   let calls = 0
   const trace = new DiagnosticTrace((event) => { events.push(event) }, 3)
-  const result = await review(evidence, config(true), new AbortController().signal, async () => {
+  const result = await review(evidence, config(true), new AbortController().signal, { fetcher: async () => {
     const content = ++calls === 1 ? '{"safe":true,"desc":"PRIVATE_DESCRIPTION","extra":1}' : JSON.stringify(safe)
     return new Response(frame(content.slice(0, 13)) + frame(content.slice(13)) + finish, { headers: { "Content-Type": "text/event-stream" } })
-  }, {}, undefined, undefined, undefined, undefined, trace.forward)
+  }, environment: {}, onDiagnostics: trace.forward })
   assert.deepEqual(result, { ...safe, metadata: result.metadata })
   assert.equal(calls, 2)
   for (const attempt of [0, 1]) {
@@ -105,10 +105,10 @@ for (const kind of ["throw", "reject", "mutate"] as const) test(`observer ${kind
     : kind === "throw" ? () => { throw new Error("PRIVATE_OBSERVER_ERROR") }
     : (event) => { (event as { at: number }).at = -1 }
   let calls = 0
-  const result = await review(evidence, config(true), new AbortController().signal, async () => {
+  const result = await review(evidence, config(true), new AbortController().signal, { fetcher: async () => {
     calls++
     return new Response(frame(JSON.stringify(safe)) + finish, { headers: { "Content-Type": "text/event-stream" } })
-  }, {}, undefined, undefined, undefined, undefined, observer)
+  }, environment: {}, onDiagnostics: observer })
   await settle() // Rejected asynchronous observers must also be consumed.
   assert.deepEqual(result, { ...safe, metadata: result.metadata })
   assert.equal(calls, 1)
@@ -154,22 +154,22 @@ test("abort and failed transport never invent final validation or leak private e
   const events: DiagnosticEvent[] = []
   const abort = new AbortController()
   let calls = 0
-  const run = review(evidence, config(true), abort.signal, async () => {
+  const run = review(evidence, config(true), abort.signal, { fetcher: async () => {
     calls++
     return new Response(new ReadableStream({ start(writer) { writer.enqueue(new TextEncoder().encode(frame('{"safe":true,'))) } }),
       { headers: { "Content-Type": "text/event-stream" } })
-  }, {}, undefined, undefined, undefined, undefined, (event) => { events.push(event) })
+  }, environment: {}, onDiagnostics: (event) => { events.push(event) } })
   await settle()
   abort.abort(new Error("PRIVATE_ABORT_REASON"))
   await assert.rejects(run)
   assert.equal(calls, 1)
   assert.deepEqual(events.map((event) => event.phase), ["dispatch", "headers", "first-content", "first-rating"])
   const before = events.length
-  await assert.rejects(review(evidence, config(true), abort.signal, async () => { throw new Error("unreachable") },
-    {}, undefined, undefined, undefined, undefined, (event) => { events.push(event) }))
+  await assert.rejects(review(evidence, config(true), abort.signal, { fetcher: async () => { throw new Error("unreachable") },
+    environment: {}, onDiagnostics: (event) => { events.push(event) } }))
   assert.equal(events.length, before)
-  await assert.rejects(review(evidence, config(false), new AbortController().signal, async () => { throw new Error("PRIVATE_NETWORK_ERROR") },
-    {}, undefined, undefined, undefined, undefined, (event) => { events.push(event) }), /Reviewer network request failed/)
+  await assert.rejects(review(evidence, config(false), new AbortController().signal, { fetcher: async () => { throw new Error("PRIVATE_NETWORK_ERROR") },
+    environment: {}, onDiagnostics: (event) => { events.push(event) } }), /Reviewer network request failed/)
   assert.equal(events.at(-1)!.phase, "dispatch")
   assertNumeric(events)
 })

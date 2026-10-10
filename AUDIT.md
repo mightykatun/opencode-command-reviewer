@@ -46,9 +46,10 @@ Implementation starts from `0aaf9d6`. Checkboxes require passing evidence, not a
   - [x] Inventory runtime entrypoints/scenarios and add a pinned-host CI selection with host-independent completeness checks.
   - [x] Share atomic serialized observation publication and selected-result/postcondition palette synchronization.
   - [x] Extract smoke scenario descriptors/families while preserving independent assertions and planning mode.
-  - [ ] Commit the verified W6a fixture-infrastructure checkpoint.
-  - [ ] Replace positional reviewer/controller injection with named dependencies and a distinct historical replay adapter.
-  - [ ] Extract the corrected live panel with explicit lifecycle ownership and stable request keying.
+  - [x] Commit the verified W6a fixture-infrastructure checkpoint: `3b5001c`.
+  - [x] Replace positional reviewer/controller injection with named dependencies and a distinct historical replay adapter.
+  - [x] Extract the corrected live panel with explicit lifecycle ownership and stable request keying.
+  - [ ] Commit the verified W6b interface/panel checkpoint.
   - [ ] Align compatibility/docs, remove confirmed unused interfaces/output/legacy routes, and evaluate compatible dependency updates.
   - [ ] Pass aggregate/package/helper and representative real-host checks for changed surfaces; record outputs and commit.
 - [ ] Final integration
@@ -134,6 +135,10 @@ node scripts/test-runtime.mjs --profile w6-extended    PASS 10/10 .runtime/runti
 These are 28 distinct cases, not exhaustive flag combinations. Each runner directory contains `results.json` and numbered invocation logs. CI covers production lifecycle auto-shell, vertical resize, fast completion, held notification baseline, mixed streaming queue, history browse, and streaming completion/statistics. Affected/extended profiles cover maintenance/statistics, history notification/shared/visibility/disabled/storage/phase0/dialog, truncation, external/auto-external, correction/scroll/cancel/edit, directory-disabled held edit, session mode, skills, notification click, and capacity. Expected `auto-shell --fail-after-listen` cleanup passed in `.runtime/runtime-run-OaQEK5/`. The GitHub job is configured; its exact profile ran locally, not remotely.
 
 W6a inventory covers 21 entrypoints and 11 helpers with aliases, scenarios/flags, validity rules, prerequisites, classifications, and host budgets. Runner execution is serial under a repository lock; fixtures requiring two hosts retain that budget. Shared atomic publishers own failure/flush/close and shared-history hosts have distinct destinations. Palette helpers prove selected ANSI rendition plus postconditions. All 28 original smoke scenarios have descriptors and named family dispatch; substantial independent assertion bodies remain in the main driver intentionally. A maintenance startup timeout prompted bounded retry of only connection-refused/startup-timeout errors; other failures remain visible, and the whole affected profile subsequently passed.
+
+**W6b (A21,A23):** `live-review-panel.tsx` now owns renderable/readiness/frame/cleanup state and UI controls; `tui.tsx` retains service and route/history composition, stable sibling root, and request-ID keys. `ReviewGeometryProof` is unchanged. Reviewer and controller dependencies use named objects; historical/current replay adapters are separate and the historical tag is resolved to an immutable commit. `npm run check` passed **981 source tests**, **111 helpers**, typecheck, and build. Package reproducibility/five-file checks and **9 artifact/npm CLI tests** passed. Verified bundle SHA-256: `9cd301b38cf166afd36734b2b735803ac8c17762fd49e20f295dc2a76a158bd4`.
+
+Actual usage replay passed for current code and `v0.7.0` commit `a8a8b1e63e050d2d8e2703f79d85e42a21a8a8ae`: two POSTs, 2,700 input/70 output tokens, one retry/review, stable repeated/restart totals, retained failed/interrupted usage (`.runtime/usage-history-audit.json`, `.runtime/runtime-run-opzYPM/results.json`). The CI profile passed **7/7** (`.runtime/runtime-run-4pF736/`), followed by eight host cases: initially-short (`runtime-run-O0X4nw`), history-short (`runtime-run-m431d1`), history covered (`runtime-run-ocDgSE`), history notification (`runtime-run-6Hk9g8`), truncated/static/stats (`runtime-run-Ikr14Z`), statistics (`runtime-run-emLBgV`), history countdown (`runtime-run-eGNFSm`), and auto-scroll (`runtime-run-IKFzLK`), all under `.runtime/` with `results.json`. These are 15 exact host cases, not a full matrix.
 
 ## 1. Scope, provenance, and status
 

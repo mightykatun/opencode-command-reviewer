@@ -240,7 +240,7 @@ test("real controller preserves completed candidate through disabled mode and fa
     identified(); calls++
     if (calls > 1) throw new Error("replacement failed")
     return result(execution!.review)
-  }, () => {}, undefined, undefined, undefined, modes, f.h.approval, undefined, f.h.lifecycle)
+  }, () => {}, { modes, onApproval: f.h.approval, onLifecycle: f.h.lifecycle })
   t.after(() => controller.dispose())
   controller.asked(request); await settle()
   const original = controller.views[0]!.assessment!.desc

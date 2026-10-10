@@ -47,7 +47,7 @@ class FakeClock implements ApprovalClock {
   jump(ms: number) { for (const callback of this.dequeueAfter(ms)) callback() }
 }
 
-type Options = NonNullable<ConstructorParameters<typeof Controller>[2]>
+type Options = NonNullable<NonNullable<ConstructorParameters<typeof Controller>[2]>["reviewOptions"]>
 type Evaluate = ConstructorParameters<typeof Controller>[0]
 function fixture(t: TestContext, settings: {
   options?: Partial<Options>
@@ -81,13 +81,13 @@ function fixture(t: TestContext, settings: {
   }, (views) => {
     publications.push([...views])
     settings.changed?.(views, controller)
-  }, { reviewBash: true, reviewEdits: true, reviewExternalDirectories: true, autoApprove: true, ...settings.options }, settings.writer === false ? undefined : {
+  }, { reviewOptions: { reviewBash: true, reviewEdits: true, reviewExternalDirectories: true, autoApprove: true, ...settings.options }, approval: settings.writer === false ? undefined : {
     visibleID: visible,
     list: (signal) => { reads.push(signal); return transport.list(signal) },
     once: (req, signal) => { writes.push({ request: req, signal }); return transport.once(req, signal) },
-  }, clock, { root: async () => "root", load: async () => {}, enabled: () => enabled }, fact => {
+  }, clock, modes: { root: async () => "root", load: async () => {}, enabled: () => enabled }, onApproval: fact => {
     facts.push(fact); settings.observer?.(fact, controller)
-  })
+  } })
   t.after(() => controller.dispose())
   const view = (id = "b-review") => controller.views.find((item) => item.request.id === id)
   const add = async (req = request()) => {

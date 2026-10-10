@@ -59,15 +59,15 @@ async function fixture(t: TestContext, options: Record<string, unknown> = {}, ho
     const first = pending[0]
     policy.snapshot(views, first ? new Map([["root", { kind: "permission", id: first.id }]]) : new Map())
     hooks.changed?.(controller.views)
-  }, config, {
+  }, { reviewOptions: config, approval: {
     visibleID: () => shown ? visibleReview(controller.views, shown, id => ({ id }))?.request.id : undefined,
     list: signal => list(signal),
     once: (req, signal) => { const ack = deferred<void>(); writes.push({ request: req, signal, ack }); return ack.promise },
-  }, undefined, { root: async () => "root", load: async () => {}, enabled: () => enabled }, fact => {
+  }, modes: { root: async () => "root", load: async () => {}, enabled: () => enabled }, onApproval: fact => {
     facts.push(fact); history.approval(fact)
     if (fact.type === "confirmed" && fact.automatic) policy.approved(fact.request, target)
     hooks.approval?.(fact)
-  }, undefined, history.lifecycle)
+  }, onLifecycle: history.lifecycle })
   const ask = async (req: PermissionRequest) => {
     pending.push(req); policy.permission(req, target, true); controller.asked(req); await settle()
   }

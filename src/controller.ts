@@ -65,6 +65,16 @@ export type ReviewLifecycleFact =
   | { type: "removed"; request: PermissionRequest; reason: "resolved" | "reconciled" | "deleted" | "disposed" }
 export type ReviewLifecycleObserver = (fact: ReviewLifecycleFact) => unknown
 
+export interface ControllerOptions {
+  reviewOptions?: Options
+  approval?: Approval
+  clock?: ApprovalClock
+  modes?: SessionModeGate
+  onApproval?: ApprovalObserver
+  onRating?: (safe: boolean, timing: ReviewTiming) => unknown
+  onLifecycle?: ReviewLifecycleObserver
+}
+
 /** Reviews remain advisory unless explicitly configured with a once-only writer. */
 export class Controller {
   private entries = new Map<string, Entry>()
@@ -79,11 +89,24 @@ export class Controller {
   private approvalRead?: Promise<PermissionRequest[]>
   private reconciliation = 0
   private reconciliationPublished = false
+  private options: Options
+  private approval?: Approval
+  private time: ApprovalClock
+  private modes?: SessionModeGate
+  private approvalObserver?: ApprovalObserver
+  private ratingObserver?: ControllerOptions["onRating"]
+  private lifecycleObserver?: ReviewLifecycleObserver
   constructor(private evaluate: Evaluate, private changed: (views: View[]) => void,
-    private options: Options = { reviewBash: true, reviewEdits: true },
-    private approval?: Approval, private time: ApprovalClock = clock, private modes?: SessionModeGate,
-    private approvalObserver?: ApprovalObserver, private ratingObserver?: (safe: boolean, timing: ReviewTiming) => unknown,
-    private lifecycleObserver?: ReviewLifecycleObserver) {}
+    { reviewOptions = { reviewBash: true, reviewEdits: true }, approval, clock: time = clock, modes,
+      onApproval, onRating, onLifecycle }: ControllerOptions = {}) {
+    this.options = reviewOptions
+    this.approval = approval
+    this.time = time
+    this.modes = modes
+    this.approvalObserver = onApproval
+    this.ratingObserver = onRating
+    this.lifecycleObserver = onLifecycle
+  }
   get revision() { return this.version }
   /** Notifications consume only the final pending snapshot. UI publications keep
    * their synchronous W1 visibility/cancellation behavior during reconciliation. */

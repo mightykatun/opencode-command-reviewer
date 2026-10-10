@@ -11,7 +11,7 @@ import { SessionModes } from "../src/session-mode.js"
 // Existing directory lifecycle cases opt into the newly independent category.
 class Controller extends CoreController {
   constructor(...args: ConstructorParameters<typeof CoreController>) {
-    super(args[0], args[1], { reviewBash: true, reviewEdits: true, reviewExternalDirectories: true, ...args[2] }, args[3], args[4])
+    super(args[0], args[1], { ...args[2], reviewOptions: { reviewBash: true, reviewEdits: true, reviewExternalDirectories: true, ...args[2]?.reviewOptions } })
   }
 }
 
@@ -63,8 +63,8 @@ test("lifetime ratings observe each accepted final review once, not previews, re
     if (req.id === "error") throw new Error("Analysis unavailable")
     if (req.id === "unrelated") return null
     return { safe: req.id === "safe", desc: "Final review without usage." }
-  }, () => {}, { reviewBash: true, reviewEdits: true, stream: true }, undefined, undefined, undefined, undefined,
-  safe => { ratings.push(safe) })
+  }, () => {}, { reviewOptions: { reviewBash: true, reviewEdits: true, stream: true },
+  onRating: safe => { ratings.push(safe) } })
   const requests = ["safe", "unsafe", "error", "unrelated"].map(id => request(id))
   for (const req of requests) { controller.asked(req); controller.asked(req) }
   await tick()
@@ -81,8 +81,8 @@ test("review timing uses the accepted attempt's first rating and excludes later 
   const timings: ReviewTiming[] = []
   const controller = new CoreController((_req, _signal, identified, onProgress) => {
     identified(); progress = onProgress; return new Promise(resolve => { finish = resolve })
-  }, () => {}, { reviewBash: true, reviewEdits: true, stream: true }, undefined,
-  { now: () => now, after: () => () => {} }, undefined, undefined, (_safe, timing) => { timings.push(timing) })
+  }, () => {}, { reviewOptions: { reviewBash: true, reviewEdits: true, stream: true },
+  clock: { now: () => now, after: () => () => {} }, onRating: (_safe, timing) => { timings.push(timing) } })
   controller.asked(request("a")); await tick()
   progress({ attempt: 0, phase: "evaluating" })
   now = 150; progress({ attempt: 0, phase: "streaming", preview: { desc: "Description first" } })
@@ -100,8 +100,8 @@ test("review timing uses the accepted attempt's first rating and excludes later 
 test("non-streaming timing records the final response time for both measures", async () => {
   let now = 100
   const timings: ReviewTiming[] = []
-  const controller = new CoreController(async () => { now = 1100; return result }, () => {}, undefined, undefined,
-    { now: () => now, after: () => () => {} }, undefined, undefined, (_safe, timing) => { timings.push(timing) })
+  const controller = new CoreController(async () => { now = 1100; return result }, () => {}, {
+    clock: { now: () => now, after: () => () => {} }, onRating: (_safe, timing) => { timings.push(timing) } })
   controller.asked(request("a")); await tick()
   assert.deepEqual(timings, [{ fullReportMs: 1000, ratingMs: 1000 }])
   await controller.dispose()
@@ -113,8 +113,8 @@ for (const action of ["reply", "delete", "disable", "dispose"] as const) {
     let finish!: (value: Assessment) => void
     const controller = new CoreController((_req, _signal, identified) => {
       identified(); return new Promise(resolve => { finish = resolve })
-    }, () => {}, { reviewBash: true, reviewEdits: true }, undefined, undefined, modes, undefined,
-    safe => { ratings.push(safe) })
+    }, () => {}, { reviewOptions: { reviewBash: true, reviewEdits: true }, modes,
+    onRating: safe => { ratings.push(safe) } })
     controller.asked(request("a")); await tick()
     if (action === "reply") controller.replied("a")
     if (action === "delete") controller.deleted("root")
@@ -128,8 +128,8 @@ for (const action of ["reply", "delete", "disable", "dispose"] as const) {
 
 test("a fresh final review after re-enabling contributes a new rating", async () => {
   const modes = modeFixture(), ratings: boolean[] = []
-  const controller = new CoreController(async () => result, () => {}, { reviewBash: true, reviewEdits: true },
-    undefined, undefined, modes, undefined, safe => { ratings.push(safe) })
+  const controller = new CoreController(async () => result, () => {}, { reviewOptions: { reviewBash: true, reviewEdits: true },
+    modes, onRating: safe => { ratings.push(safe) } })
   const req = request("a")
   controller.asked(req); await tick()
   await modes.set("root", false); controller.modeChanged("root")
@@ -140,8 +140,8 @@ test("a fresh final review after re-enabling contributes a new rating", async ()
 })
 
 for (const failure of ["throw", "reject"] as const) test(`rating observer ${failure} cannot change a review`, async () => {
-  const controller = new CoreController(async () => result, () => {}, undefined, undefined, undefined, undefined, undefined,
-    () => { if (failure === "throw") throw new Error("storage unavailable"); return Promise.reject(new Error("storage unavailable")) })
+  const controller = new CoreController(async () => result, () => {}, {
+    onRating: () => { if (failure === "throw") throw new Error("storage unavailable"); return Promise.reject(new Error("storage unavailable")) } })
   controller.asked(request("a")); await tick()
   assert.equal(controller.views[0]?.status, "complete")
   assert.equal(controller.views[0]?.assessment?.safe, true)
@@ -537,7 +537,7 @@ test("disabled review types never evaluate but still block later native permissi
     const evaluated: string[] = []
     const controller = new Controller(async (req, _, identified) => {
       evaluated.push(req.id); identified(); return result
-    }, () => {}, { reviewBash, reviewEdits, reviewExternalDirectories })
+    }, () => {}, { reviewOptions: { reviewBash, reviewEdits, reviewExternalDirectories } })
     t.after(() => controller.dispose())
     const requests = [request("0-read", "root", "read"), request("1-directory", "root", "external_directory"), request("2-edit", "root", "edit"), request("3-bash")]
     controller.reconcile(requests, controller.revision)
@@ -590,7 +590,7 @@ test("disabled root and all descendants skip enrichment while independent roots 
   const modes = modeFixture()
   await modes.set("root", false)
   const calls: string[] = []
-  const controller = new CoreController(async (req) => { calls.push(req.id); return result }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new CoreController(async (req) => { calls.push(req.id); return result }, () => {}, { modes })
   for (const id of ["root", "child", "grandchild", "other"]) controller.asked(request(id, id))
   await tick()
   // The two ancestry slots defer excess roots to ordinary fresh reconciliation.
@@ -619,7 +619,7 @@ test("switch while root lookup is unresolved rechecks root-key state without enr
   let resolve!: (value: { id: string; parentID: string }) => void
   const modes = modeFixture({ session: async (id) => id === "child" ? new Promise((yes) => { resolve = yes }) : { id } })
   let calls = 0
-  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, { modes })
   controller.asked(request("child-request", "child"))
   await tick()
   await modes.set("root", false)
@@ -635,7 +635,7 @@ test("disable then enable during unresolved ancestry requires a post-switch snap
   let resolve!: (value: { id: string; parentID: string }) => void
   const modes = modeFixture({ session: async (id) => id === "child" ? new Promise((yes) => { resolve = yes }) : { id } })
   let calls = 0
-  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, { modes })
   controller.asked(request("a", "child"))
   await tick()
   await modes.set("root", false); controller.modeChanged("root")
@@ -652,7 +652,7 @@ test("disable then enable during unresolved ancestry requires a post-switch snap
 for (const failure of ["ancestry", "store"] as const) test(`${failure} failure cannot enrich or expose a later native review`, async () => {
   let calls = 0
   const modes = modeFixture(failure === "ancestry" ? { session: async () => undefined } : { read: async () => { throw new Error("bad store") } })
-  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, { modes })
   controller.asked(request("a"))
   await tick()
   assert.equal(calls, 0)
@@ -667,7 +667,7 @@ for (const enabled of [true, false]) test(`unavailable saved mode recovers to ${
     if (!available) throw new Error("unavailable record")
     return enabled
   } })
-  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, { modes })
   controller.asked(request("a"))
   await tick()
   assert.equal(controller.views[0]?.status, "suspended")
@@ -698,7 +698,7 @@ for (const enabled of [true, false]) test(`unavailable saved mode recovers to ${
 test("repeated unavailable mode reads remain hidden and a local disable stops recovery attempts", async () => {
   let reads = 0, calls = 0
   const modes = modeFixture({ read: async () => { reads++; throw new Error("unavailable record") } })
-  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, { modes })
   controller.asked(request("a"))
   await tick()
   for (let i = 0; i < 3; i++) {
@@ -727,7 +727,7 @@ test("expired saved-mode loading recovers and its late result cannot replace the
     read: (_, signal) => ++reads === 1 ? new Promise<boolean>((resolve) => { finish = resolve; expired = signal }) : Promise.resolve(true),
     write: async () => {}, flush: async () => {},
   }, async (id) => ({ id }))
-  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, { modes })
   controller.asked(request("a"))
   await settle()
   t.mock.timers.tick(5000)
@@ -772,7 +772,7 @@ for (const outcome of ["resolve", "reject"] as const) test(`many reconciliation 
     try { return await value }
     finally { try { await closing } finally { settled() } }
   }, write: async () => {}, flush: async () => {} }, async (id) => ({ id }))
-  const controller = new CoreController(async (req) => { evaluated.push(req.id); return result }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new CoreController(async (req) => { evaluated.push(req.id); return result }, () => {}, { modes })
   t.after(async () => {
     await controller.dispose()
     for (const read of pending) { read.value.resolve(false); read.cleanup() }
@@ -859,7 +859,7 @@ for (const outcome of ["resolve", "reject"] as const) test(`many reconciliation 
 test("unavailable ancestry retries on reconciliation without restarting a natively resolved request", async () => {
   let available = false, calls = 0
   const modes = modeFixture({ session: async (id) => available ? { id } : undefined })
-  const controller = new CoreController(async () => { calls++; return result }, () => {}, undefined, undefined, undefined, modes)
+  const controller = new CoreController(async () => { calls++; return result }, () => {}, { modes })
   controller.asked(request("a"))
   controller.asked(request("b", "other"))
   await tick()
@@ -881,7 +881,7 @@ for (const outcome of ["result", "error"] as const) test(`disabled generation su
   const modes = modeFixture()
   const pending: { identify: () => void; resolve: (value: Assessment) => void; reject: (error: Error) => void; signal: AbortSignal }[] = []
   const controller = new CoreController((_, signal, identify) => new Promise((resolve, reject) => { pending.push({ signal, identify, resolve, reject }) }),
-    () => {}, undefined, undefined, undefined, modes)
+    () => {}, { modes })
   controller.asked(request("a"))
   await tick()
   await modes.set("root", false); controller.modeChanged("root")
@@ -911,7 +911,7 @@ for (const stage of ["countdown", "checking", "failed", "allowing"] as const) te
   let reads = 0, writes = 0
   let resolve!: (value: PermissionRequest[]) => void
   let finish!: () => void
-  const controller = new CoreController(async () => result, () => {}, { reviewBash: true, reviewEdits: true, autoApprove: true }, {
+  const controller = new CoreController(async () => result, () => {}, { reviewOptions: { reviewBash: true, reviewEdits: true, autoApprove: true }, approval: {
     visibleID: () => "a",
     list: () => {
       reads++
@@ -920,7 +920,7 @@ for (const stage of ["countdown", "checking", "failed", "allowing"] as const) te
       return Promise.resolve([request("a")])
     },
     once: () => { writes++; return new Promise((yes) => { finish = yes }) },
-  }, undefined, gate)
+  }, modes: gate })
   controller.asked(request("a"))
   await tick()
   controller.presented("a")
